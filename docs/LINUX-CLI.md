@@ -44,3 +44,34 @@ Exit codes are 0 for success, 2 for invalid arguments or unsafe database placeme
 is reported and leaves the session running; a terminal-read error terminates it.
 Normal stop/EOF attempts to save a validated snapshot; failure exits nonzero rather
 than storing an incomplete snapshot. Use `engine --help` for the command summary.
+
+Snapshot pagination and full export:
+
+```sh
+cargo run -- engine query /chosen/root /outside/root.loci 'ext:txt' --all --page-size 128 --null
+# In a watch session, `export ext:txt` exports the pinned snapshot in 50-entry pages.
+```
+
+The public `Engine` query lease provides `page(query, cursor, page_size, cancel,
+progress)`. Sizes are 1–1024 (default 50). `QueryPage.next` is an opaque token for
+that immutable snapshot and exact query text. Keep the lease while paging; a
+newer published snapshot never changes its results. A cursor used with another
+snapshot, another engine, or another query returns `InvalidInput`; a cursor alone
+does not retain a snapshot. Dropping the lease promptly releases the existing
+bounded reader budget (eight leases and at most one retained old version).
+
+Pages use stable snapshot storage order: flat snapshots enumerate lexical paths;
+partitioned snapshots enumerate partition IDs, then lexical paths within each
+partition. This differs from the legacy lexical first-fifty search, whose behavior
+is preserved. Enumeration may return a final empty page if a previous full page
+was followed by records that do not match. `complete` means the snapshot
+enumeration is exhausted, while `validated_at_start_and_finish` independently
+reports whether the monitored view still validates that snapshot. Cancellation
+returns partial paths and a continuation at the next unvisited record; retry with
+that token and a cleared cancellation flag. Progress counts records visited in
+this page. No exact total count is needed to produce a page.
+
+`--all` writes every page to stdout and page/version/validity diagnostics to stderr;
+`--page-size` requires `--all`. Output preserves exact NUL-delimited path bytes
+with `--null`. A failed or pending export exits 4 and can have partial output;
+callers requiring an atomic output file should stage it and check the exit code.

@@ -52,6 +52,18 @@ impl Shards {
         }
         (Self { parts }, changed, records)
     }
+    pub(crate) fn record_count(&self) -> usize {
+        self.parts.iter().map(|part| part.paths.len()).sum()
+    }
+    pub(crate) fn page_record(&self, mut offset: usize) -> (&PathBuf, &Index, usize) {
+        for part in &self.parts {
+            if offset < part.paths.len() {
+                return (&part.paths[offset], &part.index, offset);
+            }
+            offset -= part.paths.len();
+        }
+        unreachable!("checked snapshot record offset")
+    }
     pub fn search(
         &self,
         q: &Query,

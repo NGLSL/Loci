@@ -47,6 +47,22 @@ pub struct QueryResult {
     pub cancelled: bool,
     pub complete: bool,
 }
+/// Opaque continuation bound to one leased snapshot and exact query text.
+#[derive(Clone)]
+pub struct PageCursor {
+    cursor: live::PageCursor,
+}
+pub use crate::live::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+pub struct QueryPage {
+    pub version: u64,
+    pub started: View,
+    pub finished: View,
+    pub validated_at_start_and_finish: bool,
+    pub paths: Vec<PathBuf>,
+    pub cancelled: bool,
+    pub complete: bool,
+    pub next: Option<PageCursor>,
+}
 impl QueryHandle {
     pub fn view(&self) -> View {
         self.handle.view().into()
@@ -59,6 +75,31 @@ impl QueryHandle {
     }
 }
 impl QueryLease {
+    /// Returns at most `page_size` paths from a pinned immutable snapshot.
+    /// Drop the lease to release reader retention; cursors never retain a lease.
+    pub fn page(
+        &self,
+        raw: &str,
+        cursor: Option<&PageCursor>,
+        page_size: usize,
+        cancel: &AtomicBool,
+        progress: &AtomicUsize,
+    ) -> io::Result<QueryPage> {
+        let out = self
+            .lease
+            .page(raw, cursor.map(|c| &c.cursor), page_size, cancel, progress)?;
+        Ok(QueryPage {
+            version: out.version,
+            started: out.started.into(),
+            finished: out.finished.into(),
+            validated_at_start_and_finish: out.validated_at_start_and_finish,
+            paths: out.paths.into_iter().map(|p| self.root.join(p)).collect(),
+            cancelled: out.cancelled,
+            complete: out.complete,
+            next: out.next.map(|cursor| PageCursor { cursor }),
+        })
+    }
+
     pub fn search(
         &self,
         raw: &str,

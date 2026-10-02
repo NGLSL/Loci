@@ -5,7 +5,7 @@ use crate::watch::{Inventory, Recovery, Signal};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Component, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -92,7 +92,111 @@ impl QueryHandle {
         })
     }
 }
+/// A bounded continuation token. Does not itself retain a snapshot lease.
+#[derive(Clone)]
+pub struct PageCursor {
+    snapshot: Weak<Snapshot>,
+    version: u64,
+    query: String,
+    offset: usize,
+}
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+pub const MAX_PAGE_SIZE: usize = 1024;
+pub struct QueryPage {
+    pub version: u64,
+    pub started: View,
+    pub finished: View,
+    pub validated_at_start_and_finish: bool,
+    pub paths: Vec<PathBuf>,
+    pub cancelled: bool,
+    /// The snapshot enumeration is exhausted, independently of observed validity.
+    pub complete: bool,
+    pub next: Option<PageCursor>,
+}
 impl QueryLease {
+    /// Enumerates immutable storage order: flat lexical order, or partition ID
+    /// followed by lexical order within each partition. Never switches snapshots.
+    pub fn page(
+        &self,
+        raw: &str,
+        cursor: Option<&PageCursor>,
+        page_size: usize,
+        cancel: &AtomicBool,
+        progress: &AtomicUsize,
+    ) -> io::Result<QueryPage> {
+        if raw.len() > 512 || !(1..=MAX_PAGE_SIZE).contains(&page_size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "query/page budget exceeded",
+            ));
+        }
+        let weak = Arc::downgrade(&self.snapshot);
+        if let Some(cursor) = cursor {
+            if cursor.version != self.snapshot.version
+                || cursor.query != raw
+                || !Weak::ptr_eq(&cursor.snapshot, &weak)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cursor belongs to a different snapshot or query (or has expired)",
+                ));
+            }
+        }
+        let query = Query::parse(raw);
+        let count = match &self.snapshot.index {
+            LiveIndex::Flat { paths, .. } => paths.len(),
+            LiveIndex::Shards(shards) => shards.record_count(),
+        };
+        let mut offset = cursor.map_or(0, |cursor| cursor.offset);
+        let mut paths = Vec::with_capacity(page_size.min(count));
+        let mut cancelled = false;
+        let mut visited = 0;
+        while offset < count {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                break;
+            }
+            let (path, index, id) = match &self.snapshot.index {
+                LiveIndex::Flat { index, paths } => (&paths[offset], index, offset),
+                LiveIndex::Shards(shards) => shards.page_record(offset),
+            };
+            offset += 1;
+            visited += 1;
+            if visited % 64 == 0 {
+                progress.store(visited, Ordering::Release);
+            }
+            if query.matches(&index.path(id)) {
+                paths.push(path.clone());
+            }
+            if paths.len() == page_size {
+                break;
+            }
+        }
+        progress.store(visited, Ordering::Release);
+        let complete = offset == count && !cancelled;
+        let finished = self.shared.lock().unwrap().view.clone();
+        let validated = self.started.status == Status::Validated
+            && finished.status == Status::Validated
+            && self.started.version == self.snapshot.version
+            && finished.version == self.snapshot.version
+            && self.started.observed_generation == self.snapshot.generation
+            && finished.observed_generation == self.snapshot.generation;
+        Ok(QueryPage {
+            version: self.snapshot.version,
+            started: self.started.clone(),
+            finished,
+            validated_at_start_and_finish: validated,
+            paths,
+            cancelled,
+            complete,
+            next: (!complete).then(|| PageCursor {
+                snapshot: weak,
+                version: self.snapshot.version,
+                query: raw.to_owned(),
+                offset,
+            }),
+        })
+    }
     pub fn search(
         &self,
         raw: &str,

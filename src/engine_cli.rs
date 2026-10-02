@@ -1,5 +1,5 @@
 //! Real-directory CLI adapter over the public bounded Engine.
-use loci_experiment::engine::{Engine, QueryHandle, Status};
+use loci_experiment::engine::{Engine, QueryHandle, Status, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -8,14 +8,15 @@ use std::time::Duration;
 
 const HELP: &str = "Real directory commands (bounded v0.1 Engine, not synthetic data):
   engine build ROOT DATABASE
-  engine query ROOT DATABASE QUERY [--null]
+  engine query ROOT DATABASE QUERY [--null] [--all [--page-size N]]
   engine status ROOT DATABASE
   engine rebuild ROOT DATABASE
   engine watch ROOT DATABASE [--null]
-Watch reads query QUERY / status / rebuild / save / stop commands from stdin.
+Watch reads query QUERY / export QUERY / status / rebuild / save / stop commands from stdin.
 Stop or stdin EOF saves the last validated snapshot and releases monitoring.
 DATABASE and temporary saves must be outside ROOT. Current limits: 4096 entries,
-128 directories, 1 MiB UTF-8 paths; results retain at most 50 paths.
+128 directories, 1 MiB UTF-8 paths. Default query retains at most 50 paths;
+--all or watch export enumerates one pinned snapshot in bounded pages.
 Query terms use case-insensitive AND substrings and ext: filters.
 Results go to stdout (escaped Rust strings, or exact NUL-delimited paths with --null).
 Status and errors go to stderr. Validated means last reliable observation, not perpetual freshness.
@@ -45,12 +46,17 @@ fn run(args: &[String]) -> io::Result<()> {
     let valid = match action {
         "build" | "rebuild" | "status" => args.len() == 3,
         "watch" => args.len() == 3 || (args.len() == 4 && args[3] == "--null"),
-        "query" => args.len() == 4 || (args.len() == 5 && args[4] == "--null"),
+        "query" => args.len() >= 4,
         _ => false,
     };
     if !valid {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, HELP));
     }
+    let (nul, all, page_size) = if action == "query" {
+        query_options(&args[4..])?
+    } else {
+        (args.len() == 4, false, DEFAULT_PAGE_SIZE)
+    };
     let root = Path::new(&args[1]);
     let database = Path::new(&args[2]);
     let mut engine = Engine::open(root, Some(database))?;
@@ -59,7 +65,8 @@ fn run(args: &[String]) -> io::Result<()> {
     }
     let result = match action {
         "build" | "rebuild" => status(&engine.query()).and_then(|()| engine.save()),
-        "query" => query(&engine.query(), &args[3], args.len() == 5),
+        "query" if all => export(&engine.query(), &args[3], nul, page_size),
+        "query" => query(&engine.query(), &args[3], nul),
         "status" => status(&engine.query()),
         _ => unreachable!(),
     };
@@ -70,6 +77,72 @@ fn run(args: &[String]) -> io::Result<()> {
         engine.view().status
     );
     result.and(stop)
+}
+
+fn query_options(args: &[String]) -> io::Result<(bool, bool, usize)> {
+    let mut nul = false;
+    let mut all = false;
+    let mut page_size = DEFAULT_PAGE_SIZE;
+    let mut size_given = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--null" if !nul => nul = true,
+            "--all" if !all => all = true,
+            "--page-size" if !size_given => {
+                i += 1;
+                page_size = args
+                    .get(i)
+                    .and_then(|n| n.parse().ok())
+                    .filter(|n| (1..=MAX_PAGE_SIZE).contains(n))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "page size must be 1..=1024")
+                    })?;
+                size_given = true;
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, HELP)),
+        }
+        i += 1;
+    }
+    if size_given && !all {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--page-size requires --all",
+        ));
+    }
+    Ok((nul, all, page_size))
+}
+
+fn export(handle: &QueryHandle, raw: &str, nul: bool, page_size: usize) -> io::Result<()> {
+    let lease = handle.lease()?;
+    let mut cursor = None;
+    let mut page_number = 0;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    loop {
+        let page = lease.page(
+            raw,
+            cursor.as_ref(),
+            page_size,
+            &AtomicBool::new(false),
+            &AtomicUsize::new(0),
+        )?;
+        page_number += 1;
+        eprintln!("engine,page={page_number},version={},state={:?},complete={},validated={},paths_returned={}",
+            page.version, page.finished.status, page.complete, page.validated_at_start_and_finish, page.paths.len());
+        write_paths(&mut output, page.paths, nul)?;
+        if !page.validated_at_start_and_finish || page.cancelled {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "export snapshot pending or cancelled",
+            ));
+        }
+        if page.complete {
+            break;
+        }
+        cursor = page.next;
+    }
+    output.flush()
 }
 
 fn status(handle: &QueryHandle) -> io::Result<()> {
@@ -111,7 +184,23 @@ fn query(handle: &QueryHandle, raw: &str, nul: bool) -> io::Result<()> {
     );
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    for path in result.paths {
+    write_paths(&mut output, result.paths, nul)?;
+    output.flush()?;
+    if !result.validated_at_start_and_finish {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "results belong to a pending snapshot",
+        ));
+    }
+    Ok(())
+}
+
+fn write_paths(
+    output: &mut impl Write,
+    paths: Vec<std::path::PathBuf>,
+    nul: bool,
+) -> io::Result<()> {
+    for path in paths {
         if nul {
             #[cfg(unix)]
             {
@@ -128,13 +217,6 @@ fn query(handle: &QueryHandle, raw: &str, nul: bool) -> io::Result<()> {
         } else {
             writeln!(output, "{:?}", path.as_os_str())?;
         }
-    }
-    output.flush()?;
-    if !result.validated_at_start_and_finish {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "results belong to a pending snapshot",
-        ));
     }
     Ok(())
 }
@@ -192,10 +274,16 @@ fn watch(mut engine: Engine, root: &Path, database: &Path, nul: bool) -> io::Res
         if line == "stop" {
             break;
         }
-        let (name, result) = if let Some(raw) = line.strip_prefix("query ") {
+        let (name, result) = if let Some(raw) = line.strip_prefix("export ") {
+            (
+                "export",
+                export(&engine.query(), raw, nul, DEFAULT_PAGE_SIZE),
+            )
+        } else if let Some(raw) = line.strip_prefix("query ") {
             ("query", query(&engine.query(), raw, nul))
         } else {
             match line.as_str() {
+                "export" => ("export", export(&engine.query(), "", nul, DEFAULT_PAGE_SIZE)),
                 "query" => ("query", query(&engine.query(), "", nul)),
                 "status" => ("status", status(&engine.query())),
                 "save" => ("save", engine.save()),
@@ -210,7 +298,7 @@ fn watch(mut engine: Engine, root: &Path, database: &Path, nul: bool) -> io::Res
                     "invalid",
                     Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "watch commands: query QUERY | status | rebuild | save | stop",
+                        "watch commands: query QUERY | export QUERY | status | rebuild | save | stop",
                     )),
                 ),
             }
