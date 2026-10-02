@@ -4,7 +4,9 @@ Loci 是独立的 Rust 文件名/路径搜索实验，包含紧凑路径记录�
 
 项目使用 Rust **1.99.0** 和标准库，无第三方 Cargo 依赖，无 GUI。v0.1 嵌入式引擎在 Windows 使用原生递归通知，在 x86_64 Linux 使用 inotify，统一提供版本化持久库存和停止生命周期。用户 CLI 尚未完成。许可证尚未决定，没有添加 LICENSE 文件。
 
-嵌入式 `engine::Engine::open/poll/query/save/stop` 和 `storage::Snapshot::new/save/load` 用法、数据库位置、格式、预算及验证范围见 [docs/PERSISTENCE.md](docs/PERSISTENCE.md)。完整 v0.1 仍须后续跨平台及 CLI 验收。
+嵌入式 `engine::Engine::open/poll/query/save/stop` 和 `storage::Snapshot::new/save/load` 用法、数据库位置、格式、预算及验证范围见 [docs/PERSISTENCE.md](docs/PERSISTENCE.md)。完整 v0.1 仍须完成用户 CLI、生产规模和产品交付验收。
+
+新引擎代码提交 `657412e` 已在同一次 [Rust 1.99 跨平台 CI](https://github.com/NGLSL/Loci/actions/runs/37045846370) 验证：Linux/ext4 debug、release 各119 passed，Windows/NTFS 各96 passed，均0 failed。Linux 覆盖实际新 Engine 的跨进程保存与离线变化恢复、递归监听、真实内核溢出校正和 watch/fd 释放；此记录与旧原型验收分开。
 
 查询为大小写不敏感的 AND 子串，可使用 `ext:rs` 精确扩展名条件。first50 返回记录顺序前50项，complete 计算完整匹配数并保留前50项；没有相关性排序、全文、拼音或 mmap。
 

@@ -109,6 +109,23 @@ Windows 原生测试使用明确选择的临时目录与实际文件操作。`te
 
 功能分支 `codex/loci-linux-engine-v0.1`；固定 Rust 1.99.0 的 GitHub Actions 工作流 `.github/workflows/native-engine.yml` 在 Linux 与 Windows 对同一提交运行静态检查及 debug/release 全量测试。Linux 的新引擎夹具是 `tests/linux_engine.rs`，共享 `tests/engine.rs` 同时在两平台执行；持久容器测试为 `tests/storage.rs`。
 
-独立红阶段提交 `099894ccde638fcebaf621d28b3711a0ca54ba69` 的 [Linux run](https://github.com/NGLSL/Loci/actions/runs/37044712939) 已实际编译并执行公开 `Engine::open` 重启回归，明确在 `Unsupported` 处失败。装配后的运行结果待精确提交的 CI 记录补充。
+独立红阶段提交 `099894ccde638fcebaf621d28b3711a0ca54ba69` 的 [Linux run](https://github.com/NGLSL/Loci/actions/runs/37044712939) 已实际编译并执行公开 `Engine::open` 重启回归，明确在 `Unsupported` 处失败。装配后的代码验收提交为 `657412e0eec11d762537df4c34193ee24844b18b`，2026-10-02 的 [同提交跨平台 run](https://github.com/NGLSL/Loci/actions/runs/37045846370) 已完成，Linux 和 Windows jobs 均为 success。
 
 新增原生测试覆盖递归注册后子项变更、目录 rename 后保留监听、目录属性事件、依赖 rename 校正、root 身份失败、非 UTF-8 失败恢复、用户事件队列溢出、排除目录反复退休与重新注册、实际 `/proc/self/fd` 和 fdinfo watch 释放，以及两个新进程间保存/离线变更/重开。真实内核溢出测试位于 `engine::linux_kernel_tests`，要求同一新 Engine 消费实际 `IN_Q_OVERFLOW`、保留 Pending 旧查询，再重建并收敛；仅在测试中延后 Gate 校正时间以保留待排空的 fd，没有注入文件事件或 loss。另有两项来源内部回归覆盖实际重建 ENOENT 与逻辑 wd 退休；FIFO/symlink helper 测试验证 root 打开方式，不声称复现了完整 TOCTOU 竞态。
+
+| 验证 | Linux | Windows |
+| --- | --- | --- |
+| 环境 | Ubuntu 24.04、x86_64 GNU/Linux、kernel 6.17.0-1022-azure、工作区 ext4 | Windows Server 2022、x86_64 MSVC、D: NTFS |
+| Rust | 1.99.0（b940084d7，LLVM 23.1.1） | 同版本 |
+| fmt / all-targets check | 通过 | 通过，另通过 linux-ffi-check 类型检查 |
+| debug 全量 | 119 passed、0 failed、6 ignored | 96 passed、0 failed、2 ignored |
+| release 全量 | 119 passed、0 failed、6 ignored | 96 passed、0 failed、2 ignored |
+| 新引擎专用夹具 | linux_engine 11 项：10 项行为回归和 1 个子进程辅助入口，全部通过 | 同文件按平台排除 |
+| 共享引擎 / 持久容器 | engine 15 项 / storage 9 项，全部通过 | engine 16 项 / storage 9 项，全部通过 |
+| 新内核溢出恢复 | debug/release 均实际观察 IN_Q_OVERFLOW，max_queued_events=16384；Pending 旧查询、重建后正确库存 | 本轮沿用 Windows 原生来源与恢复回归 |
+| watch / fd 释放 | 实际 fd +2、递归 3 watches，stop/drop/部分打开失败回到基线 | 既有原生来源回归 20 项通过 |
+| 两轴审计 | 规范与规格审计发现的重建失败误报 Stopped、逻辑 wd 退休和 root 打开竞态已修复，复核无剩余可行动问题 | 共享装配及路径解释回归通过 |
+
+Linux 的 6 项 ignored 为 4 项既有显式性能测量和 2 项旧原型内核溢出测试；本轮新增的新 Engine 内核溢出测试不是 ignored，已真实执行。Windows 的 2 项 ignored 为既有显式性能测量。没有将任何 ignored 项计入通过数量，没有新增性能改善结论。
+
+Linux 运行实际执行了快照写入、sync、同目录 rename 和父目录 fsync，以及两进程之间的恢复。runner ext4 挂载包含 `nobarrier` 和 `data=writeback`；上述证据仅证明该环境的程序行为，不证明掉电耐久性、其他文件系统、其他 Linux 架构或长期运行。整体 v0.1 的 CLI、生产规模与完整交付验收仍未完成。main 保持上一轮已获授权合并的提交；本轮 Linux 工作同步到功能分支。
