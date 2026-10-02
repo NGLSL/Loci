@@ -696,14 +696,19 @@ impl Runtime {
                     return Err(io::Error::other("scale directory depth exhausted"));
                 }
                 processed += 1;
-                let opened = crate::engine::open_linux_root(&directory.path)?;
+                let opened = crate::engine::open_linux_root(&directory.path)
+                    .map_err(|error| self.scoped_error(&directory.path, error))?;
                 if scope::mount_id(&opened)? != self.scope.root_mount {
                     continue;
                 }
                 self.source
                     .before_directory(&directory.path)
                     .map_err(|error| self.scoped_error(&directory.path, error))?;
-                self.update_resources();
+                // Resource publication below accounts the completed bounded step.
+                // Walking retained snapshots for every registered directory makes
+                // correction quadratic once an old directory cache is published.
+                // Watch reservation and inventory allocation still enforce their
+                // limits immediately; fail() refreshes resources on errors.
                 let listing = fs::read_dir(&directory.path)
                     .map_err(|error| self.scoped_error(&directory.path, error))?;
                 scan.current = Some((directory, listing));
