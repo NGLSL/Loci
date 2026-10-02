@@ -1,9 +1,15 @@
 # Independent Linux Engine regressions
 
-This test-only verification branch is intentionally **expected red** on base
+The original test-only verification branch was intentionally **expected red** on base
 `4cedb870361922a65a00d430f0afc320e3dd2724` (code parent
-`657412e0eec11d762537df4c34193ee24844b18b`). It contains no production fix.
+`657412e0eec11d762537df4c34193ee24844b18b`). Its commit `104b218` contains no production fix.
 Do not merge the failing tests into main without the corresponding repairs.
+
+The repair branch `codex/linux-engine-regressions-fix` starts at current main
+`e204917` and cherry-picks that test-only commit as `05137c0`. It preserves both
+enabled regressions, strengthens P2 to verify updated persisted inventory if save
+succeeds, and adds a same-inode parent relocation case. Repair details and scope
+are below; the original evidence remains historical.
 
 ## Run
 
@@ -74,3 +80,25 @@ without needing ignore-rule changes. If copying manually under the original
 allowlist, explicitly add these two paths with `git add -f`. After repairing the behavior, keep both tests enabled and run the
 commands above, then the full debug/release suites against the exact repair SHA.
 There are no new performance, power-loss, other-filesystem, or long-run claims.
+
+## Repair behavior
+
+- A rename from a source absent from inventory retires any previous destination
+  inventory/watch before refreshing it. Directory refresh installs watches before
+  subtree enumeration, so subsequent children stay observable.
+- Linux Engine retains its selected database parent descriptor, rechecks identity
+  and root containment at save, then creates/replaces/cleans relative to that
+  descriptor. A path redirection cannot select a different save directory.
+- Linux stop/drop releases the additional descriptor. No query handle owns it.
+- A storage-level test redirects the parent path after selecting its descriptor,
+  then checks actual save and failing replacement cleanup in the original parent.
+  This supplements the native public Engine regressions; it is not an assertion
+  that a particular concurrent scheduling race was observed.
+- Holding a directory descriptor cannot prevent another process moving that
+  selected directory itself inside root during a save. Concurrent relocation of
+  the selected root/database directory is outside the supported save contract;
+  between-call relocation is checked. Windows pathname saving is unchanged and
+  does not inherit the Linux directory-relative guarantee.
+
+Final validation results are recorded after testing the repair code, not inferred
+from the existing 119-pass base or the original validation branch.

@@ -83,6 +83,8 @@ impl QueryLease {
 pub struct Engine {
     root: Arc<PathBuf>,
     database: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    database_parent: Option<RootIdentity>,
     identity: Option<RootIdentity>,
     source: Option<Source>,
     state: Recovery,
@@ -191,9 +193,21 @@ impl Engine {
         let database = database
             .map(|path| database_path(path, &root))
             .transpose()?;
+        #[cfg(target_os = "linux")]
+        let database_parent = database
+            .as_ref()
+            .map(|path| {
+                RootIdentity::open(
+                    path.parent()
+                        .ok_or_else(|| io::Error::other("database parent missing"))?,
+                )
+            })
+            .transpose()?;
         let mut engine = Self {
             root: Arc::new(root),
             database,
+            #[cfg(target_os = "linux")]
+            database_parent,
             identity: Some(identity),
             source: Some(source),
             state: Recovery::new(EventLimits::default().max_events()),
@@ -473,7 +487,28 @@ impl Engine {
             io::Error::new(io::ErrorKind::InvalidInput, "no database was selected")
         })?;
         self.check_root()?;
-        Snapshot::new(&self.root, self.state.inventory.clone())?.save(path)
+        let snapshot = Snapshot::new(&self.root, self.state.inventory.clone())?;
+        #[cfg(target_os = "linux")]
+        {
+            let parent = self
+                .database_parent
+                .as_ref()
+                .ok_or_else(|| io::Error::other("database parent is unavailable"))?;
+            parent.check(
+                path.parent()
+                    .ok_or_else(|| io::Error::other("database parent missing"))?,
+            )?;
+            // Recheck containment as well as identity: the retained directory
+            // itself may have moved inside root between API calls.
+            database_path(path, &self.root)?;
+            snapshot.save_in_directory(
+                &parent._file,
+                path.file_name()
+                    .ok_or_else(|| io::Error::other("database filename missing"))?,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        snapshot.save(path)
     }
     pub fn stop(&mut self) -> io::Result<()> {
         self.stopped = true;
@@ -484,6 +519,8 @@ impl Engine {
             .take()
             .map_or(Ok(()), |mut source| source.stop());
         self.identity.take();
+        #[cfg(target_os = "linux")]
+        self.database_parent.take();
         result
     }
 }

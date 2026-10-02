@@ -292,6 +292,11 @@ pub(crate) fn apply(
                     continue;
                 }
                 if old.is_none() {
+                    // An excluded/moved-in inode may replace an existing empty
+                    // directory. Its old inventory and watch describe the
+                    // replaced inode, not the incoming subtree. Retire them
+                    // before refresh installs watches and enumerates anew.
+                    remove(&mut inv, to, root, &mut topology)?;
                     refresh(root, to, &mut inv, limits, metrics, &mut topology)?;
                     continue;
                 }

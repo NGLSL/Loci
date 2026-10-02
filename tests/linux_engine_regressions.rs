@@ -3,6 +3,8 @@
 mod common;
 use common::Fixture;
 use loci_experiment::engine::{Engine, Status};
+use loci_experiment::storage::Snapshot;
+use loci_experiment::watch::Kind;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -86,6 +88,11 @@ fn changed_database_parent_cannot_redirect_saves_inside_root() {
     engine.save().unwrap();
     let before = fs::read(outside.join("state.loci")).unwrap();
 
+    // A successful redirected save must actually persist the updated snapshot,
+    // rather than merely returning Ok without touching either destination.
+    fs::write(root.join("added.txt"), b"added").unwrap();
+    await_validated(&mut engine);
+
     // Change the accepted parent between API calls; no concurrent race is needed.
     fs::rename(&outside, &original).unwrap();
     std::os::unix::fs::symlink(&inside, &outside).unwrap();
@@ -101,5 +108,41 @@ fn changed_database_parent_cannot_redirect_saves_inside_root() {
     );
     if result.is_err() {
         assert_eq!(fs::read(original.join("state.loci")).unwrap(), before);
+    } else {
+        let saved = Snapshot::load(&original.join("state.loci"), root).unwrap();
+        assert_eq!(
+            saved
+                .inventory
+                .entries
+                .get(std::path::Path::new("added.txt")),
+            Some(&Kind::File),
+            "a successful save must write the updated inventory to its original parent"
+        );
     }
+}
+
+#[test]
+fn same_database_parent_moved_inside_root_is_rejected_despite_matching_identity() {
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    let outside = fixture.base.join("outside");
+    let parent = outside.join("data");
+    let moved = root.join("relocated");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(root.join("seed.txt"), b"seed").unwrap();
+    let database = parent.join("state.loci");
+    let mut engine = Engine::open(root, Some(&database)).unwrap();
+    engine.save().unwrap();
+    let before = fs::read(&database).unwrap();
+
+    // Retain the same parent inode but redirect an ancestor to its new location
+    // inside root. Parent identity alone is insufficient to preserve containment.
+    fs::rename(&outside, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &outside).unwrap();
+    await_validated(&mut engine);
+    let error = engine.save().unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    engine.stop().unwrap();
+    assert_eq!(fs::read(moved.join("data/state.loci")).unwrap(), before);
+    assert_eq!(fs::read_dir(moved.join("data")).unwrap().count(), 1);
 }

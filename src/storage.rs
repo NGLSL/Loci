@@ -116,6 +116,17 @@ impl Snapshot {
         })
     }
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        atomic_save(path, &self.encode()?)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn save_in_directory(
+        &self,
+        parent: &fs::File,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        linux_atomic_save(parent, name, &self.encode()?)
+    }
+    fn encode(&self) -> io::Result<Vec<u8>> {
         validate(&self.inventory)?;
         if root_path(&self.root)? != self.root {
             return Err(invalid("snapshot root changed"));
@@ -133,7 +144,7 @@ impl Snapshot {
         bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&payload);
         bytes.extend_from_slice(&checksum(&bytes).to_le_bytes());
-        atomic_save(path, &bytes)
+        Ok(bytes)
     }
     pub fn load(path: &Path, root: &Path) -> io::Result<Self> {
         validate_destination(path)?;
@@ -267,7 +278,9 @@ fn get_path(bytes: &[u8], pos: &mut usize) -> io::Result<PathBuf> {
     Ok(PathBuf::from(text))
 }
 
+#[cfg(not(target_os = "linux"))]
 struct Temporary(Option<PathBuf>);
+#[cfg(not(target_os = "linux"))]
 impl Drop for Temporary {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
@@ -307,6 +320,7 @@ fn validate_destination(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+#[cfg(not(target_os = "linux"))]
 fn atomic_save(path: &Path, bytes: &[u8]) -> io::Result<()> {
     validate_destination(path)?;
     let parent = path
@@ -358,9 +372,130 @@ fn atomic_save(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn replace(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to)
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_save(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    validate_destination(path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("snapshot destination requires filename"))?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(0x10000 | 0x20000) // O_DIRECTORY | O_NOFOLLOW
+        .open(parent)?;
+    linux_atomic_save(&directory, name, bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_atomic_save(parent: &fs::File, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()> {
+    use std::ffi::{c_char, c_int, c_uint, CString};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[link(name = "c")]
+    unsafe extern "C" {
+        fn openat(directory: c_int, name: *const c_char, flags: c_int, ...) -> c_int;
+        fn renameat(
+            from_directory: c_int,
+            from: *const c_char,
+            to_directory: c_int,
+            to: *const c_char,
+        ) -> c_int;
+        fn unlinkat(directory: c_int, name: *const c_char, flags: c_int) -> c_int;
+    }
+    struct TemporaryAt<'a> {
+        parent: &'a fs::File,
+        name: Option<CString>,
+    }
+    impl Drop for TemporaryAt<'_> {
+        fn drop(&mut self) {
+            if let Some(name) = &self.name {
+                // Same held directory as creation; never follow a replaced path.
+                unsafe { unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
+            }
+        }
+    }
+    let path = Path::new(name);
+    if path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(invalid("snapshot destination requires a single filename"));
+    }
+    let destination = CString::new(name.as_bytes()).map_err(|_| invalid("NUL in filename"))?;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut created = None;
+    for _ in 0..16 {
+        let mut temporary = name.to_os_string();
+        temporary.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temporary =
+            CString::new(temporary.as_bytes()).map_err(|_| invalid("NUL in temporary filename"))?;
+        // x86_64 Linux O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC. create_new
+        // semantics ensure a foreign temporary is never followed or removed.
+        let fd = unsafe {
+            openat(
+                parent.as_raw_fd(),
+                temporary.as_ptr(),
+                0x1 | 0x40 | 0x80 | 0x80000,
+                0o600 as c_uint,
+            )
+        };
+        if fd >= 0 {
+            // We own the new descriptor; File closes it on every error path.
+            let file = unsafe { fs::File::from_raw_fd(fd) };
+            created = Some((
+                TemporaryAt {
+                    parent,
+                    name: Some(temporary),
+                },
+                file,
+            ));
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    let (mut temporary, mut file) = created.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "snapshot temporary filename collision budget",
+        )
+    })?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    let from = temporary
+        .name
+        .as_ref()
+        .ok_or_else(|| invalid("missing snapshot temporary"))?;
+    if unsafe {
+        renameat(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    temporary.name = None;
+    parent.sync_all()
 }
 #[cfg(windows)]
 fn replace(from: &Path, to: &Path) -> io::Result<()> {
@@ -379,5 +514,87 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_save_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+            let base = parent.join(format!(
+                "loci-bound-save-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&base).unwrap();
+            Self(base)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let base = fs::canonicalize(&self.0).unwrap();
+            assert_eq!(
+                base.parent(),
+                Some(fs::canonicalize(std::env::temp_dir()).unwrap().as_path())
+            );
+            assert!(base
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("loci-bound-save-"));
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    // Storage-level evidence for the directory-relative writer used by Engine.
+    // Redirect after selecting the handle, before creation/replacement/cleanup.
+    // It does not claim to reproduce every concurrent filesystem relocation.
+    #[test]
+    fn selected_directory_binds_save_and_failure_cleanup_after_path_redirection() {
+        for fail_replace in [false, true] {
+            let f = Fixture::new();
+            let root = f.0.join("data");
+            let inside = root.join("inside");
+            let outside = f.0.join("outside");
+            let original = f.0.join("original");
+            fs::create_dir_all(&inside).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let inventory = Inventory {
+                entries: [(PathBuf::from("new.txt"), Kind::File)].into(),
+                complete: true,
+                ..Inventory::default()
+            };
+            let snapshot = Snapshot::new(&root, inventory).unwrap();
+            if fail_replace {
+                fs::create_dir(outside.join("state.loci")).unwrap();
+            } else {
+                fs::write(outside.join("state.loci"), b"old bytes").unwrap();
+            }
+            let parent = fs::File::open(&outside).unwrap();
+            fs::rename(&outside, &original).unwrap();
+            std::os::unix::fs::symlink(&inside, &outside).unwrap();
+            let result = snapshot.save_in_directory(&parent, OsStr::new("state.loci"));
+            assert_eq!(fs::read_dir(&inside).unwrap().count(), 0);
+            assert_eq!(fs::read_dir(&original).unwrap().count(), 1);
+            if fail_replace {
+                assert!(result.is_err());
+                assert!(original.join("state.loci").is_dir());
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    Snapshot::load(&original.join("state.loci"), &root)
+                        .unwrap()
+                        .inventory
+                        .entries,
+                    snapshot.inventory.entries
+                );
+            }
+        }
     }
 }

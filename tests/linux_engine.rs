@@ -47,6 +47,29 @@ fn settle(engine: &mut Engine, expected: &[PathBuf]) {
 }
 
 #[test]
+fn saved_engine_releases_its_database_parent_descriptor_on_stop_and_drop() {
+    let _guard = NATIVE.lock().unwrap();
+    let f = Fixture::new();
+    fs::write(f.root.join("seed.txt"), "x").unwrap();
+    let db = f.base.join("state.loci");
+    let descriptors = fd_count();
+    for stop in [true, false] {
+        let mut engine = Engine::open(&f.root, Some(&db)).unwrap();
+        let handle = engine.query();
+        // One inotify descriptor, one root identity and one database parent.
+        assert_eq!(fd_count(), descriptors + 3);
+        engine.save().unwrap();
+        if stop {
+            engine.stop().unwrap();
+            assert_eq!(fd_count(), descriptors);
+        }
+        drop(engine);
+        assert_eq!(handle.view().status, Status::Stopped);
+        assert_eq!(fd_count(), descriptors);
+    }
+}
+
+#[test]
 fn linux_new_engine_opens_saves_and_reconciles_offline_changes() {
     let _guard = NATIVE.lock().unwrap();
     let f = Fixture::new();

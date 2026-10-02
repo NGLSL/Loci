@@ -28,6 +28,10 @@ engine.stop()?;
 
 数据库父目录必须已存在，数据库及保存临时文件必须在被监控 root 之外，避免把自身写入纳入库存。引擎不创建用户目录、不默认扫描其他 root、不后台隐式保存。`None` 表示内存会话，调用 `save` 会明确报错。缺失库可建立新索引；已有损坏或不兼容库会返回错误，保留原文件，由调用方决定重建。启动扫描错误也返回错误，持久库不会被覆盖。
 
+Linux 引擎额外持有选择时的数据库父目录句柄；每次保存前核对父目录身份与当前位置仍在 root 之外。父目录路径被替换、变为 symlink 或在两次调用之间移入 root 时拒绝保存并保留旧库。实际临时创建、替换和失败清理分别用 `openat`、`renameat`、`unlinkat`，全部相对于同一持有目录 fd，父目录同步同样使用该句柄；通过之后的路径重定向不会把写入切换到另一目录。此行为不依赖 `/proc` 的 fd 路径。
+
+并发边界：不支持在一次保存进行期间把被选 root 或持有的数据库目录本身移入对方的范围；目录 fd 能防止路径指向另一个 inode，但不能禁止其他进程移动该 inode。调用方须在该操作期间保持这些选定目录的位置稳定。两次调用之间的变更会在下一次操作检查；不将其称为全面对抗性 TOCTOU 防护。Windows 的原路径保存实现未在本次 Linux 修复中改变，不能把 Linux 的目录相对写入保证套用到 Windows。
+
 `Engine::open` 在 Windows 和 x86_64 Linux 装配原生来源；其他平台返回 `Unsupported`，Linux FFI 当前不支持其他架构。`with_source` 是已有 EventSource 接口的外部装配入口，调用方必须先为同一 canonical root 安装满足契约的来源。源错误保留 `io::Error` 和原 OS code；WatchLost 要求显式重新打开引擎。
 
 ## 状态、查询与停止
@@ -42,7 +46,7 @@ engine.stop()?;
 
 引擎在每次捕获和发布前核对 root 的稳定文件身份。Windows 以持有的目录句柄及 volume/file index 核对路径，不只比较字符串；root 被移走、替换或变为 reparse point 时不会把旧监听句柄对应的结果发布为当前有效。Windows 原生递归通知本身不保证报告 root 自身变化。身份核对依据 [GetFileInformationByHandle](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle)。
 
-loss 批次的 changes 全部丢弃。可靠事件复用原有增量事务；依赖目录 rename、overflow、未配对 rename 与来源重启间隙进入有界全量校正。扫描及构建后的新事件使候选失效。成功尝试冷却 250 ms，失败指数退避至 2 秒，另有 30 秒低频完整校正。
+loss 批次的 changes 全部丢弃。可靠事件复用原有增量事务；依赖目录 rename、overflow、未配对 rename 与来源重启间隙进入有界全量校正。未在库存中的来源替换已索引目标时，先退休目标旧库存/监听，再安装监听并重新枚举 incoming 子树，不能因为目标仍是 Directory 就复用旧 inode 的状态。扫描及构建后的新事件使候选失效。成功尝试冷却 250 ms，失败指数退避至 2 秒，另有 30 秒低频完整校正。
 
 Windows 暂存 old-name 等待配对时，每次返回均报告 `UnpairedRename`，防止把已消费 old-name 后的空批次当成可靠切面；保留一个 old-name，最多 100 ms，仍允许后续读取中的可靠 new-name 配对。真实 kernel/user/invalid loss 清除暂存名称。持续不完整输入只保持 Pending，不自动反复重建来源。
 
@@ -69,11 +73,11 @@ Linux 使用 cookie 配对 rename；未配对 FROM 暂存整个有界批次，�
 
 固定上限为 4096 条库存记录、1 MiB 相对路径输入、4096 bytes 单路径与 root、128 目录（包含 root）、16 层目录、256 事件及四次扫描尝试。拒绝绝对/逃逸/NUL/空组件、Windows ADS、重复路径、缺失或非目录父项、排除目录与不完整库存。排除规则复用 scanner/incremental 的规则；不跟随子树 symlink/reparse。
 
-保存先验证并序列化，然后用 `create_new` 创建同目录专属临时文件，写入、flush、sync 后原子替换。临时名称碰撞尝试有界，已有或外来临时文件不会被清理。Windows 使用 [MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw) 的 REPLACE_EXISTING / WRITE_THROUGH，不允许跨卷 copy/delete；Unix 使用 rename 和父目录 fsync。替换前失败保留旧有效库。Unix 在替换成功后目录 fsync 失败，返回错误但新库可能已经可见。未进行真实断电测试，不宣称跨所有文件系统的断电耐久性。
+保存先验证并序列化，然后以 `create_new` 语义创建同目录专属临时文件，写入、flush、sync 后原子替换。临时名称碰撞尝试有界，已有或外来临时文件不会被清理。Windows 使用 [MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw) 的 REPLACE_EXISTING / WRITE_THROUGH，不允许跨卷 copy/delete；Linux 使用目录相对创建、renameat 和持有父目录的 fsync，新临时文件权限为 0600（仍受 umask 约束）；其他 Unix 保留 rename 和父目录 fsync。Linux 的独立 Snapshot::save 在调用时打开父目录并绑定整个写入，拒绝最终父目录组件是 symlink；它不承担 Engine 的 root 外位置策略。替换前失败保留旧有效库。Unix 在替换成功后目录 fsync 失败，返回错误但新库可能已经可见。未进行真实断电测试，不宣称跨所有文件系统的断电耐久性。
 
 Windows 来源占两个 OS handles；运行中的引擎另持有一个 root 身份句柄，身份检查临时再打开一个目录句柄。Windows 最多八个原生来源。RSS/进程工作集不包括内核对象字节，不据此声称内核占用已经测量。
 
-Linux 引擎持有一个 inotify fd 和一个 root 身份 fd，以 Unix dev/inode 核对选定 root。所有 Loci 管理的 inotify 来源共享 8 sessions / 128 watches 上限，包含旧原型会话；超限返回错误。stop/drop 释放来源和 root fd，查询 handle 不持有这些 fd。
+Linux 内存引擎持有一个 inotify fd 和一个 root 身份 fd；选择数据库时额外持有一个数据库父目录 fd，以 Unix dev/inode 核对身份。所有 Loci 管理的 inotify 来源共享 8 sessions / 128 watches 上限，包含旧原型会话；超限返回错误。stop/drop 释放来源、root 和数据库父目录 fd，查询 handle 不持有这些 fd。
 
 ## 验证入口与证据范围
 
