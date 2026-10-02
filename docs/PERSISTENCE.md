@@ -97,4 +97,6 @@ Windows 原生测试使用明确选择的临时目录与实际文件操作。`te
 
 两个 ignored 测试是现有显式性能测量，不是本轮性能结论。新引擎取消回归使用预置取消；执行中取消的既有覆盖来自共享查询原型。本轮未新增吞吐或内存改善声明。
 
+同步核对期间，Windows 功能分支新增 `245b0dfae49a907f599c69101de800d91857c5cc`；随后整合为 `e3d86e28a80581701557ce5b3397df4eefb88f59`，Windows 两个文件与来源提交一致。新增七项明确注入 completion/时钟的状态测试，覆盖跨 completion old/new、100 ms TTL、损坏记录/尾随 bytes、零字节、插入其他事件及 pending rename 停止。两轴增量审计未发现新问题。该精确代码提交的 debug/release 全量测试均 **96 passed、0 failed、2 ignored**；原生来源测试为 20 项（13 项真实平台夹具及 7 项注入状态测试），引擎仍 16 项、持久化仍 9 项，fmt/all-targets/linux-ffi-check 通过。lib test harness 对仅在独立 integration module 使用的两个注入方法报告 dead_code warning，生产构建无此测试入口。
+
 本轮当前 Linux 新引擎原生装配、Unix rename/fsync 执行、真实断电、长期运行、其他文件系统及生产调用方集成尚未验收。原 Linux 原型历史结果不能替代本轮精确提交的运行验证。许可证、release 和 main 合并仍待用户另行决定。
