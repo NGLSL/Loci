@@ -22,6 +22,22 @@ ticket12 39-query suite, and short-negative ii/ia/rr cases, without dropping any
 Its initial blank line is the empty query. JSON query arrays are not accepted.
 First pages use snapshot ID order; optional sort uses raw-byte lexical order.
 
+After all timed query loops, `--phase queries` independently traverses the raw
+native paths once and filters that bounded disk oracle for every query. It checks
+the first 50 subset and cardinality, complete typed paginated export, and exact
+asynchronous count against the same validated version. Empty, `report`, and
+`invoice ext:txt` queries also compare complete raw lexical sort results. Count
+and sort completion timings are separate from first-page timings; every job is
+dropped before the next case, and successful temporary sets are removed only
+after their hashes are logged. A mismatch keeps its raw evidence.
+
+The oracle does not use Engine matching or inventory internals. Terms use AND
+substring matching across lowercase valid UTF-8 runs; they cannot cross invalid
+bytes. `ext:` is case sensitive, and its last occurrence selects the extension.
+OR and NOT remain ordinary literal terms. For a wholly valid path, extension
+normalization follows the whole-path context; an invalid path uses the independently
+lowercased valid raw basename suffix, matching the established raw-query contract.
+
 Full measurement interface (opt-in, substantial IO/runtime):
 
     target/release/examples/linux_million_acceptance --controller \
