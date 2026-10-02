@@ -513,3 +513,33 @@ fn deleted_slots_and_renamed_directory_parents_survive_checkpoint_and_later_upda
     }
     reopened.save().unwrap();
 }
+
+#[test]
+fn simulated_external_source_uses_the_same_scale_checkpoint_format_and_lock() {
+    use loci_experiment::events::{EventBatch, EventSource};
+    struct Quiet;
+    impl EventSource for Quiet {
+        fn poll(&mut self) -> std::io::Result<EventBatch> {
+            Ok(EventBatch::default())
+        }
+        fn stop(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let _guard = NATIVE.lock().unwrap();
+    let fixture = Fixture::new();
+    let database = fixture.base.join("scale.loci");
+    fs::write(fixture.root.join("seed.txt"), "x").unwrap();
+    let mut external = Engine::with_source_and_options(
+        &fixture.root,
+        Some(&database),
+        Quiet,
+        EngineOptions::scale(),
+    )
+    .unwrap();
+    external.save().unwrap();
+    external.stop().unwrap();
+    let reopened =
+        Engine::open_with_options(&fixture.root, Some(&database), EngineOptions::scale()).unwrap();
+    assert_eq!(all(&reopened.query()), [fixture.root.join("seed.txt")]);
+}

@@ -457,6 +457,32 @@ impl Source {
     }
 }
 impl Engine {
+    #[cfg(target_os = "linux")]
+    fn start_scale(
+        root: PathBuf,
+        database: Option<&Path>,
+        identity: RootIdentity,
+        source: Source,
+        options: EngineOptions,
+    ) -> io::Result<Self> {
+        let mut engine = Self::start_unpolled(root, database, identity, source)?;
+        let source = engine.source.take().unwrap();
+        let mut runtime = scale::Runtime::new(&engine.root, source, options)?;
+        if let Some(path) = &engine.database {
+            let parent = &engine.database_parent.as_ref().unwrap()._file;
+            let name = path.file_name().unwrap();
+            engine.writer_lock = Some(scale::checkpoint::WriterLock::acquire(parent, name)?);
+            runtime.restore_checkpoint(parent, name, engine.identity.as_ref().unwrap().id)?;
+        }
+        runtime.check_selected_mount(&engine.identity.as_ref().unwrap()._file)?;
+        engine.scale = Some(runtime);
+        if let Err(error) = engine.poll() {
+            if engine.view().coverage_gaps.is_empty() {
+                return Err(error);
+            }
+        }
+        Ok(engine)
+    }
     pub fn open_with_options(
         root: &Path,
         database: Option<&Path>,
@@ -480,23 +506,7 @@ impl Engine {
                 options.event_limits,
                 options.watch_limit,
             )?;
-            let mut engine = Self::start_unpolled(root, database, identity, Source::Linux(source))?;
-            let source = engine.source.take().unwrap();
-            let mut runtime = scale::Runtime::new(&engine.root, source, options)?;
-            if let Some(path) = &engine.database {
-                let parent = &engine.database_parent.as_ref().unwrap()._file;
-                let name = path.file_name().unwrap();
-                engine.writer_lock = Some(scale::checkpoint::WriterLock::acquire(parent, name)?);
-                runtime.restore_checkpoint(parent, name, engine.identity.as_ref().unwrap().id)?;
-            }
-            runtime.check_selected_mount(&engine.identity.as_ref().unwrap()._file)?;
-            engine.scale = Some(runtime);
-            if let Err(error) = engine.poll() {
-                if engine.view().coverage_gaps.is_empty() {
-                    return Err(error);
-                }
-            }
-            Ok(engine)
+            Self::start_scale(root, database, identity, Source::Linux(source), options)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -551,22 +561,15 @@ impl Engine {
         }
         #[cfg(target_os = "linux")]
         {
-            if database.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "external scale source currently requires an in-memory session",
-                ));
-            }
             let root = fs::canonicalize(root)?;
             let identity = RootIdentity::open(&root)?;
-            let mut engine =
-                Self::start_unpolled(root, None, identity, Source::External(Box::new(source)))?;
-            let source = engine.source.take().unwrap();
-            let runtime = scale::Runtime::new(&engine.root, source, options)?;
-            runtime.check_selected_mount(&engine.identity.as_ref().unwrap()._file)?;
-            engine.scale = Some(runtime);
-            let _ = engine.poll();
-            Ok(engine)
+            Self::start_scale(
+                root,
+                database,
+                identity,
+                Source::External(Box::new(source)),
+                options,
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
