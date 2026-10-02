@@ -1,3 +1,5 @@
+#[path = "stages.rs"]
+mod stages;
 use crate::process::{self, DeadlineRead};
 use crate::protocol::{b, frame_read, frame_write, hex, invalid, n, s, unhex, Json};
 use crate::Options;
@@ -548,11 +550,12 @@ fn correctness(
     for path in log.retained_latest.drain(..) {
         remove_owned_artifact(&options.output, &path)?;
     }
-    let budget = crate::budget::Budget::new(
+    let budget = crate::budget::Budget::with_checkpoint(
         &options.output,
         options
             .output_budget_bytes
             .saturating_sub(320 * 1024 * 1024),
+        &options.database,
     )?;
     budget.check(2 * 1024 * 1024)?;
     let began = Instant::now();
@@ -1184,7 +1187,16 @@ fn fixture_copy(options: &Options, log: &mut Log) -> io::Result<()> {
 pub fn run(options: Options) -> io::Result<()> {
     if !matches!(
         options.phase.as_str(),
-        "all" | "smoke" | "correctness" | "queries" | "events" | "restart" | "idle" | "fixture"
+        "all"
+            | "smoke"
+            | "correctness"
+            | "queries"
+            | "events"
+            | "restart"
+            | "idle"
+            | "fixture"
+            | "directory-heavy"
+            | "stages"
     ) {
         return Err(invalid("unknownphase"));
     }
@@ -1192,11 +1204,12 @@ pub fn run(options: Options) -> io::Result<()> {
         fs::create_dir_all(&options.output)?;
     }
     process::owned_directory(&options.output)?;
-    let aggregate = crate::budget::Budget::new(
+    let aggregate = crate::budget::Budget::with_checkpoint(
         &options.output,
         options
             .output_budget_bytes
             .saturating_sub(320 * 1024 * 1024),
+        &options.database,
     )?;
     aggregate.check(2 * 1024 * 1024)?;
     let marker = options.output.join("driver-run-owner.json");
@@ -1208,6 +1221,20 @@ pub fn run(options: Options) -> io::Result<()> {
         ("schema", n(1u64)),
         ("sha", s(options.sha.clone())),
         ("controller_pid", n(std::process::id())),
+        ("binary_sha256", s(file_digest(&std::env::current_exe()?)?)),
+        (
+            "binary_path_hex",
+            s(hex(std::env::current_exe()?.as_os_str().as_bytes())),
+        ),
+        (
+            "query_file_sha256",
+            options
+                .queries
+                .as_ref()
+                .map_or(Ok(Json::Null), |p| file_digest(p).map(s))?,
+        ),
+        ("idle_seconds", n(options.idle_seconds)),
+        ("environment", process::environment()?),
         ("root_hex", s(hex(options.root.as_os_str().as_bytes()))),
         (
             "database_hex",
@@ -1285,7 +1312,10 @@ pub fn run(options: Options) -> io::Result<()> {
         return Ok(());
     }
     let initial = correctness(&mut worker, &options, "initial", &mut log)?;
-    if !options.smoke && initial != 1_000_000 {
+    if options.phase == "directory-heavy" && !options.smoke && initial != 30_501 {
+        return Err(invalid("directory-heavy fixture requires30,501entries"));
+    }
+    if !options.smoke && options.phase != "directory-heavy" && initial != 1_000_000 {
         return Err(invalid("million baseline must beexact1,000,000realentries"));
     }
     if matches!(options.phase.as_str(), "all" | "queries") {
@@ -1296,28 +1326,20 @@ pub fn run(options: Options) -> io::Result<()> {
         sampler.phase("event");
         event_bench(&mut worker, &options, &mut log, initial)?;
     }
-    if options.phase == "all" {
+    if matches!(options.phase.as_str(), "all" | "stages" | "directory-heavy") {
+        sampler.phase("subtree");
+        stages::subtree(
+            &mut worker,
+            &options,
+            &mut log,
+            options.phase == "directory-heavy",
+        )?;
         sampler.phase("compaction");
-        let before = worker.status()?;
-        worker.operation("COMPACT", &[])?;
-        worker.wait_validated(Duration::from_secs(3600))?;
-        log.record(
-            "compaction",
-            Json::object([("before", before), ("after", worker.status()?)]),
-        )?;
-        correctness(&mut worker, &options, "compaction", &mut log)?;
+        stages::compaction(&mut worker, &options, &mut log)?;
+        sampler.phase("cancellation");
+        stages::cancellations(&mut worker, &mut log)?;
         sampler.phase("correction");
-        let start = Instant::now();
-        worker.operation("REBUILD", &[])?;
-        worker.wait_validated(Duration::from_secs(3600))?;
-        log.record(
-            "full-correction",
-            Json::object([
-                ("elapsed_ns", n(start.elapsed().as_nanos())),
-                ("status", worker.status()?),
-            ]),
-        )?;
-        correctness(&mut worker, &options, "correction", &mut log)?;
+        stages::corrections(&mut worker, &options, &mut log)?;
     }
     if matches!(options.phase.as_str(), "all" | "idle") {
         sampler.phase("quiet");
@@ -1329,9 +1351,11 @@ pub fn run(options: Options) -> io::Result<()> {
     } else {
         1
     };
+    let mut save_times = Vec::new();
     for index in 0..save_reps {
         let start = Instant::now();
         let saved = worker.operation("SAVE", &[])?;
+        save_times.push(start.elapsed().as_nanos() as u64);
         log.record(
             "save",
             Json::object([
@@ -1341,6 +1365,17 @@ pub fn run(options: Options) -> io::Result<()> {
             ]),
         )?;
     }
+    log.record(
+        "save-summary",
+        Json::object([
+            ("samples", n(save_times.len())),
+            ("p50_ns", n(percentile(&save_times, 50))),
+            ("p95_ns", n(percentile(&save_times, 95))),
+            ("p99_ns", n(percentile(&save_times, 99))),
+            ("cache_state", s("warm-or-unspecified-filesystem-cache")),
+            ("acceptance", b(false)),
+        ]),
+    )?;
     sampler.finish()?;
     log.record("stop", worker.stop()?)?;
     if matches!(options.phase.as_str(), "all" | "restart") {

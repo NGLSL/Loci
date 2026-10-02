@@ -455,11 +455,12 @@ pub fn run(options: Options) -> io::Result<()> {
     process::owned_directory(&options.root)?;
     fs::create_dir_all(&options.output)?;
     process::owned_directory(&options.output)?;
-    let budget = crate::budget::Budget::new(
+    let budget = crate::budget::Budget::with_checkpoint(
         &options.output,
         options
             .output_budget_bytes
             .saturating_sub(320 * 1024 * 1024),
+        &options.database,
     )?;
     budget.check(2 * 1024 * 1024)?;
     let baseline = process::sample(std::process::id())?;

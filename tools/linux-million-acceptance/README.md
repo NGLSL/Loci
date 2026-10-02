@@ -65,3 +65,30 @@ cannot establish ext4/Btrfs or the localSSD/NVMe reference class. Numerical fail
 and unsupported/unverified gates remain explicit. Native filesystem runners,
 exact-commit Windows validation and uninterrupted24h supervision are separate
 gates. Do not infer a million performance result from the small protocol tests.
+
+`--phase stages` runs full byte/kind comparisons around a real top-level subtree
+rename, exports a held old lease, restores the fixture, waits for actual
+compaction publication (epoch and completed counter), exercises query and
+correction cancellation, and measures three complete corrections independently.
+`--phase directory-heavy` runs those stages on the owned dense fixture with
+30,501 entries; it records a separate stress result rather than a million-entry
+headline. A reduced custom fixture requires `--smoke`.
+
+The manifest binds the supplied source SHA, executable SHA256, query-file SHA256,
+kernel/CPU/memory facts and configured run options. Samples include actual
+`/proc/PID/io` counters when readable. The aggregate output budget includes the
+external checkpoint file; 320 MiB is separately reserved for bounded logs.
+Successful comparisons remove owned duplicate files after recording hashes;
+failed sets remain available.
+
+A small real worker protocol check is available separately:
+
+```sh
+python3 tools/linux-million-acceptance/protocol_smoke.py \
+  --binary /absolute/target/release/examples/linux_million_acceptance \
+  --sha EXACT_40_CHARACTER_SOURCE_SHA --output-parent /owned/absolute/directory
+```
+
+It checks native capture, invalid UTF-8, symlink/hardlink kinds, a held snapshot,
+exact count/sort, and release of watches and descriptors in the same live PID.
+It establishes neither million-entry performance nor reference hardware acceptance.

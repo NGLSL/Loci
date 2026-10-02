@@ -205,6 +205,21 @@ pub fn sample(pid: u32) -> io::Result<Json> {
         }
         Err(e) => return Err(e),
     }
+    let io_fields = fs::read_to_string(root.join("io"))
+        .ok()
+        .map(|text| {
+            let mut result = std::collections::BTreeMap::new();
+            for line in text.lines() {
+                if let Some((key, value)) = line.split_once(':') {
+                    if let Ok(value) = value.trim().parse::<u64>() {
+                        result.insert(key.to_owned(), n(value));
+                    }
+                }
+            }
+            Json::Object(result)
+        })
+        .unwrap_or(Json::Null);
+    fields.insert("io_counters".into(), io_fields);
     fields.insert("kernel_slab_bytes".into(), Json::Null);
     fields.insert(
         "kernel_slab_reason".into(),
@@ -246,4 +261,26 @@ impl<T: Read + AsRawFd> Read for DeadlineRead<'_, T> {
             return self.stream.read(buf);
         }
     }
+}
+
+pub fn environment() -> io::Result<Json> {
+    fn bounded(path: &str, limit: usize) -> Json {
+        match fs::read(path) {
+            Ok(bytes) if bytes.len() <= limit => s(String::from_utf8_lossy(&bytes)),
+            _ => Json::Null,
+        }
+    }
+    Ok(Json::object([
+        (
+            "kernel_release",
+            bounded("/proc/sys/kernel/osrelease", 4096),
+        ),
+        ("cpuinfo", bounded("/proc/cpuinfo", 256 * 1024)),
+        ("meminfo", bounded("/proc/meminfo", 32 * 1024)),
+        (
+            "available_parallelism",
+            n(std::thread::available_parallelism()?.get()),
+        ),
+        ("reference_hardware_verified", b(false)),
+    ]))
 }
