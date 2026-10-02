@@ -40,6 +40,57 @@ fn wait_advance(worker: &mut Worker, before: &Json, compaction: bool) -> io::Res
         thread::sleep(Duration::from_millis(20));
     }
 }
+fn settle_resources(
+    worker: &mut Worker,
+    options: &Options,
+    log: &mut Log,
+    stage: &str,
+) -> io::Result<()> {
+    let before = worker.status()?;
+    let first = process::sample(worker.child.id())?;
+    let requested = if options.smoke { 1 } else { 5 };
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(requested) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let after = worker.status()?;
+    let last = process::sample(worker.child.id())?;
+    let quiet_single_epoch = before.get("status")?.text()? == "Validated"
+        && after.get("status")?.text()? == "Validated"
+        && before.get("version")?.number()? == after.get("version")?.number()?
+        && after.get("leases")?.number()? == 0
+        && !after
+            .get("resources")?
+            .get("compaction_in_progress")?
+            .boolean()?;
+    log.record(
+        "maintenance-settle",
+        Json::object([
+            ("stage", s(stage)),
+            ("actual_ns", n(started.elapsed().as_nanos())),
+            ("before", before),
+            ("after", after),
+            ("first_resources", first),
+            (
+                "rss_numeric_pass",
+                b(last.get("vmrss_bytes")?.number()? <= 200 * 1024 * 1024),
+            ),
+            (
+                "hwm_numeric_pass",
+                b(last.get("vmhwm_bytes")?.number()? <= 512 * 1024 * 1024),
+            ),
+            ("quiet_single_epoch", b(quiet_single_epoch)),
+            ("last_resources", last),
+            ("acceptance", b(false)),
+        ]),
+    )?;
+    if !quiet_single_epoch {
+        return Err(invalid(
+            "maintenance settle did not preserve unleased validated epoch",
+        ));
+    }
+    Ok(())
+}
 pub(super) fn compaction(worker: &mut Worker, options: &Options, log: &mut Log) -> io::Result<()> {
     let before = worker.status()?;
     let start = Instant::now();
@@ -58,6 +109,7 @@ pub(super) fn compaction(worker: &mut Worker, options: &Options, log: &mut Log) 
             ("resources", process::sample(worker.child.id())?),
         ]),
     )?;
+    settle_resources(worker, options, log, "compaction")?;
     correctness(worker, options, "compaction", log)?;
     Ok(())
 }
@@ -78,6 +130,7 @@ pub(super) fn corrections(worker: &mut Worker, options: &Options, log: &mut Log)
                 ("cache_state", s("warm-or-unspecified-filesystem-cache")),
             ]),
         )?;
+        settle_resources(worker, options, log, &format!("correction-{trial}"))?;
         correctness(worker, options, &format!("correction-{trial}"), log)?;
     }
     Ok(())
