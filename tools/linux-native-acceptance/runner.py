@@ -61,10 +61,12 @@ def stage_tools(root):
     """Owned overlay context only; do not mutate the shared probe image/rootfs."""
     root = Path(root)
     paths = set()
-    for name in ('kill', 'mkfifo', 'true'):
+    for name in ('kill', 'mkfifo', 'true', 'sort'):
         tool = shutil.which(name)
         if not tool:
             raise ValueError(f'required host tool missing: {name}')
+        if name == 'sort' and 'GNU coreutils' not in cmd_output([tool, '--version']):
+            raise ValueError('million controller requires GNU sort with -z/-S; BusyBox sort is not accepted')
         paths.add(Path(tool).resolve())
         text = cmd_output(['ldd', tool])
         paths.update(Path(path).resolve() for path in re.findall(r'(/[^\s()]+)', text))
@@ -345,7 +347,7 @@ def main():
     execute.add_argument('--test-timeout', type=int, default=600)
     execute.add_argument('--container-timeout', type=int, default=7200)
     execute.add_argument('--fixture-data', type=Path)
-    execute.add_argument('--queries', type=Path)
+    execute.add_argument('--queries', type=Path, help='UTF-8 newline-text query suite, one literal query per line; not JSON')
     execute.add_argument('--million-timeout', type=int, default=3600)
     execute.add_argument('--plan-only', action='store_true')
     classify = sub.add_parser('classify-log', help='assess one retained Rust test log without building or running workloads')

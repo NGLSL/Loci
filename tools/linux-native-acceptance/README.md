@@ -29,10 +29,12 @@ create their own user/mount namespace.
 The base image must provide Bash, `cat`, `cp`, `df`, `findmnt`, `id`, `mkdir`,
 `mount`, `stat`, `timeout`, `umount`, `uname`, `unshare`, `sha256sum`, the launcher,
 and their runtime libraries. `prepare` snapshots missing helpers `kill`, `mkfifo`,
-`true` and their `ldd` libraries into the owned artifact directory. It never
+`true`, GNU `sort` and their `ldd` libraries into the owned artifact directory. It never
 mutates a shared rootfs, image or global installation. `Dockerfile.runtime`
 allows a later unified runtime-image build; by default the runner mounts those
 snapshots read-only at their exact tool/library paths with digest verification.
+The million controller requires GNU `sort -z -S` for bounded raw-path sorting;
+minimal images and BusyBox support are not assumed.
 Runtime snapshots, images, result logs and preparation artifacts belong outside
 Git.
 
@@ -140,7 +142,10 @@ existence or a smaller fixture's success.
 
 The optional hook uses the separate `linux_million_acceptance` example. It does
 not duplicate the production worker, fixture/oracle implementation or query
-benchmarks. Check that example's final interface before native execution.
+benchmarks. `--queries` takes UTF-8 plain text with one literal query per line,
+not a JSON array. Use the final driver's complete query suite rather than a
+smaller baseline; retain its digest with the driver results. Check that example's
+final interface before native execution.
 
 ```sh
 python3 tools/linux-native-acceptance/runner.py run \
@@ -148,7 +153,7 @@ python3 tools/linux-native-acceptance/runner.py run \
   --results /owned/results/ext4-all-FROZEN_SHA \
   --image PREPARED_IMAGE --image-id sha256:VERIFIED_IMAGE_ID \
   --phases suites,100k,overflow,million \
-  --fixture-data /owned/fixture/data --queries /owned/fixture/queries.json
+  --fixture-data /owned/fixture/data --queries /owned/fixture/queries.txt
 ```
 
 The source corpus binds read-only at `/input` and copies as real files onto the
