@@ -159,12 +159,18 @@ fn unobserved_directory_replacing_an_entry_is_corrected_before_validation() {
     let _guard = NATIVE.lock().unwrap();
     let fixture = Fixture::new();
     fs::create_dir(fixture.root.join("active")).unwrap();
-    // The bounded control exclusions are retained until scope configuration is
-    // introduced. This inode has no recursively observed source entry.
+    // The explicitly excluded source inode has no recursively observed entry.
     fs::create_dir(fixture.root.join("target")).unwrap();
     fs::write(fixture.root.join("target/incoming.txt"), b"x").unwrap();
-    let mut engine =
-        Engine::open_with_options(&fixture.root, None, EngineOptions::scale()).unwrap();
+    let mut engine = Engine::open_with_options(
+        &fixture.root,
+        None,
+        EngineOptions {
+            exclusions: vec![PathBuf::from("target")],
+            ..EngineOptions::scale()
+        },
+    )
+    .unwrap();
     let scans = engine.metrics().full_scans;
     fs::rename(fixture.root.join("target"), fixture.root.join("active")).unwrap();
     settle(

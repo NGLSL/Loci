@@ -55,3 +55,33 @@ opening scale mode; saving a scale checkpoint returns Unsupported. No format is
 silently migrated. The small native tests executed on overlayfs establish the
 model and API behavior only, not million-entry, ext4/Btrfs, Windows native,
 24-hour or RSS/performance acceptance.
+
+## Raw-name and source-scope extension (LOCI-LINUX-001-05)
+
+Scale mode now accepts original basename bytes, including non-UTF-8 bytes. The
+shared query matcher searches lowercase valid UTF-8 runs without joining across
+invalid bytes; distinct AND terms may match different valid runs. Extension
+filters examine the valid filename suffix. Symlinks, including dangling links,
+are snapshot entries with `EntryKind::Symlink`; enumeration never follows them.
+`QueryLease::entry_kind(absolute_path)` obtains kind from the pinned scale
+snapshot, without consulting the current filesystem. Its initial lookup is linear;
+bounded compatibility snapshots return Unsupported.
+
+Scale exclusions are explicit relative subtree paths, defaulting to empty.
+The control implementation keeps its historical exclusions. Selected database
+output and temporary saves remain outside the monitored root. Nested mounts are
+included as directory boundary entries but their contents are excluded from the
+single-root source. Linux mount IDs and escaped raw paths from mountinfo detect
+bind mounts even when device/inode matches. The selected root is bound to the
+mount of the originally opened root descriptor; rebinding it fails the source.
+A nested mount table change invalidates current coverage and starts correction.
+Unavailable, over-budget or unrecognized mount metadata fails explicitly and
+preserves the older query snapshot. Mount table polling is currently conservative;
+later scheduling/idle work must budget its overhead. It does not promise detection
+of an attachment removed again entirely between observation cutoffs.
+
+The CLI routes root/database/exclusion arguments as OS strings and supports
+`--scale --exclude RELATIVE_PATH`, with exact raw-byte NUL export. Query text stays
+UTF-8. Native scope evidence includes same-device bind mounts and root rebinding
+in a private user/mount namespace; these overlayfs tests do not establish ext4 or
+Btrfs scale acceptance.

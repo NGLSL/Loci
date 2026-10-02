@@ -75,3 +75,30 @@ this page. No exact total count is needed to produce a page.
 `--page-size` requires `--all`. Output preserves exact NUL-delimited path bytes
 with `--null`. A failed or pending export exits 4 and can have partial output;
 callers requiring an atomic output file should stage it and check the exit code.
+
+Scale raw-name and scope mode:
+
+```sh
+cargo run -- engine query /chosen/root /outside/unused.loci '报告 ext:txt' --scale --exclude private --all --null
+```
+
+All `engine` commands accept `--scale` and repeatable `--exclude RELATIVE_PATH`.
+Exclusions omit the named relative entry and its descendants, default to empty,
+and require scale mode; `.git` and `target` are included unless configured.
+Root, database and exclusion arguments preserve OS bytes. Query text must be
+UTF-8. Legal UTF-8 runs in unusual names remain searchable with lowercase AND
+matching, but a single term never matches across an invalid byte. Display quotes
+escape invalid bytes as `\xNN` and newline as `\n`; `--null` preserves all original
+path bytes without shell interpretation. Symlinks are listed without following
+external targets, dangling targets, or cycles.
+
+The selected root uses one mount source. Nested mount directories are included
+as boundary entries and contents are omitted, including same-device bind mounts.
+Mount changes invalidate coverage for correction; selected-root rebinding or
+unknown mount metadata reports a failure rather than validated coverage.
+`watch` and its `rebuild` command retain the selected scale/exclusion options.
+Scale checkpoints remain unsupported until the persistence milestone: transient
+query/status are usable, while build/save and watch stop report Unsupported and
+preserve existing data. The initial small scale scan is batched; a large initial
+root can still be Pending before the later CLI readiness milestone. The bounded
+mode and its existing format/limits remain the default.

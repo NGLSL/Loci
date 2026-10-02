@@ -23,11 +23,13 @@ pub enum EngineMode {
     Scale,
 }
 /// Explicit opt-in. Bounded behavior and format remain the default on both OSes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct EngineOptions {
     pub mode: EngineMode,
     pub limits: Limits,
     pub scan_batch: usize,
+    /// Explicit relative paths whose entries and descendants are excluded in scale mode.
+    pub exclusions: Vec<PathBuf>,
 }
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -35,6 +37,7 @@ impl Default for EngineOptions {
             mode: EngineMode::Bounded,
             limits: Limits::default(),
             scan_batch: 256,
+            exclusions: Vec::new(),
         }
     }
 }
@@ -133,7 +136,30 @@ impl QueryHandle {
         })
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Directory,
+    Symlink,
+}
 impl QueryLease {
+    /// Kind from the immutable scale snapshot, never a live filesystem lookup.
+    /// The bounded compatibility backend does not retain kinds and returns Unsupported.
+    pub fn entry_kind(&self, path: &Path) -> io::Result<EntryKind> {
+        let relative = path.strip_prefix(&*self.root).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "entry outside selected root")
+        })?;
+        #[cfg(target_os = "linux")]
+        if let LeaseBackend::Scale(lease) = &self.lease {
+            return lease.entry_kind(relative);
+        }
+        let _ = relative;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "entry kinds require scale snapshots",
+        ))
+    }
+
     /// Returns at most `page_size` paths from a pinned immutable snapshot.
     /// Drop the lease to release reader retention; cursors never retain a lease.
     pub fn page(
@@ -307,6 +333,12 @@ impl Engine {
         options: EngineOptions,
     ) -> io::Result<Self> {
         if options.mode == EngineMode::Bounded {
+            if !options.exclusions.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "explicit exclusions require scale mode",
+                ));
+            }
             return Self::open(root, database);
         }
         #[cfg(target_os = "linux")]
@@ -326,7 +358,9 @@ impl Engine {
             let source = crate::linux_events::LinuxEvents::open(&root, EventLimits::default())?;
             let mut engine = Self::start_unpolled(root, database, identity, Source::Linux(source))?;
             let source = engine.source.take().unwrap();
-            engine.scale = Some(scale::Runtime::new(&engine.root, source, options)?);
+            let runtime = scale::Runtime::new(&engine.root, source, options)?;
+            runtime.check_selected_mount(&engine.identity.as_ref().unwrap()._file)?;
+            engine.scale = Some(runtime);
             engine.poll()?;
             Ok(engine)
         }

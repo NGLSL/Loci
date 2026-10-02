@@ -1,12 +1,15 @@
 //! Real-directory CLI adapter over the public bounded Engine.
-use loci_experiment::engine::{Engine, QueryHandle, Status, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+use loci_experiment::engine::{
+    Engine, EngineMode, EngineOptions, QueryHandle, Status, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+};
+use std::ffi::OsString;
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-const HELP: &str = "Real directory commands (bounded v0.1 Engine, not synthetic data):
+const HELP: &str = "Real directory commands (public Engine, not synthetic data):
   engine build ROOT DATABASE
   engine query ROOT DATABASE QUERY [--null] [--all [--page-size N]]
   engine status ROOT DATABASE
@@ -21,9 +24,13 @@ Query terms use case-insensitive AND substrings and ext: filters.
 Results go to stdout (escaped Rust strings, or exact NUL-delimited paths with --null).
 Status and errors go to stderr. Validated means last reliable observation, not perpetual freshness.
 Exit codes: 0 success, 2 invalid arguments, 3 failure, 4 pending/incomplete results.
+All engine commands accept --scale [--exclude RELATIVE_PATH] (repeatable).
+Scale mode preserves raw names and lists symlinks without following targets; defaults to
+no configured exclusions and no descent across nested mount points. Scale checkpoints
+are currently unsupported; transient query/status work, saving reports Unsupported.
 Existing build/bench/query/scan/live-check commands remain experiments.";
 
-pub fn entry(args: &[String]) {
+pub fn entry(args: &[OsString]) {
     if let Err(error) = run(args) {
         eprintln!(
             "engine: {error} (bounded v0.1: 4096 entries, 128 directories, 1 MiB UTF-8 paths)"
@@ -37,36 +44,38 @@ pub fn entry(args: &[String]) {
     }
 }
 
-fn run(args: &[String]) -> io::Result<()> {
-    if args == ["--help"] || args == ["help"] {
+fn run(args: &[OsString]) -> io::Result<()> {
+    if args.len() == 1 && (args[0] == "--help" || args[0] == "help") {
         eprintln!("{HELP}");
         return Ok(());
     }
-    let action = args.first().map(String::as_str).unwrap_or("");
-    let valid = match action {
-        "build" | "rebuild" | "status" => args.len() == 3,
-        "watch" => args.len() == 3 || (args.len() == 4 && args[3] == "--null"),
-        "query" => args.len() >= 4,
-        _ => false,
+    let action = args.first().and_then(|arg| arg.to_str()).unwrap_or("");
+    let base = match action {
+        "build" | "rebuild" | "status" | "watch" => 3,
+        "query" => 4,
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, HELP)),
     };
-    if !valid {
+    if args.len() < base {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, HELP));
     }
-    let (nul, all, page_size) = if action == "query" {
-        query_options(&args[4..])?
-    } else {
-        (args.len() == 4, false, DEFAULT_PAGE_SIZE)
-    };
+    let (nul, all, page_size, options) = query_options(&args[base..], action)?;
     let root = Path::new(&args[1]);
     let database = Path::new(&args[2]);
-    let mut engine = Engine::open(root, Some(database))?;
+    let mut engine = Engine::open_with_options(root, Some(database), options.clone())?;
     if action == "watch" {
-        return watch(engine, root, database, args.len() == 4);
+        return watch(engine, root, database, nul, options);
     }
+    let raw = if action == "query" {
+        args[3].to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "query text must be UTF-8")
+        })?
+    } else {
+        ""
+    };
     let result = match action {
         "build" | "rebuild" => status(&engine.query()).and_then(|()| engine.save()),
-        "query" if all => export(&engine.query(), &args[3], nul, page_size),
-        "query" => query(&engine.query(), &args[3], nul),
+        "query" if all => export(&engine.query(), raw, nul, page_size),
+        "query" => query(&engine.query(), raw, nul),
         "status" => status(&engine.query()),
         _ => unreachable!(),
     };
@@ -79,20 +88,41 @@ fn run(args: &[String]) -> io::Result<()> {
     result.and(stop)
 }
 
-fn query_options(args: &[String]) -> io::Result<(bool, bool, usize)> {
+fn query_options(
+    args: &[OsString],
+    action: &str,
+) -> io::Result<(bool, bool, usize, EngineOptions)> {
     let mut nul = false;
     let mut all = false;
     let mut page_size = DEFAULT_PAGE_SIZE;
     let mut size_given = false;
+    let mut scale = false;
+    let mut options = EngineOptions::default();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--null" if !nul => nul = true,
-            "--all" if !all => all = true,
-            "--page-size" if !size_given => {
+        match args[i].to_str().unwrap_or("") {
+            "--null" if !nul && (action == "query" || action == "watch") => nul = true,
+            "--all" if !all && action == "query" => all = true,
+            "--scale" if !scale => {
+                scale = true;
+                options.mode = EngineMode::Scale;
+            }
+            "--exclude" => {
+                i += 1;
+                options
+                    .exclusions
+                    .push(args.get(i).map(std::path::PathBuf::from).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--exclude requires a relative path",
+                        )
+                    })?);
+            }
+            "--page-size" if !size_given && action == "query" => {
                 i += 1;
                 page_size = args
                     .get(i)
+                    .and_then(|n| n.to_str())
                     .and_then(|n| n.parse().ok())
                     .filter(|n| (1..=MAX_PAGE_SIZE).contains(n))
                     .ok_or_else(|| {
@@ -110,7 +140,20 @@ fn query_options(args: &[String]) -> io::Result<(bool, bool, usize)> {
             "--page-size requires --all",
         ));
     }
-    Ok((nul, all, page_size))
+    if scale {
+        let exclusions = options.exclusions;
+        options = EngineOptions {
+            exclusions,
+            ..EngineOptions::scale()
+        };
+    }
+    if !options.exclusions.is_empty() && !scale {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--exclude requires --scale",
+        ));
+    }
+    Ok((nul, all, page_size, options))
 }
 
 fn export(handle: &QueryHandle, raw: &str, nul: bool, page_size: usize) -> io::Result<()> {
@@ -128,8 +171,7 @@ fn export(handle: &QueryHandle, raw: &str, nul: bool, page_size: usize) -> io::R
             &AtomicUsize::new(0),
         )?;
         page_number += 1;
-        eprintln!("engine,page={page_number},version={},state={:?},complete={},validated={},paths_returned={}",
-            page.version, page.finished.status, page.complete, page.validated_at_start_and_finish, page.paths.len());
+        eprintln!("engine,page={page_number},version={},state={:?},complete={},validated={},paths_returned={}", page.version, page.finished.status, page.complete, page.validated_at_start_and_finish, page.paths.len());
         write_paths(&mut output, page.paths, nul)?;
         if !page.validated_at_start_and_finish || page.cancelled {
             return Err(io::Error::new(
@@ -221,7 +263,13 @@ fn write_paths(
     Ok(())
 }
 
-fn watch(mut engine: Engine, root: &Path, database: &Path, nul: bool) -> io::Result<()> {
+fn watch(
+    mut engine: Engine,
+    root: &Path,
+    database: &Path,
+    nul: bool,
+    options: EngineOptions,
+) -> io::Result<()> {
     // A bounded command queue keeps monitoring independent from terminal input.
     let (sender, receiver) = mpsc::sync_channel(8);
     std::thread::spawn(move || {
@@ -290,7 +338,7 @@ fn watch(mut engine: Engine, root: &Path, database: &Path, nul: bool) -> io::Res
                 "rebuild" => {
                     // Opening the public Engine performs a new root reconciliation.
                     engine.stop()?;
-                    engine = Engine::open(root, Some(database))?;
+                    engine = Engine::open_with_options(root, Some(database), options.clone())?;
                     failed = false;
                     ("rebuild", status(&engine.query()))
                 }

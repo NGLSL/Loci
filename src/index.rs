@@ -340,6 +340,41 @@ impl Query {
         }
         q
     }
+    /// Match valid UTF-8 runs separately, preserving invalid filesystem bytes.
+    /// Each AND term may occur in any run; a term never spans an invalid byte.
+    pub fn matches_raw(&self, path: &[u8]) -> bool {
+        if let Ok(text) = std::str::from_utf8(path) {
+            return self.matches(text);
+        }
+        let mut remainder = path;
+        let mut runs = Vec::new();
+        while !remainder.is_empty() {
+            match std::str::from_utf8(remainder) {
+                Ok(text) => {
+                    runs.push(normalize(text));
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 {
+                        runs.push(normalize(std::str::from_utf8(&remainder[..valid]).unwrap()));
+                    }
+                    let invalid = error.error_len().unwrap_or(remainder.len() - valid);
+                    remainder = &remainder[valid + invalid..];
+                }
+            }
+        }
+        self.tokens.iter().all(|token| {
+            runs.iter()
+                .any(|run| contains(run.as_bytes(), token.as_bytes()))
+        }) && self.ext.as_ref().is_none_or(|ext| {
+            let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+            let Some(dot) = name.iter().rposition(|byte| *byte == b'.') else {
+                return false;
+            };
+            std::str::from_utf8(&name[dot + 1..]).is_ok_and(|suffix| normalize(suffix) == *ext)
+        })
+    }
     pub fn matches(&self, path: &str) -> bool {
         let path = normalize(path);
         self.tokens
@@ -347,7 +382,7 @@ impl Query {
             .all(|t| contains(path.as_bytes(), t.as_bytes()))
             && self.ext.as_ref().is_none_or(|e| {
                 path.rsplit_once('/')
-                    .unwrap()
+                    .unwrap_or(("", &path))
                     .1
                     .rsplit_once('.')
                     .is_some_and(|(_, ext)| ext == e)

@@ -385,9 +385,23 @@ fn live_check(_args: &[String]) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let os_args: Vec<_> = std::env::args_os().collect();
+    if os_args.get(1).is_some_and(|arg| arg == "engine") {
+        engine_cli::entry(&os_args[2..]);
+        return Ok(());
+    }
+    let args: Vec<String> = os_args
+        .into_iter()
+        .map(|arg| {
+            arg.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "experimental command arguments must be UTF-8",
+                )
+            })
+        })
+        .collect::<io::Result<_>>()?;
     match args.get(1).map(String::as_str) {
-        Some("engine") => engine_cli::entry(&args[2..]),
         Some("live-check") => live_check(&args[2..])?,
         Some("build") => {
             let n: usize = args[2].parse().unwrap();

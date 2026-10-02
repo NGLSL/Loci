@@ -1,7 +1,8 @@
-use super::inventory::Data;
+use super::inventory::{Data, Kind};
 use crate::engine::{QueryPage, QueryResult, Status, View, MAX_PAGE_SIZE};
 use crate::index::Query;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -102,6 +103,23 @@ impl Drop for Lease {
     }
 }
 impl Lease {
+    pub fn entry_kind(&self, relative: &std::path::Path) -> io::Result<crate::engine::EntryKind> {
+        for id in 1..self.snapshot.data.slots {
+            let entry = self.snapshot.data.entry(id as u32);
+            if entry.alive && self.snapshot.data.path(id as u32) == relative {
+                return Ok(match entry.kind {
+                    Kind::File => crate::engine::EntryKind::File,
+                    Kind::Directory => crate::engine::EntryKind::Directory,
+                    Kind::Symlink => crate::engine::EntryKind::Symlink,
+                });
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "entry absent from snapshot",
+        ))
+    }
+
     fn validated(&self, finished: &View) -> bool {
         self.started.status == Status::Validated
             && finished.status == Status::Validated
@@ -149,10 +167,9 @@ impl Lease {
                 continue;
             }
             let path = self.snapshot.data.path(id);
-            let text = path.to_str().ok_or_else(|| {
-                io::Error::other("scale text query requires UTF-8 names at this stage")
-            })?;
-            if query.matches(&format!("/{text}")) {
+            let mut raw_path = vec![b'/'];
+            raw_path.extend_from_slice(path.as_os_str().as_bytes());
+            if query.matches_raw(&raw_path) {
                 paths.push(path);
             }
             if visited % 64 == 0 {

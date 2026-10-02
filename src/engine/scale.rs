@@ -2,6 +2,7 @@
 //! native mode; persistence and increased scale budgets are separate milestones.
 mod inventory;
 pub(super) mod query;
+mod scope;
 use super::{EngineOptions, Source, Status};
 use crate::events::{Change, EventSource, SourceState};
 use crate::incremental::{Metrics, Topology};
@@ -27,6 +28,7 @@ pub(super) struct Runtime {
     root: PathBuf,
     source: Source,
     options: EngineOptions,
+    scope: scope::Scope,
     inventory: Inventory,
     scan: Option<Scan>,
     pending: Vec<Change>,
@@ -45,8 +47,12 @@ impl Runtime {
                 "scan batch must be positive",
             ));
         }
+        for exclusion in &options.exclusions {
+            crate::incremental::valid(exclusion)?;
+        }
         Ok(Self {
             root: root.to_path_buf(),
+            scope: scope::Scope::read(root)?,
             source,
             options,
             inventory: Inventory::new(0),
@@ -58,6 +64,31 @@ impl Runtime {
             store: query::Store::new(),
             metrics: Metrics::default(),
         })
+    }
+    pub fn check_selected_mount(&self, selected: &std::fs::File) -> io::Result<()> {
+        if scope::mount_id(selected)? != self.scope.root_mount {
+            return Err(io::Error::other(
+                "selected root mount changed during source installation",
+            ));
+        }
+        Ok(())
+    }
+    fn update_scope(&mut self) -> io::Result<()> {
+        let scope = scope::Scope::read(&self.root)?;
+        if scope.root_mount != self.scope.root_mount {
+            return Err(io::Error::other(
+                "selected root mount identity changed; reopen explicitly",
+            ));
+        }
+        if scope != self.scope {
+            self.scope = scope;
+            self.generation += 1;
+            self.correction = true;
+            self.scan = None;
+            self.pending.clear();
+            self.store.status(Status::Pending);
+        }
+        Ok(())
     }
     pub fn fail(&mut self, error: &io::Error) {
         self.store.status(Status::Failed(
@@ -73,7 +104,14 @@ impl Runtime {
         self.store.status(Status::Stopped);
         self.source.stop()
     }
+    fn excluded(&self, relative: &Path) -> bool {
+        self.options
+            .exclusions
+            .iter()
+            .any(|excluded| relative.starts_with(excluded))
+    }
     fn capture(&mut self) -> io::Result<()> {
+        self.update_scope()?;
         let batch = self.source.poll()?;
         if batch.state == SourceState::Stopped {
             return self.stop();
@@ -190,7 +228,7 @@ impl Runtime {
             let child = child?;
             processed += 1;
             self.metrics.scanned_entries += 1;
-            if crate::watch::skip(&child.path()) {
+            if self.excluded(child.path().strip_prefix(&self.root).unwrap()) {
                 continue;
             }
             let metadata = fs::symlink_metadata(child.path())?;
@@ -199,11 +237,6 @@ impl Runtime {
                 continue;
             };
             let name = child.file_name();
-            if name.to_str().is_none() {
-                return Err(io::Error::other(
-                    "scale text mode requires UTF-8 names at this stage",
-                ));
-            }
             let id = scan.inventory.insert(
                 directory.id,
                 name.as_bytes(),
@@ -216,7 +249,7 @@ impl Runtime {
             {
                 return Err(io::Error::other("scale inventory budget exhausted"));
             }
-            if kind == Kind::Directory {
+            if kind == Kind::Directory && !self.scope.boundary(&child.path()) {
                 scan.todo.push(Directory {
                     id,
                     path: child.path(),
@@ -242,9 +275,13 @@ impl Runtime {
         Ok(self.store.publish(self.inventory.data.clone()))
     }
     fn inspect(&mut self, relative: &Path) -> io::Result<Option<(Kind, Metadata)>> {
+        if self.excluded(relative) {
+            return Ok(None);
+        }
         let mut path = self.root.clone();
         let mut result = None;
-        for component in relative.components() {
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
             path.push(component.as_os_str());
             self.metrics.metadata_calls += 1;
             let metadata = match fs::symlink_metadata(&path) {
@@ -255,6 +292,11 @@ impl Runtime {
             let Some(kind) = kind(&metadata) else {
                 return Ok(None);
             };
+            if components.peek().is_some()
+                && (kind != Kind::Directory || self.scope.boundary(&path))
+            {
+                return Ok(None);
+            }
             result = Some((kind, metadata));
         }
         Ok(result)
@@ -270,7 +312,7 @@ impl Runtime {
         Ok(())
     }
     fn refresh(&mut self, path: &Path) -> io::Result<()> {
-        if crate::watch::skip(path) {
+        if self.excluded(path) {
             return self.remove(path);
         }
         let Some((kind, metadata)) = self.inspect(path)? else {
@@ -299,11 +341,6 @@ impl Runtime {
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::other("entry name missing"))?;
-        if name.to_str().is_none() {
-            return Err(io::Error::other(
-                "scale text mode requires UTF-8 names at this stage",
-            ));
-        }
         if self.inventory.entries >= self.options.limits.entries {
             return Err(io::Error::other("scale entry budget exhausted"));
         }
@@ -341,7 +378,7 @@ impl Runtime {
                         "ambiguous rename identity; correction required",
                     ));
                 }
-                if crate::watch::skip(&to) {
+                if self.excluded(&to) {
                     return self.remove(&from);
                 }
                 let parent = self
@@ -369,6 +406,8 @@ fn kind(metadata: &Metadata) -> Option<Kind> {
         Some(Kind::Directory)
     } else if metadata.is_file() {
         Some(Kind::File)
+    } else if metadata.file_type().is_symlink() {
+        Some(Kind::Symlink)
     } else {
         None
     }
