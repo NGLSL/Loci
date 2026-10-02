@@ -63,7 +63,7 @@ fn run(args: &[OsString]) -> io::Result<()> {
     let root = Path::new(&args[1]);
     let database = Path::new(&args[2]);
     let mut engine = Engine::open_with_options(root, Some(database), options.clone())?;
-    wait_for_snapshot(&mut engine)?;
+    wait_for_snapshot(&mut engine, all || action == "build" || action == "rebuild")?;
     if action == "watch" {
         return watch(engine, root, database, nul, options);
     }
@@ -201,9 +201,11 @@ fn query_options(
     Ok((nul, all, page_size, options))
 }
 
-fn wait_for_snapshot(engine: &mut Engine) -> io::Result<()> {
+fn wait_for_snapshot(engine: &mut Engine, require_validated: bool) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(90);
-    while engine.view().version == 0 {
+    while engine.view().version == 0
+        || (require_validated && engine.view().status != Status::Validated)
+    {
         if let Status::Failed(error) = engine.view().status {
             coverage(&engine.query());
             return Err(io::Error::other(error));
@@ -423,7 +425,7 @@ fn watch(
                     // Opening the public Engine performs a new root reconciliation.
                     engine.stop()?;
                     engine = Engine::open_with_options(root, Some(database), options.clone())?;
-                    wait_for_snapshot(&mut engine)?;
+                    wait_for_snapshot(&mut engine, true)?;
                     failed = false;
                     ("rebuild", status(&engine.query()))
                 }

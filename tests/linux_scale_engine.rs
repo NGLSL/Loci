@@ -142,16 +142,14 @@ fn scale_mode_never_silently_reuses_or_overwrites_a_legacy_database() {
     let error = Engine::open_with_options(&fixture.root, Some(&database), EngineOptions::scale())
         .err()
         .expect("scale mode must reject an existing unsupported checkpoint");
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("rebuild"));
     assert_eq!(fs::read(&database).unwrap(), bytes);
     let future = fixture.base.join("scale.loci");
     let mut scale =
         Engine::open_with_options(&fixture.root, Some(&future), EngineOptions::scale()).unwrap();
-    assert_eq!(
-        scale.save().unwrap_err().kind(),
-        std::io::ErrorKind::Unsupported
-    );
-    assert!(!future.exists());
+    scale.save().unwrap();
+    assert!(future.exists());
 }
 
 #[test]

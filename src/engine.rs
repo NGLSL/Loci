@@ -343,6 +343,8 @@ pub struct Engine {
     database: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     database_parent: Option<RootIdentity>,
+    #[cfg(target_os = "linux")]
+    writer_lock: Option<scale::checkpoint::WriterLock>,
     identity: Option<RootIdentity>,
     source: Option<Source>,
     state: Recovery,
@@ -429,16 +431,6 @@ impl Engine {
         }
         #[cfg(target_os = "linux")]
         {
-            if let Some(database) = database {
-                match fs::symlink_metadata(database) {
-                    Ok(_) => return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "scale checkpoint loading is not implemented; existing database preserved",
-                    )),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
             let root = fs::canonicalize(root)?;
             let identity = RootIdentity::open(&root)?;
             let source = crate::linux_events::LinuxEvents::open_scale(
@@ -448,7 +440,13 @@ impl Engine {
             )?;
             let mut engine = Self::start_unpolled(root, database, identity, Source::Linux(source))?;
             let source = engine.source.take().unwrap();
-            let runtime = scale::Runtime::new(&engine.root, source, options)?;
+            let mut runtime = scale::Runtime::new(&engine.root, source, options)?;
+            if let Some(path) = &engine.database {
+                let parent = &engine.database_parent.as_ref().unwrap()._file;
+                let name = path.file_name().unwrap();
+                engine.writer_lock = Some(scale::checkpoint::WriterLock::acquire(parent, name)?);
+                runtime.restore_checkpoint(parent, name, engine.identity.as_ref().unwrap().id)?;
+            }
             runtime.check_selected_mount(&engine.identity.as_ref().unwrap()._file)?;
             engine.scale = Some(runtime);
             if let Err(error) = engine.poll() {
@@ -556,6 +554,8 @@ impl Engine {
             database,
             #[cfg(target_os = "linux")]
             database_parent,
+            #[cfg(target_os = "linux")]
+            writer_lock: None,
             identity: Some(identity),
             source: Some(source),
             state: Recovery::new(EventLimits::default().max_events()),
@@ -835,13 +835,6 @@ impl Engine {
     }
     /// Save only a currently validated observation; never persist partial inventory.
     pub fn save(&mut self) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if self.scale.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "scale checkpoint format is not implemented yet",
-            ));
-        }
         if !self.poll()? || self.view().status != Status::Validated {
             return Err(io::Error::other(
                 "save requires a validated engine observation",
@@ -851,6 +844,21 @@ impl Engine {
             io::Error::new(io::ErrorKind::InvalidInput, "no database was selected")
         })?;
         self.check_root()?;
+        #[cfg(target_os = "linux")]
+        if let Some(scale) = &self.scale {
+            let parent = self
+                .database_parent
+                .as_ref()
+                .ok_or_else(|| io::Error::other("database parent unavailable"))?;
+            parent.check(path.parent().unwrap())?;
+            database_path(path, &self.root)?;
+            let bytes = scale.encode_checkpoint(self.identity.as_ref().unwrap().id)?;
+            return crate::storage::linux_atomic_save(
+                &parent._file,
+                path.file_name().unwrap(),
+                &bytes,
+            );
+        }
         let snapshot = Snapshot::new(&self.root, self.state.inventory.clone())?;
         #[cfg(target_os = "linux")]
         {
@@ -865,6 +873,15 @@ impl Engine {
             // Recheck containment as well as identity: the retained directory
             // itself may have moved inside root between API calls.
             database_path(path, &self.root)?;
+            let _writer =
+                scale::checkpoint::WriterLock::acquire(&parent._file, path.file_name().unwrap())?;
+            // A legacy owner opened before a scale checkpoint was created must
+            // reject that changed lineage instead of silently downgrading it.
+            match Snapshot::load(path, &self.root) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             snapshot.save_in_directory(
                 &parent._file,
                 path.file_name()
@@ -889,6 +906,8 @@ impl Engine {
         self.identity.take();
         #[cfg(target_os = "linux")]
         self.database_parent.take();
+        #[cfg(target_os = "linux")]
+        self.writer_lock.take();
         result
     }
 }

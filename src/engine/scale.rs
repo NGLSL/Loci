@@ -1,5 +1,6 @@
 //! Parent/name entry inventory behind the public Engine facade. Initial small
 //! native mode; persistence and increased scale budgets are separate milestones.
+pub(super) mod checkpoint;
 mod inventory;
 pub(super) mod query;
 mod scope;
@@ -98,6 +99,39 @@ impl Runtime {
             store: query::Store::new(budgets),
             metrics: Metrics::default(),
         })
+    }
+    pub fn restore_checkpoint(
+        &mut self,
+        parent: &std::fs::File,
+        name: &std::ffi::OsStr,
+        source: (u64, u64),
+    ) -> io::Result<bool> {
+        let Some((inventory, version)) = checkpoint::load(
+            parent,
+            name,
+            &self.root,
+            source,
+            self.scope.root_mount,
+            &self.options,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.store.seed(inventory.data.clone(), version)?;
+        self.inventory = inventory;
+        self.update_resources();
+        Ok(true)
+    }
+    pub fn encode_checkpoint(&self, source: (u64, u64)) -> io::Result<Vec<u8>> {
+        let (data, version) = self.store.checkpoint()?;
+        checkpoint::encode(
+            &self.root,
+            source,
+            self.scope.root_mount,
+            &self.options,
+            &data,
+            version,
+        )
     }
     fn clear_pending(&mut self) {
         self.pending.clear();
@@ -316,7 +350,12 @@ impl Runtime {
             self.metrics.full_scans += 1;
             self.scan = Some(Scan {
                 inventory: Inventory::new(
-                    self.inventory.data.epoch + 1,
+                    self.inventory.data.epoch.checked_add(1).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "source epoch exhausted; rebuild required",
+                        )
+                    })?,
                     self.options.scale_budgets,
                 )?,
                 todo: vec![Directory {

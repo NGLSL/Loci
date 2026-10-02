@@ -396,7 +396,11 @@ fn atomic_save(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_atomic_save(parent: &fs::File, name: &std::ffi::OsStr, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn linux_atomic_save(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    bytes: &[u8],
+) -> io::Result<()> {
     use std::ffi::{c_char, c_int, c_uint, CString};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;

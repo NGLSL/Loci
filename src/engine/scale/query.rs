@@ -54,6 +54,31 @@ impl Store {
             },
         }
     }
+    pub(super) fn checkpoint(&self) -> io::Result<(Data, u64)> {
+        let shared = self.handle.shared.lock().unwrap();
+        if shared.view.status != Status::Validated || !shared.view.coverage_gaps.is_empty() {
+            return Err(io::Error::other(
+                "checkpoint requires validated complete coverage",
+            ));
+        }
+        let snapshot = shared
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no checkpoint snapshot"))?;
+        Ok((snapshot.data.clone(), snapshot.version))
+    }
+    pub(super) fn seed(&self, data: Data, version: u64) -> io::Result<()> {
+        let mut shared = self.handle.shared.lock().unwrap();
+        if data.allocated_bytes() > shared.budgets.max_snapshot_bytes
+            || data.allocated_bytes() > shared.budgets.max_retained_bytes
+        {
+            return Err(io::Error::other("loaded checkpoint memory budget"));
+        }
+        shared.snapshot = Some(Arc::new(Snapshot { data, version }));
+        shared.view.version = version;
+        shared.view.status = Status::Pending;
+        Ok(())
+    }
     pub(super) fn retained_bytes(&self, writer: &Data, candidate: Option<&Data>) -> usize {
         let shared = self.handle.shared.lock().unwrap();
         let mut seen = HashSet::new();
@@ -123,7 +148,12 @@ impl Store {
         if data.allocated_bytes() > shared.budgets.max_snapshot_bytes {
             return Err(io::Error::other("snapshot byte budget exhausted"));
         }
-        shared.view.version += 1;
+        shared.view.version = shared.view.version.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot version exhausted; rebuild required",
+            )
+        })?;
         let version = shared.view.version;
         if let Some(old) = shared.snapshot.take() {
             shared.retired = Arc::downgrade(&old);

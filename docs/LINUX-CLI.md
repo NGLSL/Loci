@@ -97,11 +97,12 @@ as boundary entries and contents are omitted, including same-device bind mounts.
 Mount changes invalidate coverage for correction; selected-root rebinding or
 unknown mount metadata reports a failure rather than validated coverage.
 `watch` and its `rebuild` command retain the selected scale/exclusion options.
-Scale checkpoints remain unsupported until the persistence milestone: transient
-query/status are usable, while build/save and watch stop report Unsupported and
-preserve existing data. The initial small scale scan is batched; a large initial
-root can still be Pending before the later CLI readiness milestone. The bounded
-mode and its existing format/limits remain the default.
+Scale checkpoints use the separate LOCISCL1 format. Build/save and watch stop
+persist coherent validated snapshots. LOCISNP1 databases require a separate scale
+rebuild destination; unknown or damaged databases are preserved. Loaded results
+are Pending until correction completes. The bounded format and limits remain the
+default. Complete export/build/rebuild wait for Validated; ordinary first-page
+queries can return explicitly stale saved results with exit code 4.
 
 Scale native monitoring allows an explicit watch budget (`EngineOptions.watch_limit`,
 default 32,768 including the selected root), with a hard shared process ceiling of

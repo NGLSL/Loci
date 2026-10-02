@@ -131,6 +131,40 @@ impl Inventory {
             allocation_credit: budgets.max_retained_bytes,
         }
     }
+    pub fn validate_restored_lookup(&self) -> io::Result<()> {
+        let mut names = HashSet::new();
+        for id in 1..self.data.slots as u32 {
+            let entry = self.data.entry(id);
+            if entry.alive && !names.insert((entry.parent, self.data.name(id))) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "checkpoint duplicate live directory entry",
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub fn insert_restored(
+        &mut self,
+        parent: EntryId,
+        name: &[u8],
+        kind: Kind,
+        dev: u64,
+        ino: u64,
+        alive: bool,
+    ) -> io::Result<EntryId> {
+        let id = self.insert(parent, name, kind, dev, ino)?;
+        if !alive {
+            self.detach_child(parent, id);
+            self.remove_lookup(id);
+            self.edit(id)?.alive = false;
+            self.entries -= 1;
+            if kind == Kind::Directory {
+                self.directories -= 1;
+            }
+        }
+        Ok(id)
+    }
     pub fn set_allocation_credit(&mut self, credit: usize) {
         self.allocation_credit = credit;
     }

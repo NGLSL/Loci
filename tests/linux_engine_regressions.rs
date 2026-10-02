@@ -134,6 +134,10 @@ fn same_database_parent_moved_inside_root_is_rejected_despite_matching_identity(
     let mut engine = Engine::open(root, Some(&database)).unwrap();
     engine.save().unwrap();
     let before = fs::read(&database).unwrap();
+    let before_names: std::collections::BTreeSet<_> = fs::read_dir(&parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
 
     // Retain the same parent inode but redirect an ancestor to its new location
     // inside root. Parent identity alone is insufficient to preserve containment.
@@ -144,5 +148,12 @@ fn same_database_parent_moved_inside_root_is_rejected_despite_matching_identity(
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     engine.stop().unwrap();
     assert_eq!(fs::read(moved.join("data/state.loci")).unwrap(), before);
-    assert_eq!(fs::read_dir(moved.join("data")).unwrap().count(), 1);
+    let after_names: std::collections::BTreeSet<_> = fs::read_dir(moved.join("data"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        after_names, before_names,
+        "refused save must not create files inside root"
+    );
 }
