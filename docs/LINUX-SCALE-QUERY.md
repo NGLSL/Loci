@@ -76,3 +76,8 @@ Session artifacts:
 - Intermediate per-entry pair rows/log: `/workspace/linux-ticket-12-query-100k-pair-first.jsonl` and `.log`
 
 These session artifacts are outside the repository; the tracked driver, table and source commit provide the reproducible method. No extrapolated million-entry pass is reported.
+
+The later actual million-entry, 52-query worker phase and bounded wider pair
+filter are recorded in [million-entry pair filter measurement](LINUX-MILLION-PAIR-FILTER.md).
+It preserves each query/pass p95 and actual worker RSS/HWM, separately from this
+100k baseline and from final unified-source/filesystem acceptance.
