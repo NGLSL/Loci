@@ -241,3 +241,16 @@ remains cancellable during filtering, sorting and merging. New jobs are refused
 after monitor stop; directly retained snapshot leases remain queryable. Optional
 sort explicitly requires Linux scale mode. No million-entry timing or RSS target
 is inferred from the 100k query baseline.
+
+Scale mode has an explicit default live-entry limit of 1,250,000, leaving room
+for ordinary additions above the million-entry reference fixture. The physical
+slot, name arena, snapshot/retention, watch and process reservation limits still
+apply independently; this capacity is not a performance claim. Existing
+LOCISCL1 checkpoints remain compatible when their contents fit the configured
+limits. Bounded Linux and Windows defaults remain 4096 entries and128 directories.
+
+Scale normal and completed-sort pages expose QueryPage.kinds aligned with paths
+from their immutable snapshot. Kind lookup uses each matched entry ID, so a full
+typed export does not perform a new inventory search for every result. Bounded
+compatibility pages expose None because those snapshots do not retain entry
+kinds; QueryLease::entry_kind keeps its existing compatibility behavior.

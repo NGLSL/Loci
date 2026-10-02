@@ -263,6 +263,7 @@ impl Lease {
         let (grams, short) = query.filter();
         let mut offset = cursor.map_or(1, |cursor| cursor.offset);
         let mut paths = Vec::with_capacity(size);
+        let mut kinds = Vec::with_capacity(size);
         let mut visited = 0;
         let mut cancelled = false;
         let mut normalized = Vec::new();
@@ -279,6 +280,7 @@ impl Lease {
             }
             if self.matches(id, &query, grams, &short, &mut normalized) {
                 paths.push(self.snapshot.data.path(id));
+                kinds.push(self.kind(id));
             }
             if visited % 64 == 0 {
                 progress.store(visited, Ordering::Release);
@@ -296,6 +298,7 @@ impl Lease {
             validated_at_start_and_finish: self.validated(&finished),
             finished,
             paths,
+            kinds: Some(kinds),
             cancelled,
             complete,
             next: (!complete).then(|| crate::engine::PageCursor {
@@ -326,6 +329,13 @@ impl Lease {
         data.search
             .fill_path(entry.parent, data.name(id), normalized);
         query.matches_normalized(normalized)
+    }
+    fn kind(&self, id: u32) -> crate::engine::EntryKind {
+        match self.snapshot.data.entry(id).kind {
+            Kind::File => crate::engine::EntryKind::File,
+            Kind::Directory => crate::engine::EntryKind::Directory,
+            Kind::Symlink => crate::engine::EntryKind::Symlink,
+        }
     }
     pub(crate) fn sort_budget(&self) -> usize {
         self.shared.lock().unwrap().budgets.max_sort_bytes
@@ -397,6 +407,7 @@ impl Lease {
             validated_at_start_and_finish: self.validated(&finished),
             finished,
             paths: ids[offset..end].iter().map(|id| self.path(*id)).collect(),
+            kinds: Some(ids[offset..end].iter().map(|id| self.kind(*id)).collect()),
             cancelled: false,
             complete: end == ids.len(),
             next: None,

@@ -73,7 +73,7 @@ impl Runtime {
         memory: std::sync::Arc<memory::Reservation>,
     ) -> io::Result<Self> {
         if options.limits.entries == 0
-            || options.limits.entries > 1_000_000
+            || options.limits.entries > 1_250_000
             || options.limits.directories == 0
             || options.limits.directories > 65536
             || options.limits.depth == 0

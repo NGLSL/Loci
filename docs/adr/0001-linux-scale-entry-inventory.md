@@ -124,3 +124,18 @@ exact total; direct immutable leases remain readable after stop. Bounded/Windows
 pagination and matching are unchanged; optional sorting explicitly requires the
 Linux scale mode. The 100k measurements are documented separately and do not
 establish million-entry, native Windows, filesystem or RSS acceptance.
+
+## Typed page export and live capacity extension (LOCI-LINUX-001-14)
+
+QueryPage.kinds is optional, positionally aligned with paths. Linux scale normal
+and completed-sort pages collect kind directly from matching immutable entry
+IDs. This avoids the existing linear QueryLease::entry_kind(path) lookup in a
+complete million-entry export. The path-based API remains compatible; bounded
+and Windows page results have None. Held older pages preserve their paths and
+kinds after directory moves or kind replacement in newer publications.
+
+Scale default live capacity is1,250,000 entries, supporting an actual new file
+above an exact million-entry reference inventory. This does not raise physical
+slot/name/snapshot/process/watch caps, migrate checkpoint formats, or imply that
+the performance gates already pass. LOCISCL1 graph validation uses the configured
+live budget; bounded Engine validation remains separate and unchanged.

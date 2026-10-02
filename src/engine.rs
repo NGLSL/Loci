@@ -110,7 +110,7 @@ impl EngineOptions {
         Self {
             mode: EngineMode::Scale,
             limits: Limits {
-                entries: 1_000_000,
+                entries: 1_250_000,
                 directories: 32768,
                 ..Limits::default()
             },
@@ -246,6 +246,8 @@ pub struct QueryPage {
     pub finished: View,
     pub validated_at_start_and_finish: bool,
     pub paths: Vec<PathBuf>,
+    /// Snapshot kinds aligned with paths; bounded compatibility snapshots have None.
+    pub kinds: Option<Vec<EntryKind>>,
     pub cancelled: bool,
     pub complete: bool,
     pub next: Option<PageCursor>,
@@ -346,6 +348,7 @@ impl QueryLease {
             finished: out.finished.into(),
             validated_at_start_and_finish: out.validated_at_start_and_finish,
             paths: out.paths.into_iter().map(|p| self.root.join(p)).collect(),
+            kinds: None,
             cancelled: out.cancelled,
             complete: out.complete,
             next: out.next.map(|cursor| PageCursor {
