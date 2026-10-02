@@ -29,9 +29,12 @@ pub struct View {
     pub reasons: BTreeSet<Signal>,
     pub leases: usize,
 }
+enum LiveIndex {
+    Flat { index: Index, paths: Vec<PathBuf> },
+    Shards(crate::partitioned::Shards),
+}
 struct Snapshot {
-    index: Index,
-    paths: Vec<PathBuf>,
+    index: LiveIndex,
     version: u64,
     generation: u64,
 }
@@ -96,13 +99,28 @@ impl QueryLease {
         if raw.len() > 512 {
             return Err(io::Error::other("query byte budget exhausted"));
         }
-        let out = self.snapshot.index.search(
-            &Query::parse(raw),
-            true,
-            if first50 { 50 } else { usize::MAX },
-            cancel,
-            progress,
-        );
+        let query = Query::parse(raw);
+        let out = match &self.snapshot.index {
+            LiveIndex::Flat { index, paths } => {
+                let out = index.search(
+                    &query,
+                    true,
+                    if first50 { 50 } else { usize::MAX },
+                    cancel,
+                    progress,
+                );
+                crate::partitioned::Found {
+                    paths: out
+                        .ids
+                        .iter()
+                        .map(|id| paths[*id as usize].clone())
+                        .collect(),
+                    matches: out.matches,
+                    cancelled: out.cancelled,
+                }
+            }
+            LiveIndex::Shards(shards) => shards.search(&query, first50, cancel, progress),
+        };
         let finished = self.shared.lock().unwrap().view.clone();
         let validated = self.started.status == Status::Validated
             && finished.status == Status::Validated
@@ -116,25 +134,24 @@ impl QueryLease {
             started: self.started.clone(),
             finished,
             validated_at_start_and_finish: validated,
-            paths: out
-                .ids
-                .iter()
-                .map(|id| self.snapshot.paths[*id as usize].clone())
-                .collect(),
+            paths: out.paths,
             matches: out.matches,
             cancelled: out.cancelled,
         })
     }
 }
 struct Candidate {
-    index: Index,
-    paths: Vec<PathBuf>,
+    index: LiveIndex,
     generation: u64,
 }
 pub struct Store {
     handle: QueryHandle,
     staged: Option<Candidate>,
     pub builds: usize,
+    pub rebuilt_records: usize,
+    pub rebuilt_partitions: usize,
+    pub last_rebuilt_records: usize,
+    pub last_rebuilt_partitions: usize,
 }
 impl Default for Store {
     fn default() -> Self {
@@ -161,6 +178,10 @@ impl Store {
             },
             staged: None,
             builds: 0,
+            rebuilt_records: 0,
+            rebuilt_partitions: 0,
+            last_rebuilt_records: 0,
+            last_rebuilt_partitions: 0,
         }
     }
     pub fn handle(&self) -> QueryHandle {
@@ -185,10 +206,10 @@ impl Store {
     pub fn needs_update(&self) -> bool {
         self.handle.view().status != Status::Validated
     }
-    pub fn stage(&mut self, state: &Recovery) -> io::Result<bool> {
+    fn prepare(&mut self, state: &Recovery) -> io::Result<Option<(Vec<PathBuf>, Vec<String>)>> {
         self.observe(state);
         if state.dirty || !state.inventory.complete {
-            return Ok(false);
+            return Ok(None);
         }
         if self.staged.is_some() {
             return Err(io::Error::other("one staged candidate only"));
@@ -197,7 +218,7 @@ impl Store {
             let mut shared = self.handle.shared.lock().unwrap();
             if shared.retired.strong_count() > 0 {
                 shared.view.status = Status::ReadersPinned;
-                return Ok(false);
+                return Ok(None);
             }
         }
         let paths: Vec<_> = state.inventory.entries.keys().cloned().collect();
@@ -226,11 +247,41 @@ impl Store {
             }
             strings.push(text);
         }
+        Ok(Some((paths, strings)))
+    }
+    pub fn stage(&mut self, state: &Recovery) -> io::Result<bool> {
+        let Some((paths, strings)) = self.prepare(state)? else {
+            return Ok(false);
+        };
         self.builds += 1;
+        self.last_rebuilt_records = paths.len();
+        self.last_rebuilt_partitions = 1;
+        self.rebuilt_records += paths.len();
+        self.rebuilt_partitions += 1;
         let index = Index::from_paths(strings.into_iter());
         self.staged = Some(Candidate {
-            index,
-            paths,
+            index: LiveIndex::Flat { index, paths },
+            generation: state.generation,
+        });
+        Ok(true)
+    }
+    pub fn stage_delta(&mut self, state: &Recovery) -> io::Result<bool> {
+        let Some((paths, strings)) = self.prepare(state)? else {
+            return Ok(false);
+        };
+        let current = self.handle.shared.lock().unwrap().current.clone();
+        let previous = current.as_ref().and_then(|s| match &s.index {
+            LiveIndex::Shards(parts) => Some(parts),
+            _ => None,
+        });
+        let (shards, parts, records) = crate::partitioned::Shards::build(paths, strings, previous);
+        self.builds += 1;
+        self.last_rebuilt_records = records;
+        self.last_rebuilt_partitions = parts;
+        self.rebuilt_records += records;
+        self.rebuilt_partitions += parts;
+        self.staged = Some(Candidate {
+            index: LiveIndex::Shards(shards),
             generation: state.generation,
         });
         Ok(true)
@@ -258,7 +309,6 @@ impl Store {
         }
         shared.current = Some(Arc::new(Snapshot {
             index: next.index,
-            paths: next.paths,
             version,
             generation: next.generation,
         }));
@@ -299,6 +349,8 @@ pub struct Portable {
     pub state: Recovery,
     pub store: Store,
     pub gate: Gate,
+    pub full_scans: usize,
+    pub scanned_entries: usize,
 }
 impl Portable {
     pub fn new(root: &std::path::Path, limits: crate::watch::Limits) -> io::Result<Self> {
@@ -312,6 +364,8 @@ impl Portable {
             state: Recovery::new(limits.queue),
             store: Store::new(),
             gate: Gate::default(),
+            full_scans: 0,
+            scanned_entries: 0,
         })
     }
     pub fn restore(&mut self, inventory: Inventory) {
@@ -340,7 +394,9 @@ impl Portable {
         let mut success = false;
         for _ in 0..self.limits.retries {
             let ticket = self.state.ticket();
+            self.full_scans += 1;
             let candidate = crate::watch::scan(&self.root, self.limits, |_| Ok(()));
+            self.scanned_entries += candidate.examined;
             after_scan(&mut self.state);
             if self.state.publish(ticket, candidate) {
                 success = true;

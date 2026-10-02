@@ -37,3 +37,14 @@
 !/docs/VALIDATION.md
 !/docs/BENCHMARKS.md
 !/tests/linux_stage3_regressions.rs
+
+!/src/partitioned.rs
+!/src/incremental.rs
+!/src/incremental/
+/src/incremental/*
+!/src/incremental/native.rs
+!/src/incremental/events.rs
+!/tests/incremental.rs
+!/tests/linux_incremental.rs
+!/scripts/measure-incremental.py
+!/docs/INCREMENTAL.md

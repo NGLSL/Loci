@@ -1,3 +1,5 @@
+> 本文记录基础提交7415280的验收。增量分支的新增范围、Windows45项结果及Linux待复验入口见[INCREMENTAL.md](INCREMENTAL.md)。
+
 # 验证范围
 
 2026-10-02。完成Windows共享逻辑及x86_64 Linux原生基础验收；以下限制仍然适用。

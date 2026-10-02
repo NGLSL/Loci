@@ -1,6 +1,6 @@
 # Loci
 
-Loci 是独立的 Rust 文件名/路径搜索实验，包含紧凑路径记录、块级 trigram 候选过滤、短词摘要及最终精确匹配。实时原型将 Linux inotify 的有界重扫接到不可变查询快照，支持校正状态、取消和并发读者。
+Loci 是独立的 Rust 文件名/路径搜索实验，包含紧凑路径记录、块级 trigram 候选过滤、短词摘要及最终精确匹配。实时原型将 Linux inotify 接到不可变查询快照，支持有界增量更新、失效校正、取消和并发读者；保留全量重扫作为对照。
 
 项目使用 Rust **1.99.0** 和标准库，无第三方 Cargo 依赖，无 GUI。当前为原型；原生监听仅支持 x86_64 Linux。许可证尚未决定，没有添加 LICENSE 文件。
 
@@ -29,6 +29,6 @@ python scripts/measure-live-windows.py
 
 Windows的 linux-ffi-check 只能用于 cargo check；不要在Windows用该feature运行测试或构建来冒充Linux执行。
 
-基础验收：Windows debug/release各32项通过；x86_64 Linux overlayfs debug/release各53项通过，真实overflow恢复及有界原生测量另行通过。生产规模、其它文件系统和架构尚未验证。
+基础提交7415280验收：Windows debug/release各32项；x86_64 Linux overlayfs各53项及另行真实overflow/原生测量通过。当前增量分支Windows各45项通过；新增Linux原生用例尚未执行。成对测量、复验入口与实现边界见 [docs/INCREMENTAL.md](docs/INCREMENTAL.md)。生产规模、其它文件系统和架构尚未验证。
 
 验证方法与当前通过范围见 [docs/VALIDATION.md](docs/VALIDATION.md)；合成数据、硬件与性能局限见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)；实现归属见 [THIRD_PARTY.md](THIRD_PARTY.md)。

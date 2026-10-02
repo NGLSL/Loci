@@ -12,10 +12,14 @@ if ! rustup toolchain list | grep -q '^1[.]99[.]0-'; then
 fi
 overflow=false
 live_metrics=false
+incremental_overflow=false
+incremental_metrics=false
 for option in "$@"; do
   case "$option" in
     --kernel-overflow) overflow=true ;;
     --live-metrics) live_metrics=true ;;
+    --incremental-overflow) incremental_overflow=true ;;
+    --incremental-metrics) incremental_metrics=true ;;
     *) echo "BLOCKED: unknown option $option" >&2; exit 2 ;;
   esac
 done
@@ -39,5 +43,14 @@ if $overflow; then
 fi
 if $live_metrics; then
   timeout 180s python3 scripts/measure-live-linux.py
+fi
+if $incremental_overflow; then
+  timeout 60s cargo +1.99.0 test --release --offline --test linux_incremental native_incremental_kernel_overflow -- --ignored --nocapture 2>&1 | tee results-linux/incremental-overflow.txt
+  if ! grep -q 'PASS: real IN_Q_OVERFLOW recovered through incremental snapshot engine' results-linux/incremental-overflow.txt; then
+    echo 'INCOMPLETE: actual incremental kernel overflow recovery was not observed; inspect SKIP/FAIL log' >&2; exit 2
+  fi
+fi
+if $incremental_metrics; then
+  timeout 300s python3 scripts/measure-incremental.py
 fi
 echo 'Completed requested Linux checks; kernel overflow is untested unless explicitly selected and PASS observed.'

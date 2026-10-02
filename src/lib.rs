@@ -9,3 +9,6 @@ mod watch_tests;
 pub mod index;
 pub mod live;
 mod signatures;
+
+pub mod incremental;
+mod partitioned;

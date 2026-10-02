@@ -31,13 +31,20 @@ compile_error!("This inotify FFI experiment is limited to x86_64 Linux");
 unsafe extern "C" {
     fn inotify_init1(flags: c_int) -> c_int;
     fn inotify_add_watch(fd: c_int, path: *const c_char, mask: u32) -> c_int;
+    fn inotify_rm_watch(fd: c_int, wd: c_int) -> c_int;
     fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
     fn close(fd: c_int) -> c_int;
+}
+pub(crate) struct Captured {
+    pub events: Vec<watch::RawEvent>,
+    pub truncated: bool,
+    pub kernel_overflow: bool,
 }
 pub struct Session {
     fd: c_int,
     watches: BTreeMap<i32, PathBuf>,
     limit: usize,
+    pub(crate) expected_ignored: BTreeSet<i32>,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -62,6 +69,7 @@ impl Session {
             fd,
             watches: BTreeMap::new(),
             limit,
+            expected_ignored: BTreeSet::new(),
         })
     }
     pub fn add(&mut self, path: &Path) -> io::Result<()> {
@@ -93,6 +101,10 @@ impl Session {
             LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
         }
+        if self.expected_ignored.contains(&wd) {
+            LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
+            return Err(io::Error::other("ambiguous reused watch descriptor"));
+        }
         if self
             .watches
             .get(&wd)
@@ -105,6 +117,75 @@ impl Session {
             LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
         }
         Ok(())
+    }
+    pub(crate) fn paths(&self) -> &BTreeMap<i32, PathBuf> {
+        &self.watches
+    }
+    pub(crate) fn remove_prefix(&mut self, prefix: &Path) -> io::Result<()> {
+        let ids: Vec<_> = self
+            .watches
+            .iter()
+            .filter(|(_, p)| p.starts_with(prefix))
+            .map(|(wd, _)| *wd)
+            .collect();
+        for wd in ids {
+            let rc = unsafe { inotify_rm_watch(self.fd, wd) };
+            if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(22) {
+                return Err(io::Error::last_os_error());
+            }
+            self.watches.remove(&wd);
+            LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
+            self.expected_ignored.insert(wd);
+        }
+        if self.expected_ignored.len() > PROCESS_WATCH_CAP {
+            return Err(io::Error::other("retired descriptor budget exhausted"));
+        }
+        Ok(())
+    }
+    pub(crate) fn rename_prefix(&mut self, from: &Path, to: &Path) {
+        for path in self.watches.values_mut() {
+            if let Ok(tail) = path.strip_prefix(from) {
+                *path = to.join(tail);
+            }
+        }
+    }
+    pub(crate) fn acknowledge_ignored(&mut self, ids: &[i32]) {
+        for wd in ids {
+            self.expected_ignored.remove(wd);
+        }
+    }
+    pub(crate) fn capture(&mut self, capacity: usize) -> io::Result<Captured> {
+        let mut captured = Captured {
+            events: vec![],
+            truncated: false,
+            kernel_overflow: false,
+        };
+        for _ in 0..8 {
+            let mut buffer = [0u8; 65536];
+            let n = unsafe { read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(captured);
+                }
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if n == 0 {
+                return Err(io::Error::other("inotify EOF"));
+            }
+            let batch = watch::decode_events(
+                &buffer[..n as usize],
+                capacity.saturating_sub(captured.events.len()),
+            )?;
+            captured.kernel_overflow |= batch.kernel_overflow;
+            captured.truncated |= batch.dropped;
+            captured.events.extend(batch.events);
+        }
+        captured.truncated = true;
+        Ok(captured)
     }
     pub fn count(&self) -> usize {
         self.watches.len()
@@ -154,7 +235,9 @@ pub struct Runtime {
     pub limits: Limits,
     pub state: Recovery,
     pub events_observed: usize,
-    session: Option<Session>,
+    pub full_scans: usize,
+    pub scanned_entries: usize,
+    pub(crate) session: Option<Session>,
     last_check: Instant,
 }
 impl Runtime {
@@ -168,6 +251,8 @@ impl Runtime {
             limits,
             state: Recovery::new(limits.queue),
             events_observed: 0,
+            full_scans: 0,
+            scanned_entries: 0,
             session: None,
             last_check: Instant::now(),
         })
@@ -193,7 +278,9 @@ impl Runtime {
                     return Err(e);
                 }
             };
+            self.full_scans += 1;
             let candidate = watch::scan(&self.root, self.limits, |path| next.add(path));
+            self.scanned_entries += candidate.examined;
             if !candidate.complete {
                 self.state.publish(ticket, candidate);
                 return Ok(false);

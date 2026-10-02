@@ -34,6 +34,7 @@ pub enum Kind {
 pub struct Inventory {
     pub entries: BTreeMap<PathBuf, Kind>,
     pub directories: usize,
+    pub examined: usize,
     pub complete: bool,
     pub errors: Vec<String>,
 }
@@ -113,7 +114,7 @@ impl Recovery {
         true
     }
 }
-fn skip(path: &Path) -> bool {
+pub(crate) fn skip(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
         [
             "target",
@@ -171,6 +172,7 @@ pub fn scan(
                 return out;
             }
             visited += 1;
+            out.examined += 1;
             let item = match item {
                 Ok(x) => x,
                 Err(e) => {
@@ -374,7 +376,7 @@ pub fn load_checkpoint(path: &Path, root: &Path, limits: Limits) -> io::Result<I
 pub const IN_Q_OVERFLOW: u32 = 0x4000;
 pub const IN_IGNORED: u32 = 0x8000;
 pub const IN_UNMOUNT: u32 = 0x2000;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RawEvent {
     pub wd: i32,
     pub mask: u32,

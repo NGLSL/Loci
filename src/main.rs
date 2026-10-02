@@ -297,9 +297,96 @@ impl Overlay {
         true
     }
 }
+/// Minimal bounded validation entry point; not a standalone CLI product.
+#[cfg(target_os = "linux")]
+fn live_check(args: &[String]) -> io::Result<()> {
+    use loci_experiment::watch::Limits;
+    use std::time::Duration;
+    if args.len() != 4 {
+        return Err(io::Error::other(
+            "usage: live-check explicit-root query duration-ms incremental|rescan",
+        ));
+    }
+    let milliseconds: u64 = args[2].parse().map_err(io::Error::other)?;
+    if !(1..=10000).contains(&milliseconds) || args[1].len() > 512 {
+        return Err(io::Error::other(
+            "live-check duration/query budget exhausted",
+        ));
+    }
+    let root = Path::new(&args[0]);
+    let deadline = Instant::now() + Duration::from_millis(milliseconds);
+    match args[3].as_str() {
+        "incremental" => {
+            let mut engine = loci_experiment::incremental::Native::new(root, Limits::default())?;
+            loop {
+                let ok = engine.tick();
+                let handle = engine.store.handle();
+                if let Ok(lease) = handle.lease() {
+                    let result = lease.search(
+                        &args[1],
+                        false,
+                        &AtomicBool::new(false),
+                        &AtomicUsize::new(0),
+                    )?;
+                    println!("live_check,incremental,version={},generation={},validated={},matches={},full_scans={},subtree_scans={},rebuilt_records={}",
+                        result.version,result.snapshot_generation,result.validated_at_start_and_finish,result.matches,
+                        engine.metrics.full_scans,engine.metrics.subtree_scans,engine.store.rebuilt_records);
+                } else {
+                    println!("live_check,incremental,no_snapshot");
+                }
+                if let Err(error) = ok {
+                    eprintln!("live_check,incremental,failed={error}");
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        "rescan" => {
+            let mut engine = loci_experiment::live::Native::new(root, Limits::default())?;
+            loop {
+                let ok = engine.tick();
+                let handle = engine.store.handle();
+                if let Ok(lease) = handle.lease() {
+                    let result = lease.search(
+                        &args[1],
+                        false,
+                        &AtomicBool::new(false),
+                        &AtomicUsize::new(0),
+                    )?;
+                    println!("live_check,rescan,version={},generation={},validated={},matches={},full_scans={},rebuilt_records={}",
+                        result.version,result.snapshot_generation,result.validated_at_start_and_finish,result.matches,
+                        engine.watch.full_scans,engine.store.rebuilt_records);
+                } else {
+                    println!("live_check,rescan,no_snapshot");
+                }
+                if let Err(error) = ok {
+                    eprintln!("live_check,rescan,failed={error}");
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        _ => {
+            return Err(io::Error::other(
+                "live-check mode must be incremental or rescan",
+            ))
+        }
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+fn live_check(_args: &[String]) -> io::Result<()> {
+    Err(io::Error::other("native live-check requires x86_64 Linux"))
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("live-check") => live_check(&args[2..])?,
         Some("build") => {
             let n: usize = args[2].parse().unwrap();
             assert!((1..=1_000_000).contains(&n));
