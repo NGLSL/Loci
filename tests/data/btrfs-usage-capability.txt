@@ -1,0 +1,25 @@
+Overall:
+    Device size:		        4294967296
+    Device allocated:		         562036736
+    Device unallocated:		        3732930560
+    Device missing:		                 0
+    Device slack:		                 0
+    Used:			            655360
+    Free (estimated):		        3741319168	(min: 1874853888)
+    Free (statfs, df):		        3740270592
+    Data ratio:			              1.00
+    Metadata ratio:		              2.00
+    Global reserve:		           5767168	(used: 0)
+    Multiple profiles:		                no
+
+Data,single: Size:8388608, Used:0 (0.00%)
+   /dev/vdb	   8388608
+
+Metadata,DUP: Size:268435456, Used:311296 (0.12%)
+   /dev/vdb	 536870912
+
+System,DUP: Size:8388608, Used:16384 (0.20%)
+   /dev/vdb	  16777216
+
+Unallocated:
+   /dev/vdb	3732930560

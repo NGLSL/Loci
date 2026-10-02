@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 mod common;
+#[path = "common/fixture_capacity.rs"]
+mod fixture_capacity;
 use common::Fixture;
 use loci_experiment::engine::{Engine, EngineOptions, QueryHandle, Status};
 use std::fs;
@@ -414,6 +416,9 @@ fn failed_atomic_save_preserves_old_checkpoint_and_cleans_owned_temporaries() {
 fn one_hundred_thousand_entry_checkpoint_saves_reopens_and_exports_full_set() {
     let _guard = NATIVE.lock().unwrap();
     let fixture = Fixture::new();
+    if !fixture_capacity::hundred_thousand_fixture_preflight(&fixture.base) {
+        return;
+    }
     let database = fixture.base.join("scale.loci");
     let mut expected = Vec::with_capacity(100_000);
     for directory in 0..2000 {
