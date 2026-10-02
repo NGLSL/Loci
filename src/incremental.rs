@@ -62,6 +62,8 @@ pub struct Metrics {
     pub metadata_calls: usize,
     pub transactions: usize,
     pub changed_paths: usize,
+    pub audited_directories: usize,
+    pub correction_attempts: usize,
     /// Scale inventory work in the last local transaction, excluding derived
     /// path/query cache and native watch topology work.
     pub last_touched_entries: usize,

@@ -4,7 +4,7 @@ mod inventory;
 pub(super) mod query;
 mod scope;
 use super::{CoverageGap, CoverageGapKind, EngineOptions, Source, Status};
-use crate::events::{Change, EventSource, SourceState};
+use crate::events::{Change, EventSource, Loss, SourceState};
 use crate::incremental::{Metrics, Topology};
 use inventory::{EntryId, Inventory, Kind};
 use std::fs::{self, Metadata, ReadDir};
@@ -12,7 +12,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 struct Directory {
     id: EntryId,
@@ -39,6 +40,10 @@ pub(super) struct Runtime {
     generation: u64,
     retry_after: Option<Instant>,
     failures: usize,
+    cancelled: bool,
+    audit_cursor: Option<EntryId>,
+    last_audit: Instant,
+    drain_polls: usize,
     pub store: query::Store,
     pub metrics: Metrics,
 }
@@ -80,6 +85,15 @@ impl Runtime {
                 "invalid scale memory/query budgets",
             ));
         }
+        if !(1..=16).contains(&options.recovery.retry_limit)
+            || !(1..=1024).contains(&options.recovery.audit_batch)
+            || !(1..=4096).contains(&options.recovery.max_drain_polls)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid recovery/audit budget",
+            ));
+        }
         let budgets = options.scale_budgets;
         Ok(Self {
             root: root.to_path_buf(),
@@ -95,9 +109,44 @@ impl Runtime {
             generation: 1,
             retry_after: None,
             failures: 0,
+            cancelled: false,
+            audit_cursor: None,
+            last_audit: Instant::now(),
+            drain_polls: 0,
             store: query::Store::new(budgets),
             metrics: Metrics::default(),
         })
+    }
+    pub fn request_rebuild(&mut self) -> io::Result<()> {
+        if self.stopped {
+            return Err(io::Error::other(
+                "source stopped; reopen selected root explicitly",
+            ));
+        }
+        self.cancelled = false;
+        self.failures = 0;
+        self.retry_after = None;
+        self.drain_polls = 0;
+        self.scan = None;
+        self.clear_pending();
+        self.correction = true;
+        self.generation += 1;
+        self.store.status(Status::Pending);
+        Ok(())
+    }
+    fn cancel_recovery(&mut self) {
+        self.cancelled = true;
+        self.scan = None;
+        self.clear_pending();
+        self.correction = true;
+        self.store.gap(CoverageGap {
+            path: self.root.clone(),
+            kind: CoverageGapKind::Cancelled,
+            error: "correction cancelled; request rebuild to resume".into(),
+            errno: None,
+        });
+        self.store.status(Status::Pending);
+        self.update_resources();
     }
     fn clear_pending(&mut self) {
         self.pending.clear();
@@ -144,13 +193,41 @@ impl Runtime {
         Ok(())
     }
     fn update_scope(&mut self) -> io::Result<()> {
-        let scope = scope::Scope::read(&self.root)?;
+        let scope = scope::Scope::read(&self.root).map_err(|error| {
+            self.store.gap(CoverageGap {
+                path: self.root.clone(),
+                kind: if error.kind() == io::ErrorKind::PermissionDenied {
+                    CoverageGapKind::Permission
+                } else {
+                    CoverageGapKind::ScopeUnknown
+                },
+                error: error.to_string(),
+                errno: error.raw_os_error(),
+            });
+            error
+        })?;
         if scope.root_mount != self.scope.root_mount {
+            self.store.gap(CoverageGap {
+                path: self.root.clone(),
+                kind: CoverageGapKind::MountChanged,
+                error: "selected root mount identity changed; reopen explicitly".into(),
+                errno: None,
+            });
+            let _ = self.source.stop();
+            self.stopped = true;
             return Err(io::Error::other(
                 "selected root mount identity changed; reopen explicitly",
             ));
         }
         if scope != self.scope {
+            for path in self.scope.changed_boundaries(&scope) {
+                self.store.gap(CoverageGap {
+                    path,
+                    kind: CoverageGapKind::MountChanged,
+                    error: "nested mount scope changed; correcting source".into(),
+                    errno: None,
+                });
+            }
             self.scope = scope;
             self.generation += 1;
             self.correction = true;
@@ -182,14 +259,37 @@ impl Runtime {
         if self.store.handle.view().coverage_gaps.is_empty() {
             self.store.gap(CoverageGap {
                 path: self.root.clone(),
-                kind: CoverageGapKind::Source,
+                kind: if error.kind() == io::ErrorKind::PermissionDenied {
+                    CoverageGapKind::Permission
+                } else if error.to_string().contains("identity changed") {
+                    CoverageGapKind::SourceIdentity
+                } else {
+                    CoverageGapKind::Source
+                },
+                error: error.to_string(),
+                errno: error.raw_os_error(),
+            });
+        }
+        if error.to_string().contains("selected root identity changed") {
+            self.store.gap(CoverageGap {
+                path: self.root.clone(),
+                kind: CoverageGapKind::SourceIdentity,
                 error: error.to_string(),
                 errno: error.raw_os_error(),
             });
         }
         self.update_resources();
         self.failures += 1;
-        self.retry_after = Some(Instant::now() + Duration::from_millis(250));
+        if self.failures >= self.options.recovery.retry_limit {
+            self.store.gap(CoverageGap {
+                path: self.root.clone(),
+                kind: CoverageGapKind::RetryLimit,
+                error: "finite automatic recovery attempts exhausted; request rebuild to retry"
+                    .into(),
+                errno: None,
+            });
+        }
+        self.retry_after = Some(Instant::now() + self.options.recovery.retry_delay);
         self.store.status(Status::Failed(
             error.to_string().chars().take(256).collect(),
         ));
@@ -211,14 +311,40 @@ impl Runtime {
             .iter()
             .any(|excluded| relative.starts_with(excluded))
     }
+    fn record_losses(&self, losses: &std::collections::BTreeSet<Loss>) {
+        self.store.losses(losses);
+        for loss in losses {
+            let kind = match loss {
+                Loss::KernelOverflow => CoverageGapKind::KernelOverflow,
+                Loss::UserOverflow => CoverageGapKind::UserOverflow,
+                Loss::WatchLost => CoverageGapKind::WatchLost,
+                Loss::InvalidEvent => CoverageGapKind::UnknownWatch,
+                _ => CoverageGapKind::Source,
+            };
+            self.store.gap(CoverageGap {
+                path: self.root.clone(),
+                kind,
+                error: format!("observed event loss: {loss:?}"),
+                errno: None,
+            });
+        }
+    }
     fn capture(&mut self) -> io::Result<()> {
         self.update_scope()?;
         let batch = self.source.poll()?;
         self.update_resources();
         if batch.state == SourceState::Stopped {
+            if !batch.losses.is_empty() {
+                self.record_losses(&batch.losses);
+                self.stop()?;
+                return Err(io::Error::other(
+                    "event source stopped after observation loss",
+                ));
+            }
             return self.stop();
         }
         if !batch.losses.is_empty() {
+            self.record_losses(&batch.losses);
             self.clear_pending();
             self.scan = None;
             self.correction = true;
@@ -243,6 +369,7 @@ impl Runtime {
                 || self.pending_bytes.saturating_add(bytes)
                     > self.options.scale_budgets.max_queue_bytes
             {
+                self.record_losses(&[Loss::UserOverflow].into());
                 self.clear_pending();
                 self.scan = None;
                 self.correction = true;
@@ -254,8 +381,10 @@ impl Runtime {
         self.update_resources();
         Ok(())
     }
-    pub fn poll(&mut self) -> io::Result<bool> {
-        if self.failures >= 4 || self.retry_after.is_some_and(|after| Instant::now() < after) {
+    pub fn poll_with_cancel(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
+        if self.failures >= self.options.recovery.retry_limit
+            || self.retry_after.is_some_and(|after| Instant::now() < after)
+        {
             return Ok(false);
         }
         if self.stopped {
@@ -266,13 +395,39 @@ impl Runtime {
             return Ok(false);
         }
         if !self.correction && self.pending.is_empty() {
+            self.audit()?;
+            if self.correction {
+                return Ok(false);
+            }
             return Ok(self.store.handle.view().status == Status::Validated);
+        }
+        if self.correction && cancel.load(Ordering::Relaxed) {
+            self.cancel_recovery();
+            return Ok(false);
         }
         if !self.store.ready() {
             return Ok(false);
         }
         if self.correction {
-            return self.correct();
+            if cancel.load(Ordering::Relaxed) {
+                self.cancel_recovery();
+            }
+            if self.cancelled {
+                return Ok(false);
+            }
+            if !self.source.recovery_ready() {
+                self.drain_polls += 1;
+                if self.drain_polls >= self.options.recovery.max_drain_polls {
+                    let error = io::Error::other(
+                        "bounded loss drain exhausted; request rebuild after source becomes quiet",
+                    );
+                    self.failures = self.options.recovery.retry_limit - 1;
+                    self.fail(&error);
+                }
+                return Ok(false);
+            }
+            self.drain_polls = 0;
+            return self.correct(cancel);
         }
         let generation = self.generation;
         self.inventory.reset_work();
@@ -309,11 +464,12 @@ impl Runtime {
         self.update_resources();
         Ok(published)
     }
-    fn correct(&mut self) -> io::Result<bool> {
+    fn correct(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
         if self.scan.is_none() {
             self.source.begin_reconcile()?;
             self.clear_pending();
             self.metrics.full_scans += 1;
+            self.metrics.correction_attempts += 1;
             self.scan = Some(Scan {
                 inventory: Inventory::new(
                     self.inventory.data.epoch + 1,
@@ -335,6 +491,10 @@ impl Runtime {
         );
         let mut processed = 0;
         while processed < self.options.scan_batch {
+            if cancel.load(Ordering::Relaxed) {
+                self.cancel_recovery();
+                return Ok(false);
+            }
             if scan.current.is_none() {
                 let Some(directory) = scan.todo.pop() else {
                     break;
@@ -342,6 +502,7 @@ impl Runtime {
                 if directory.depth > self.options.limits.depth {
                     return Err(io::Error::other("scale directory depth exhausted"));
                 }
+                processed += 1;
                 self.source
                     .before_directory(&directory.path)
                     .map_err(|error| self.scoped_error(&directory.path, error))?;
@@ -397,7 +558,9 @@ impl Runtime {
         }
         if scan.generation != self.generation {
             self.scan = None;
-            self.store.status(Status::Pending);
+            self.fail(&io::Error::other(
+                "correction candidate invalidated by concurrent observation; retry bounded",
+            ));
             return Ok(false);
         }
         if scan.current.is_some() || !scan.todo.is_empty() {
@@ -406,6 +569,8 @@ impl Runtime {
             return Ok(false);
         }
         self.inventory = scan.inventory;
+        self.audit_cursor = None;
+        self.last_audit = Instant::now();
         self.correction = false;
         self.failures = 0;
         self.retry_after = None;
@@ -413,6 +578,54 @@ impl Runtime {
         let published = self.store.publish(self.inventory.data.clone())?;
         self.update_resources();
         Ok(published)
+    }
+    fn audit(&mut self) -> io::Result<()> {
+        if self.last_audit.elapsed() < self.options.recovery.audit_interval {
+            return Ok(());
+        }
+        self.last_audit = Instant::now();
+        use std::ops::Bound::{Excluded, Unbounded};
+        let range = (self.audit_cursor.map_or(Unbounded, Excluded), Unbounded);
+        let ids: Vec<_> = self
+            .inventory
+            .directory_ids
+            .range(range)
+            .take(self.options.recovery.audit_batch)
+            .copied()
+            .collect();
+        if ids.is_empty() {
+            self.audit_cursor = None;
+            return Ok(());
+        }
+        for id in ids {
+            self.audit_cursor = Some(id);
+            let path = self.root.join(self.inventory.data.path(id));
+            if self.scope.boundary(&path) {
+                continue;
+            }
+            self.metrics.audited_directories += 1;
+            self.metrics.metadata_calls += 1;
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| self.scoped_error(&path, error))?;
+            let old = self.inventory.data.entry(id);
+            if !metadata.is_dir()
+                || metadata.file_type().is_symlink()
+                || (id != 0 && (old.dev != metadata.dev() || old.ino != metadata.ino()))
+            {
+                self.store.gap(CoverageGap {
+                    path,
+                    kind: CoverageGapKind::UnknownWatch,
+                    error: "audited directory identity changed; correcting source".into(),
+                    errno: None,
+                });
+                self.correction = true;
+                self.generation += 1;
+                self.store.status(Status::Pending);
+                return Ok(());
+            }
+            drop(fs::read_dir(&path).map_err(|error| self.scoped_error(&path, error))?);
+        }
+        Ok(())
     }
     fn inspect(&mut self, relative: &Path) -> io::Result<Option<(Kind, Metadata)>> {
         if self.excluded(relative) {
@@ -458,6 +671,14 @@ impl Runtime {
         let Some((kind, metadata)) = self.inspect(path)? else {
             return self.remove(path);
         };
+        if kind == Kind::Directory && !self.scope.boundary(&self.root.join(path)) {
+            // IN_ATTRIB preserves object identity, but a revoked listing permission
+            // invalidates coverage immediately instead of waiting for the audit cycle.
+            drop(
+                fs::read_dir(self.root.join(path))
+                    .map_err(|error| self.scoped_error(&self.root.join(path), error))?,
+            );
+        }
         if let Some(id) = self.inventory.find(path) {
             let old = self.inventory.data.entry(id);
             if old.dev != metadata.dev() || old.ino != metadata.ino() || old.kind != kind {
