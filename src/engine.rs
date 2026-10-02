@@ -84,7 +84,7 @@ pub struct Engine {
     root: Arc<PathBuf>,
     database: Option<PathBuf>,
     identity: Option<RootIdentity>,
-    source: Option<Box<dyn EventSource>>,
+    source: Option<Source>,
     state: Recovery,
     store: Store,
     pending: Vec<Change>,
@@ -95,22 +95,79 @@ pub struct Engine {
     last_audit: Instant,
     metrics: Metrics,
 }
+
+// Native Linux needs directory registration during scans and incremental
+// transactions. These hooks stay private; the public EventSource seam is fixed.
+enum Source {
+    External(Box<dyn EventSource>),
+    #[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+    Linux(crate::linux_events::LinuxEvents),
+}
+impl EventSource for Source {
+    fn poll(&mut self) -> io::Result<EventBatch> {
+        match self {
+            Self::External(source) => source.poll(),
+            #[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+            Self::Linux(source) => source.poll(),
+        }
+    }
+    fn stop(&mut self) -> io::Result<()> {
+        match self {
+            Self::External(source) => source.stop(),
+            #[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+            Self::Linux(source) => source.stop(),
+        }
+    }
+}
+impl Source {
+    fn before_directory(&mut self, _path: &Path) -> io::Result<()> {
+        match self {
+            Self::External(_) => Ok(()),
+            #[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+            Self::Linux(source) => source.before_directory(_path),
+        }
+    }
+    fn topology(&mut self, _edit: incremental::Topology) -> io::Result<()> {
+        match self {
+            Self::External(_) => Ok(()),
+            #[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+            Self::Linux(source) => source.topology(_edit),
+        }
+    }
+    fn begin_reconcile(&mut self) -> io::Result<bool> {
+        match self {
+            Self::External(_) => Ok(false),
+            #[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+            Self::Linux(source) => {
+                source.begin_reconcile()?;
+                Ok(true)
+            }
+        }
+    }
+}
 impl Engine {
-    /// Native Windows source. Other platforms explicitly await their v0.1 adapter.
+    /// Native Windows or x86_64 Linux source for the explicitly selected root.
     pub fn open(root: &Path, database: Option<&Path>) -> io::Result<Self> {
         #[cfg(windows)]
         {
             let root = fs::canonicalize(root)?;
             let identity = RootIdentity::open(&root)?;
             let source = crate::windows_events::WindowsEvents::open(&root, EventLimits::default())?;
-            Self::start(root, database, identity, Box::new(source))
+            Self::start(root, database, identity, Source::External(Box::new(source)))
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let root = fs::canonicalize(root)?;
+            let identity = RootIdentity::open(&root)?;
+            let source = crate::linux_events::LinuxEvents::open(&root, EventLimits::default())?;
+            Self::start(root, database, identity, Source::Linux(source))
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (root, database);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "v0.1 native Engine adapter currently requires Windows",
+                "native Engine requires Windows or x86_64 Linux",
             ))
         }
     }
@@ -123,13 +180,13 @@ impl Engine {
     ) -> io::Result<Self> {
         let root = fs::canonicalize(root)?;
         let identity = RootIdentity::open(&root)?;
-        Self::start(root, database, identity, Box::new(source))
+        Self::start(root, database, identity, Source::External(Box::new(source)))
     }
     fn start(
         root: PathBuf,
         database: Option<&Path>,
         identity: RootIdentity,
-        source: Box<dyn EventSource>,
+        source: Source,
     ) -> io::Result<Self> {
         let database = database
             .map(|path| database_path(path, &root))
@@ -321,10 +378,22 @@ impl Engine {
         if self.correction {
             for _ in 0..Limits::default().retries {
                 self.pending.clear();
-                let ticket = self.state.ticket();
                 self.check_root()?;
+                let source = self
+                    .source
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("event source missing"))?;
+                if source.begin_reconcile()? {
+                    // Replacing an inotify fd loses a cut; only the following
+                    // complete scan and final drain can validate the new source.
+                    self.state.signal(Signal::Restart);
+                    self.store.observe(&self.state);
+                }
+                let ticket = self.state.ticket();
                 self.metrics.full_scans += 1;
-                let inventory = watch::scan(&self.root, Limits::default(), |_| Ok(()));
+                let inventory = watch::scan(&self.root, Limits::default(), |dir| {
+                    source.before_directory(dir)
+                });
                 self.metrics.scanned_entries += inventory.examined;
                 if !inventory.complete {
                     return Err(io::Error::other(format!(
@@ -363,13 +432,17 @@ impl Engine {
             self.invalidate(Signal::GenerationRace);
             return Ok(false);
         }
+        let source = self
+            .source
+            .as_mut()
+            .ok_or_else(|| io::Error::other("event source missing"))?;
         let next = incremental::apply(
             &self.root,
             &self.state.inventory,
             &changes,
             Limits::default(),
             &mut self.metrics,
-            |_| Ok(()),
+            |edit| source.topology(edit),
         )?;
         self.capture()?;
         if self.stopped {
@@ -481,8 +554,13 @@ impl RootIdentity {
                 .custom_flags(0x02000000 | 0x00200000)
                 .open(path)?
         };
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        let file = open_linux_root(path)?;
+        #[cfg(not(any(windows, target_os = "linux")))]
         let file = File::open(path)?;
+        if !file.metadata()?.is_dir() {
+            return Err(io::Error::other("opened root is not a directory"));
+        }
         let id = file_identity(&file)?;
         Ok(Self { _file: file, id })
     }
@@ -495,6 +573,16 @@ impl RootIdentity {
         }
         Ok(())
     }
+}
+#[cfg(target_os = "linux")]
+fn open_linux_root(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // x86_64 Linux O_DIRECTORY | O_NOFOLLOW: a replacement FIFO must not
+    // block open, and a replacement symlink must not retarget root ownership.
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x10000 | 0x20000)
+        .open(path)
 }
 #[cfg(windows)]
 fn file_identity(file: &File) -> io::Result<(u64, u64)> {
@@ -526,4 +614,141 @@ fn file_identity(_file: &File) -> io::Result<(u64, u64)> {
         io::ErrorKind::Unsupported,
         "root identity unavailable on this platform",
     ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_kernel_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    struct Fixture {
+        parent: PathBuf,
+        base: PathBuf,
+        root: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+            let base = parent.join(format!(
+                "loci-engine-kernel-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&base).unwrap();
+            let root = base.join("data");
+            fs::create_dir(&root).unwrap();
+            Self { parent, base, root }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let target = fs::canonicalize(&self.base).unwrap();
+            assert_eq!(target.parent(), Some(self.parent.as_path()));
+            assert!(target
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("loci-engine-kernel-"));
+            fs::remove_dir_all(target).unwrap();
+        }
+    }
+    fn paths(engine: &Engine) -> Vec<PathBuf> {
+        engine
+            .query()
+            .lease()
+            .unwrap()
+            .search("", false, &AtomicBool::new(false), &AtomicUsize::new(0))
+            .unwrap()
+            .paths
+    }
+
+    #[test]
+    fn linux_engine_real_kernel_overflow_preserves_then_reconciles_snapshot() {
+        let f = Fixture::new();
+        fs::write(f.root.join("kept.txt"), b"kept").unwrap();
+        let baseline = crate::linux_inotify::process_usage();
+        let mut engine = Engine::open(&f.root, None).unwrap();
+        assert_eq!(engine.view().status, Status::Validated);
+        assert_eq!(paths(&engine), [f.root.join("kept.txt")]);
+        let scans = engine.metrics().full_scans;
+        let capacity: usize = fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            (1..=131072).contains(&capacity),
+            "unbounded test kernel queue: {capacity}"
+        );
+        // Only the correction deadline is controlled. The fd, filesystem events,
+        // queue overflow record and subsequent correction are all native.
+        // Retain the overflowing fd across bounded eight-read drains until the
+        // actual kernel overflow record behind the ordinary events is observed.
+        engine
+            .gate
+            .completed(engine.epoch.elapsed() + Duration::from_secs(60), true);
+        let transient = f.root.join("transient.txt");
+        for _ in 0..(capacity / 2 + 1024) {
+            fs::write(&transient, b"transient").unwrap();
+            fs::remove_file(&transient).unwrap();
+        }
+        fs::write(f.root.join("survivor.txt"), b"survivor").unwrap();
+        for _ in 0..32 {
+            assert!(!engine.poll().unwrap());
+            if engine.state.reasons.contains(&Signal::KernelOverflow) {
+                break;
+            }
+        }
+        assert!(
+            engine.state.reasons.contains(&Signal::KernelOverflow),
+            "native IN_Q_OVERFLOW was not observed"
+        );
+        assert_eq!(engine.view().status, Status::Pending);
+        assert_eq!(paths(&engine), [f.root.join("kept.txt")]);
+        assert_eq!(engine.metrics().full_scans, scans);
+        eprintln!("new Linux Engine observed actual IN_Q_OVERFLOW; max_queued_events={capacity}");
+        engine.gate = Gate::default();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !engine.poll().unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "overflow correction did not validate"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.view().status, Status::Validated);
+        assert_eq!(
+            paths(&engine),
+            [f.root.join("kept.txt"), f.root.join("survivor.txt")]
+        );
+        assert!(engine.metrics().full_scans > scans);
+        engine.stop().unwrap();
+        engine.stop().unwrap();
+        assert_eq!(crate::linux_inotify::process_usage(), baseline);
+    }
+
+    #[test]
+    fn linux_root_open_rejects_fifo_and_symlink_without_blocking() {
+        let f = Fixture::new();
+        let fifo = f.base.join("replacement-fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let started = Instant::now();
+        assert!(open_linux_root(&fifo).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let link = f.base.join("replacement-symlink");
+        symlink(&f.root, &link).unwrap();
+        assert!(open_linux_root(&link).is_err());
+        assert!(open_linux_root(&f.root)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .is_dir());
+    }
 }

@@ -28,8 +28,12 @@ fn child(root: &Path, parent: &Path, name: &[u8]) -> Result<PathBuf, Signal> {
     let name = std::ffi::OsString::from(
         String::from_utf8(name.to_vec()).map_err(|_| Signal::GenerationRace)?,
     );
-    parent
-        .join(name)
+    let absolute = if name.is_empty() {
+        parent.to_path_buf()
+    } else {
+        parent.join(name)
+    };
+    absolute
         .strip_prefix(root)
         .map(|p| p.to_path_buf())
         .map_err(|_| Signal::UnknownWatch)
@@ -126,7 +130,11 @@ pub fn translate(
                     }
                     for (wd, p) in &mut map {
                         if let Ok(tail) = p.strip_prefix(&old) {
-                            *p = new.join(tail);
+                            *p = if tail.as_os_str().is_empty() {
+                                new.clone()
+                            } else {
+                                new.join(tail)
+                            };
                             moved.insert(*wd);
                         }
                     }

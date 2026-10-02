@@ -26,3 +26,32 @@ jobs:
           cat /proc/sys/fs/inotify/max_queued_events
       - name: New Linux Engine persistence and restart
         run: timeout 120s cargo +1.99.0 test --offline --locked --test linux_engine -- --nocapture --test-threads=1
+      - name: Format and all targets
+        run: |
+          cargo +1.99.0 fmt --check
+          cargo +1.99.0 check --all-targets --offline --locked
+      - name: Linux debug suite
+        run: timeout 180s cargo +1.99.0 test --offline --locked -- --nocapture --test-threads=1
+      - name: Linux release suite
+        run: timeout 240s cargo +1.99.0 test --release --offline --locked -- --nocapture --test-threads=1
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Rust 1.99
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt
+      - name: Environment
+        run: |
+          git rev-parse HEAD
+          rustc +1.99.0 -Vv
+          Get-Volume -DriveLetter ([System.IO.Path]::GetPathRoot($PWD.Path).Substring(0, 1)) | Select-Object DriveLetter, FileSystem
+      - name: Format and all targets
+        run: |
+          cargo +1.99.0 fmt --check
+          cargo +1.99.0 check --all-targets --offline --locked
+          cargo +1.99.0 check --all-targets --offline --locked --features linux-ffi-check
+      - name: Windows debug suite
+        run: cargo +1.99.0 test --offline --locked -- --test-threads=1
+      - name: Windows release suite
+        run: cargo +1.99.0 test --release --offline --locked -- --test-threads=1

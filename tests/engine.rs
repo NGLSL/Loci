@@ -1,4 +1,4 @@
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "linux"))]
 mod common;
 use common::Fixture;
 use loci_experiment::engine::{Engine, QueryHandle, Status};
@@ -331,19 +331,22 @@ fn simulated_fatal_error_watch_lost_and_stopped_keep_distinct_states() {
 
 #[test]
 fn simulated_whole_batch_validation_precedes_inspection() {
-    for bad in [
+    let bad_paths = vec![
         "../escape.txt",
         "a/./b",
         "a//b",
         "a/",
-        "a\\.\\b",
-        "a\\\\b",
-        "a\\",
         "nul\0name",
-        "file:stream",
         "",
-        "C:\\absolute",
-    ] {
+        "/absolute",
+    ];
+    #[cfg(windows)]
+    let bad_paths = {
+        let mut paths = bad_paths;
+        paths.extend(["a\\.\\b", "a\\\\b", "a\\", "file:stream", "C:\\absolute"]);
+        paths
+    };
+    for bad in bad_paths {
         let f = Fixture::new();
         fs::write(f.root.join("kept.txt"), "x").unwrap();
         let (mut engine, inputs) = simulated(&f);
@@ -446,6 +449,7 @@ fn queries_report_cancellation_first50_and_complete_counts() {
     assert!(all.validated_at_start_and_finish);
 }
 
+#[cfg(windows)]
 #[test]
 fn non_utf8_windows_name_rejects_candidate_and_preserves_old_query() {
     use std::ffi::OsString;

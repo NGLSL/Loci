@@ -145,7 +145,11 @@ impl Session {
     pub(crate) fn rename_prefix(&mut self, from: &Path, to: &Path) {
         for path in self.watches.values_mut() {
             if let Ok(tail) = path.strip_prefix(from) {
-                *path = to.join(tail);
+                *path = if tail.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(tail)
+                };
             }
         }
     }
@@ -155,6 +159,19 @@ impl Session {
         }
     }
     pub(crate) fn capture(&mut self, capacity: usize) -> io::Result<Captured> {
+        self.capture_with_buffer(capacity, 65536)
+    }
+    pub(crate) fn capture_with_buffer(
+        &mut self,
+        capacity: usize,
+        buffer_bytes: usize,
+    ) -> io::Result<Captured> {
+        if !(4096..=65536).contains(&buffer_bytes) || !buffer_bytes.is_multiple_of(4) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid inotify buffer budget",
+            ));
+        }
         let mut captured = Captured {
             events: vec![],
             truncated: false,
@@ -162,7 +179,7 @@ impl Session {
         };
         for _ in 0..8 {
             let mut buffer = [0u8; 65536];
-            let n = unsafe { read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            let n = unsafe { read(self.fd, buffer.as_mut_ptr().cast(), buffer_bytes) };
             if n < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::WouldBlock {
