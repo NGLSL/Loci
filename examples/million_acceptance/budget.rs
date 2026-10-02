@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct Budget {
     root: PathBuf,
     limit: u64,
+    checkpoint: Option<PathBuf>,
 }
 impl Budget {
     pub fn new(root: &Path, limit: u64) -> io::Result<Self> {
@@ -15,7 +16,15 @@ impl Budget {
         Ok(Self {
             root: root.to_owned(),
             limit,
+            checkpoint: None,
         })
+    }
+    pub fn with_checkpoint(root: &Path, limit: u64, checkpoint: &Path) -> io::Result<Self> {
+        let mut budget = Self::new(root, limit)?;
+        if !checkpoint.starts_with(root) {
+            budget.checkpoint = Some(checkpoint.to_owned());
+        }
+        Ok(budget)
     }
     pub fn used(&self) -> io::Result<u64> {
         let mut todo = vec![self.root.clone()];
@@ -41,6 +50,23 @@ impl Budget {
                 } else {
                     return Err(invalid("artifactspecialfile"));
                 }
+            }
+        }
+        if let Some(path) = &self.checkpoint {
+            match fs::symlink_metadata(path) {
+                Ok(meta) => {
+                    if !meta.is_file()
+                        || meta.uid() != process::uid()
+                        || meta.file_type().is_symlink()
+                    {
+                        return Err(invalid("checkpoint artifact ownership/type"));
+                    }
+                    bytes = bytes
+                        .checked_add(meta.len())
+                        .ok_or_else(|| invalid("checkpoint aggregate overflow"))?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e),
             }
         }
         Ok(bytes)
