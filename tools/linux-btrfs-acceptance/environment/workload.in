@@ -1,0 +1,59 @@
+#!/bin/sh
+set -eu
+export PATH=/usr/bin:/bin:/sbin LC_ALL=C
+[ "$(id -u)" = 1000 ];[ "$(id -g)" = 1000 ]
+BASE="/mnt/data/$LOCI_TOKEN"
+RESULTS="$BASE/results"
+# Every raw native/driver log and oracle survives inside the host-owned data image.
+run_job(){
+ LOCI_JOB=$1;LOCI_TIMEOUT=$2;shift 2
+ LOCI_LOG="$RESULTS/$LOCI_JOB.log"
+ [ ! -e "$LOCI_LOG" ]
+ [ -d "$BASE/native-$LOCI_JOB" ] || mkdir -m700 "$BASE/native-$LOCI_JOB"
+ cd "$BASE/native-$LOCI_JOB"
+ mkdir -m700 tmp
+ export TMPDIR="$PWD/tmp"
+ if timeout -s TERM -k 5 "$LOCI_TIMEOUT" "$@" > "$LOCI_LOG" 2>&1;then LOCI_CODE=0;else LOCI_CODE=$?;fi
+ LOCI_HASH=$(sha256sum "$LOCI_LOG" | cut -d' ' -f1)
+ printf 'LOCI_BTRFS_JOB id=%s exit=%s raw_sha256=%s raw_log=%s\n' "$LOCI_JOB" "$LOCI_CODE" "$LOCI_HASH" "$LOCI_LOG"
+ [ "$LOCI_CODE" = 0 ] || { tail -n80 "$LOCI_LOG";echo "LOCI_BTRFS_FAIL native_job_$LOCI_JOB";exit 1; }
+ if grep -E 'SKIP:|UNVERIFIED:|LOCI_BTRFS_FAIL|GUEST_CAPABILITY_FAIL' "$LOCI_LOG";then echo "LOCI_BTRFS_FAIL unverified_native_job_$LOCI_JOB";exit 1;fi
+}
+run_driver(){
+ LOCI_PHASE=$1;LOCI_SMOKE=$2
+ LOCI_OUT="$RESULTS/driver-$LOCI_PHASE-$LOCI_SMOKE"
+ # Whole retained result set, not a per-worker file limit.
+ LOCI_USED=$(du -sk "$BASE" | awk '{print $1*1024}')
+ awk -v used="$LOCI_USED" 'BEGIN{if(used> @RESULT_BUDGET@ - 1536*1024*1024)exit 1}'
+ set -- "$LOCI_FINAL_DRIVER" --controller --root "$BASE/million/data" --database "$BASE/driver-$LOCI_PHASE-$LOCI_SMOKE.loci" --output "$LOCI_OUT" --sha "$LOCI_SHA" --queries /guest/queries.txt --phase "$LOCI_PHASE" --repetitions 200 --idle-seconds 600 --output-budget-mib @RESULT_MIB@
+ [ "$LOCI_SMOKE" = no ] || set -- "$@" --smoke
+ run_job "driver-$LOCI_PHASE-$LOCI_SMOKE" 10800 "$@"
+ [ -f "$LOCI_OUT/completed.json" ]
+ # Successful duplicate raw sets may be removed after full digest receipts only.
+ # Never execute this cleanup for a failed/partial job.
+ find "$LOCI_OUT" -type f \( -name '*.nul' -o -name '*.kinds' -o -name '*.sorted' \) -exec sha256sum '{}' \; > "$RESULTS/driver-$LOCI_PHASE-$LOCI_SMOKE-successful-raw-digests.txt"
+ find "$LOCI_OUT" -type f \( -name '*.nul' -o -name '*.kinds' -o -name '*.sorted' \) -exec rm '{}' \;
+ LOCI_USED=$(du -sk "$BASE" | awk '{print $1*1024}')
+ awk -v used="$LOCI_USED" 'BEGIN{if(used> @RESULT_BUDGET@)exit 1}'
+}
+case "$1" in
+ pilot) run_driver correctness pilot;;
+ matrix)
+   run_job subvolume-matrix 600 /guest/btrfs-matrix check
+   grep -q '^BTRFS_MATRIX_NATIVE_FINAL_CLI_PASS' "$RESULTS/subvolume-matrix.log"
+   ;;
+ native-job)
+   case "$2" in
+@NATIVE_JOB_CASES@
+    *) exit 2;;
+   esac
+   ;;
+ million)
+   # Functional phases preserve independent1M full oracle; TCG is not reference timing.
+   run_driver correctness no
+   run_driver stages no
+   run_driver restart no
+   echo 'LOCI_BTRFS_NONREFERENCE_TIMING reference_ssd=unverified guest_tcg=1'
+   ;;
+ *) exit 2;;
+esac

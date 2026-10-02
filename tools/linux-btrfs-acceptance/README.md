@@ -2,7 +2,7 @@
 
 This is a **preparation tool**, not Task 16 acceptance. It checks externally supplied immutable artifacts, launches a bounded QEMU TCG guest without networking, and retains raw evidence. A passing wrapper result means its guest-workload markers passed; `engine_acceptance`, `issue16_resolved` and reference-hardware acceptance remain false. Final native cases, complete oracle, million-entry gates and same-SHA review still require separate assessment.
 
-The existing environment proved guest-kernel Btrfs capability on an older source version. Those results cannot satisfy a final frozen-SHA gate. The old environment builder used private package paths and an old CLI; it is intentionally **not** copied into this repository. No kernel, image, package, binary, private installation tree or previous result is bundled here. This tool neither installs dependencies nor builds/formats/mounts a host disk.
+The existing environment proved guest-kernel Btrfs capability on an older source version. Those results cannot satisfy a final frozen-SHA gate. The old exploration builder used private package paths and an old CLI. The [source-only environment glue](environment/README.md) now provides a parameterized assembler, init, native probe, real fixture/matrix and workload scripts; it copies no old CLI or package tree into this repository. No kernel, image, package, binary, private installation tree or previous result is bundled here. This tool neither installs dependencies nor builds/formats/mounts a host disk.
 
 ## What the environment must provide
 
@@ -10,7 +10,7 @@ Use Linux with Python pidfd support. Supply an explicitly owned directory contai
 
 The environment must build an initramfs with its matching kernel modules and a guest `/init` that mounts `/dev/vda` read-only as ext4 and `/dev/vdb` as Btrfs, supplies ordinary UID/GID 1000, and runs the final workload as that user. The workload must check actual Btrfs `statfs` magic, `statx` mount identity, actual inotify create/close-write events and attempted writes returning EROFS on the artifact filesystem. Successful shutdown alone is insufficient.
 
-**Guest image assembly, module selection, a final native probe/workload and the guest receipt emitter remain externally supplied and unverified by these source-only tools.** There is no bundled builder or complete Task 16 harness. Existing generic capability markers are deliberately insufficient. A supplied final workload must establish its test/oracle behavior before completion markers are emitted.
+**The parameterized environment sources are now available, but helper compilation, image assembly, matching kernel/modules/private ABI inputs, actual metadata-capacity pilot and final native workload execution remain unverified.** The source-only assembler does not resolve or install packages, start a guest, or establish Task 16 acceptance. A read-only guest result-extraction/host-assessment handoff is still required. Existing generic capability markers are deliberately insufficient. A supplied final workload must establish its test/oracle behavior before completion markers are emitted.
 
 ## Freeze and preserve artifacts
 
@@ -18,7 +18,7 @@ First freeze the source to a complete lowercase 40-hex SHA and prepare compiler 
 
 The shared runner stages GNU `sort`, `sha256sum` remains an explicit guest requirement, and BusyBox `sort` does not meet the controller's `sort -z -S64M` contract. Include the shared runtime overlay and required guest libraries at their canonical absolute paths. Stage a compatible `sha256sum` through environment preparation if the guest lacks it. Copy the CLI, test binaries and driver into the artifact image while preserving **all manifest absolute destinations**. Tests bake `CARGO_BIN_EXE_loci-experiment` paths during compilation; those exact paths must resolve inside the guest. For example, a guest `/workspace` symlink can point into `/artifacts/workspace`, but additional absolute prefixes must be represented deliberately. The driver itself does not bake that CLI path.
 
-The final million driver is `linux_million_acceptance --controller` with `--phase all --repetitions 200 --idle-seconds 600`. Queries are UTF-8 plain lines, including a meaningful empty first line. Use the [repository suite](../linux-million-acceptance/queries.txt) and its exact digest, not JSON or a reduced baseline. The current foundation
+The final million driver is `linux_million_acceptance --controller` with `--repetitions 200 --idle-seconds 600`. Reference hardware uses `--phase all`; the TCG environment source uses separate functional `correctness`, `stages`, and `restart` phases, preserving full independent oracles while leaving reference timing unverified. Queries are UTF-8 plain lines, including a meaningful empty first line. Use the [repository suite](../linux-million-acceptance/queries.txt) and its exact digest, not JSON or a reduced baseline. The current foundation
 suite has 52 lines (including the empty first line), SHA256
 `53b6379f77d0fb79c134285b92382347a2c029d598f5278ad2d011eae4b99a74`;
 freeze/recheck it with the final source revision. Coordinate the final driver and [soak tool](../linux-soak/README.md) receipts; this wrapper neither runs nor resolves the 24-hour gate. Its summary does not
