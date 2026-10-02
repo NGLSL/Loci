@@ -4,7 +4,7 @@
 
 ## 基线、范围与当前状态
 
-主工作树基线 `e204917644fb771e5c92e74d130a34127ca8f74e`；云端参考 `de8f897eda0ba856b1f59e9497f2bd079d287686` 为祖先，没有自动重置。阶段 A 独立提交 `381bb8e30512b447c0b860225233ca51e29ee0e2`。阶段 B 代码提交 `7cdf3e41a494d45021ffb2aded10d3154194a0a8`，分支 `codex/windows-ntfs-stage-b`；本报告与完成记录随后单独提交。
+主工作树基线 `e204917644fb771e5c92e74d130a34127ca8f74e`；云端参考 `de8f897eda0ba856b1f59e9497f2bd079d287686` 为祖先，没有自动重置。阶段 A 独立提交 `381bb8e30512b447c0b860225233ca51e29ee0e2`。阶段 B 初版代码提交 `7cdf3e41a494d45021ffb2aded10d3154194a0a8`、首次报告 `ce89c1f3110c5b446801e5b4a79e8c27425b67c3`、真实路径竞争和目录句柄定位修正 `34312267b6710c180c3a2b9808e4797b2afbe483`、夹具固定和原生 reference 位宽边界修正 `7f2306fbeb7ea98cb9f2be7eefc1fa84e7a71008`，分支 `codex/windows-ntfs-stage-b`；报告与完成记录单独提交。
 
 独立工作树 `D:\Project\Loci\.scratch\worktrees\windows-ntfs-stage-b`，独立 Cargo 项目、独立 target，Rust 1.99.0、std-only。根 Cargo、共享 events/storage/engine/index/lib 和阶段 A 源码保持原样；没有 GUI、主引擎装配、PR、推送、合并或发布。共享 ADR 为 proposed，不能视为 Linux／共享核心已同意。
 
@@ -39,9 +39,9 @@ CLI 的 `query <fixture> <checkpoint-directory> <literal>` 重开并同步后，
 
 `Backend::build/open/sync/query/save/stop` 是本轮私有接口。建库先记录 journal 边界，扫描关系、重放到已观察的安静截止点，再保存完整库存；`open` 从持久游标恢复，不重新 MFT 枚举。调用方显式 `sync`，没有后台线程或自动轮询；Ready 表示最近一次成功同步的截止点，不表示查询时刻的文件系统事务快照。
 
-每批根据对象、父对象和既有硬链接别名收集脏目录。只枚举受影响目录的直接子项，新目录／移入目录递归发现；祖先改名更新 parent/name 关系并派生后代路径，移出／删除子树按可达性清除。目录变化期间失去路径时，候选库存丢弃并从原边界重试，最多 4 次；权限、分享、未知版本及预算错误不变成空结果。
+每批根据对象、父对象和既有硬链接别名收集脏目录。只枚举受影响目录的直接子项，新目录／移入目录递归发现；祖先改名更新 parent/name 关系并派生后代路径，移出／删除子树按可达性清除。目录变化期间失去路径时，候选库存丢弃并从原边界重试，最多 32 次；5 毫秒起步、最高 250 毫秒退避，每 5 毫秒检查取消和原始总期限。30 秒及记录预算仍跨尝试累计。权限、分享、未知版本及预算错误不变成空结果。
 
-硬链接变化不能仅依赖 USN 返回的一个名称。对 `HARD_LINK_CHANGE`，使用完整 64-bit NTFS reference 经 `OpenFileById` 定位对象，再完整枚举当前链接；核对前后对象、serial、link count 和解析路径身份，只返回范围内 parent。范围外名称只存在于当前 API 输出缓冲区，不日志记录、不形成持久名称集合。原生查询最多 4096 个链接；高 64 位非零的 file reference 在这条原生定位路线明确 Unsupported，不截断。依据：[OpenFileById](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-openfilebyid)、[FILE_ID_DESCRIPTOR](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_descriptor)、[FindFirstFileNameW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfilenamew)。
+硬链接变化不能仅依赖 USN 返回的一个名称。对 `HARD_LINK_CHANGE`，使用完整 64-bit NTFS reference 经 `OpenFileById` 定位对象，再完整枚举当前链接；核对前后对象、serial、link count 和解析路径身份，只返回范围内 parent。范围外名称仅作为单次对象查询的临时 API 结果，不日志记录、不形成持久名称集合。原生查询最多 4096 个链接。解码器保留 V3 的 128-bit identity，而本轮实际 namespace 身份接口为完整 legacy 64-bit reference；任何对象或 parent 高 64 位非零的原生批次明确 Unsupported，不截断、不作为无关事件忽略。依据：[OpenFileById](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-openfilebyid)、[FILE_ID_DESCRIPTOR](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_descriptor)、[FindFirstFileNameW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfilenamew)。
 
 对象身份与目录项关系分开。私有 EntryId 是 `(parent, object, raw name)`，完整路径不是主键；rename 改变关系键，共享稳定 EntryId 生命周期仍待 ADR 确认。来源绑定包括卷 GUID、legacy 32-bit serial、根对象和原始 scope；原生 reference 保留完整值，而非仅保留 MFT slot。强制身份复用尚未原生验证。
 
@@ -57,13 +57,21 @@ D: 为 NTFS，legacy serial `0xf228c46d`，卷 GUID `\\?\Volume{3b1b89c0-c213-49
 
 20 项阶段 B 测试通过；阶段 A 24 项回归通过。涵盖格式／长度／校验、图、名称、硬链接关系、128-bit 名称记录解码、版本拒绝、预算、取消与 Pending／Stopped 行为。真实 Windows `save_new` 对已有目标返回 OS 183；锁住目标后的原子替换返回 OS 5，两者保留精确旧库存和 cursor，并没有遗留本次临时文件。
 
+修正后完整 debug 测试为 24 项通过，新增实际目录项竞争、退避取消／总期限、原生 reference 位宽拒绝及普通权限的对象级硬链接定位。对象定位现在用选定工程根目录的零访问权限句柄作为 `OpenFileById` 的 volume hint，省去不必要的额外卷句柄。普通 token 下，范围外源对象首次在范围内添加链接返回父目录 a，再跨目录添加链接返回 a／b；两条范围内路径的 identity／serial 相同，原生链接数量与全名称枚举数量均为 3。这是实际对象元数据查询证据，不代表普通用户具备 USN 权限。
+
 普通扫描成功证据：`.scratch/windows-ntfs-stage-b/run/native-20261002T204446Z-2ebed87d2d5d41d787156884e7ae2d53/`。1,000 个真实数据集文件，加场景／目录条目共 1,045 条；独立 Python 两次完整遍历的 UTF-16 路径集合、全部对象 reference／serial／attributes 相等，D800 名称保留，v2 快照 71,603 字节。这一轮明确使用 journal=0／cursor=0／假 GUID，是 namespace／codec 验证，不能计入 USN 同步。检查器对工程内 junction 路径实际在遍历前拒绝。
 
 保留首次普通扫描失败证据 `native-20261002T204245Z-f3ef2714a5114aa18791e1d342a37ced/`：实际 OS 3，未保存库存；修正 native identity 扫描所使用的 canonical extended root 后，以上完整检查通过。没有将首次失败隐藏或当成通过。
 
 ## 原生 1k／10k 验收
 
-待本轮明确 UAC 授权后填入真实执行结果。本段未填写前，阶段 B 原生同步验收尚未完成；普通扫描和模型测试不能替代。
+首次管理员执行已授权并运行，代码为 `ce89c1f`，证据 `.scratch/windows-ntfs-stage-b/run/native-20261002T205815Z-f8c13b5fa9324ef58285b09067129ae5/`。fmt、release 的 20 项测试、build、capabilities 均 exit=0；1k 并发建库 exit=1，实际 OS 2，进程总耗时 503 毫秒、句柄 56→56、结束 working set 5,939,200 字节、private commit 1,228,800 字节、peak working set 7,024,640 字节。未保存库存，未执行离线变更／恢复，10k 尚未创建。管理员 child PID 27736 已退出。失败证据保留，没有计作完整通过。
+
+该次 token 实际 elevated=true，Aura 模块未加载。GENERIC_READ 卷句柄和 QUERY／READ 成功；journal ID `0x1d9b89b541688b0`，FirstUsn=37706792960、NextUsn=37746866384、LowestValidUsn=0、API advertised major 2..4；READ 从末尾返回 0 条，因此本轮不能据此宣称实际观察了所有记录版本。ENUM 仅执行 EOF sentinel（OS 38），没有整卷 MFT 建库。20 次原生句柄循环 64→64；capability 进程初始化前后 62→63 的差异也如实保留，不把它解释为已定位的泄漏或零差值。
+
+修正前后的真实竞争回归：扫描器已经取得 `read_dir` 项后，让另一线程实际 rename，再打开对象身份。旧四次立即重试均收到原生 OS 2；在相同前四次实际改名后，新策略第五次扫描成功，1,001 个完整原始路径与独立目录集合一致。此为受控调度的真实文件系统竞争，没有注入错误码，也没有调用或模拟 USN；它证明旧策略缺口，但旧管理员日志缺少阶段标签，尚不能确定首次失败就是该阶段。新日志区分扫描、重放和夹具写入方，同时保留原 OS code，不打印范围外名称。
+
+修正版本的完整 1k／10k 管理员复验仍待新的有范围 UAC 授权；尚未填入成功结果前，不将阶段 B 原生闭环标为完成。
 
 ## 无权限／非 NTFS 的降级
 
