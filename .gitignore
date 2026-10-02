@@ -58,3 +58,10 @@
 !/tests/engine.rs
 !/tests/windows_events.rs
 !/docs/PERSISTENCE.md
+!/src/linux_events.rs
+!/tests/linux_engine.rs
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/native-engine.yml

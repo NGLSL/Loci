@@ -1,0 +1,28 @@
+name: Native engine
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/loci-linux-engine-v0.1']
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Rust 1.99
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt
+      - name: Environment
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          uname -srmo
+          rustc +1.99.0 -Vv
+          findmnt -T . -o TARGET,SOURCE,FSTYPE,OPTIONS
+          cat /proc/sys/fs/inotify/max_queued_events
+      - name: New Linux Engine persistence and restart
+        run: timeout 120s cargo +1.99.0 test --offline --locked --test linux_engine -- --nocapture --test-threads=1
