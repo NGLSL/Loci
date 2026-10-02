@@ -14,6 +14,8 @@ __pycache__/
 /.scratch/windows-ntfs-stage-a/run/
 /.scratch/windows-ntfs-stage-b/target/
 /.scratch/windows-ntfs-stage-b/run/
+/.scratch/windows-ntfs-performance/target/
+/.scratch/windows-ntfs-performance/run/
 /.artifact-archive/
 /.archive/
 
