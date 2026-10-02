@@ -75,3 +75,20 @@ this page. No exact total count is needed to produce a page.
 `--page-size` requires `--all`. Output preserves exact NUL-delimited path bytes
 with `--null`. A failed or pending export exits 4 and can have partial output;
 callers requiring an atomic output file should stage it and check the exit code.
+
+Scale native monitoring allows an explicit watch budget (`EngineOptions.watch_limit`,
+default 32,768 including the selected root), with a hard shared process ceiling of
+65,536 actual watches across bounded and scale owners. Bounded owners retain their
+additional shared limit of 128. All owners share eight native inotify descriptors;
+these counts describe inotify descriptors, rather than every descriptor in the
+process. `EngineOptions.event_limits` bounds native queued events and read-buffer
+bytes; actual queued bytes/counts are reported separately from the configured limit.
+
+Scale status exposes `View.coverage_gaps` (exact affected path, reason and original
+errno) and `View.resources`; CLI status writes these details to stderr. Permission
+failure, a watch budget gap or kernel ENOSPC never publishes Validated coverage.
+Previously published snapshots stay searchable and explicitly unvalidated. Initial
+partial coverage produces an inspectable Failed Engine with no published snapshot.
+Retries wait 250 ms and stop after four failures; restoration before exhaustion can
+recover, while an explicit reopening/rebuild restarts an exhausted attempt. No system
+watch limits are changed. Native source replacement and stop/drop release resources.

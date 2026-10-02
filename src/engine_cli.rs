@@ -145,7 +145,25 @@ fn export(handle: &QueryHandle, raw: &str, nul: bool, page_size: usize) -> io::R
     output.flush()
 }
 
+fn coverage(handle: &QueryHandle) {
+    let view = handle.view();
+    let resources = &view.resources;
+    if resources.observed {
+        eprintln!("engine,version={},state={:?},watches={}/{},process_watches={}/{},inotify_fds={},process_inotify_fds={}/{},queued_events={}/{},queued_event_bytes={}/{},event_buffer_bytes={}",
+            view.version, view.status, resources.session_watches, resources.session_watch_limit,
+            resources.process_watches, resources.process_watch_limit, resources.inotify_fds,
+            resources.process_inotify_fds, resources.process_fd_limit, resources.queued_events,
+            resources.queue_limit, resources.queued_event_bytes, resources.queue_byte_limit, resources.event_buffer_bytes);
+    }
+    for gap in &view.coverage_gaps {
+        eprintln!(
+            "engine,coverage_gap={:?},reason={:?},errno={:?},error={}",
+            gap.path, gap.kind, gap.errno, gap.error
+        );
+    }
+}
 fn status(handle: &QueryHandle) -> io::Result<()> {
+    coverage(handle);
     let result =
         handle
             .lease()?
@@ -264,6 +282,7 @@ fn watch(mut engine: Engine, root: &Path, database: &Path, nul: bool) -> io::Res
         let view = engine.view();
         if previous != (view.version, view.status.clone()) {
             eprintln!("engine,version={},state={:?}", view.version, view.status);
+            coverage(&engine.query());
             previous = (view.version, view.status);
         }
         let line = match receiver.recv_timeout(Duration::from_millis(20)) {

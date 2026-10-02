@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 pub const PROCESS_WATCH_CAP: usize = 128;
+/// Shared ceiling for all native bounded and scale watch owners.
+pub const PROCESS_TOTAL_WATCH_CAP: usize = 65536;
 pub const PROCESS_SESSION_CAP: usize = 8;
+static LEGACY_WATCHES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_WATCHES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 fn reserve(counter: &AtomicUsize, cap: usize) -> io::Result<()> {
@@ -43,6 +46,8 @@ pub(crate) struct Captured {
 pub struct Session {
     fd: c_int,
     watches: BTreeMap<i32, PathBuf>,
+    reverse: BTreeMap<PathBuf, i32>,
+    scale: bool,
     limit: usize,
     pub(crate) expected_ignored: BTreeSet<i32>,
 }
@@ -51,12 +56,24 @@ impl Drop for Session {
         unsafe {
             close(self.fd);
         }
-        LIVE_WATCHES.fetch_sub(self.watches.len(), Ordering::AcqRel);
+        self.release_watches(self.watches.len());
         LIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 impl Session {
     pub fn new(limit: usize) -> io::Result<Self> {
+        Self::new_budgeted(limit, false)
+    }
+    pub(crate) fn new_scale(limit: usize) -> io::Result<Self> {
+        if !(1..=PROCESS_TOTAL_WATCH_CAP).contains(&limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scale watch limit must be 1..=65536",
+            ));
+        }
+        Self::new_budgeted(limit, true)
+    }
+    fn new_budgeted(limit: usize, scale: bool) -> io::Result<Self> {
         // x86_64 Linux O_NONBLOCK | O_CLOEXEC. No changes to global kernel limits.
         reserve(&LIVE_SESSIONS, PROCESS_SESSION_CAP)?;
         let fd = unsafe { inotify_init1(0x800 | 0x80000) };
@@ -68,12 +85,35 @@ impl Session {
         Ok(Self {
             fd,
             watches: BTreeMap::new(),
+            reverse: BTreeMap::new(),
+            scale,
             limit,
             expected_ignored: BTreeSet::new(),
         })
     }
+    fn reserve_watch(&self) -> io::Result<()> {
+        if !self.scale {
+            reserve(&LEGACY_WATCHES, PROCESS_WATCH_CAP)?;
+        }
+        if let Err(error) = reserve(&LIVE_WATCHES, PROCESS_TOTAL_WATCH_CAP) {
+            if !self.scale {
+                LEGACY_WATCHES.fetch_sub(1, Ordering::AcqRel);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn release_watches(&self, count: usize) {
+        LIVE_WATCHES.fetch_sub(count, Ordering::AcqRel);
+        if !self.scale {
+            LEGACY_WATCHES.fetch_sub(count, Ordering::AcqRel);
+        }
+    }
+    pub(crate) fn descriptor_for(&self, path: &Path) -> Option<i32> {
+        self.reverse.get(path).copied()
+    }
     pub fn add(&mut self, path: &Path) -> io::Result<()> {
-        if self.watches.values().any(|p| p == path) {
+        if self.reverse.contains_key(path) {
             return Ok(());
         }
         if self.watches.len() >= self.limit {
@@ -94,15 +134,15 @@ impl Session {
         // CREATE, DELETE, MOVED_FROM/TO, ATTRIB, DELETE_SELF, MOVE_SELF,
         // ONLYDIR and DONT_FOLLOW. Do not subscribe OPEN/ACCESS from our scans.
         let mask = 0x100 | 0x200 | 0x40 | 0x80 | 0x4 | 0x400 | 0x800 | 0x01000000 | 0x02000000;
-        reserve(&LIVE_WATCHES, PROCESS_WATCH_CAP)?;
+        self.reserve_watch()?;
         let wd = unsafe { inotify_add_watch(self.fd, path_c.as_ptr(), mask) };
         if wd < 0 {
             let error = io::Error::last_os_error();
-            LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
+            self.release_watches(1);
             return Err(error);
         }
         if self.expected_ignored.contains(&wd) {
-            LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
+            self.release_watches(1);
             return Err(io::Error::other("ambiguous reused watch descriptor"));
         }
         if self
@@ -110,12 +150,13 @@ impl Session {
             .get(&wd)
             .is_some_and(|previous| previous != path)
         {
-            LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
+            self.release_watches(1);
             return Err(io::Error::other("aliased watch descriptor"));
         }
         if self.watches.insert(wd, path.to_path_buf()).is_some() {
-            LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
+            self.release_watches(1);
         }
+        self.reverse.insert(path.to_path_buf(), wd);
         Ok(())
     }
     pub(crate) fn paths(&self) -> &BTreeMap<i32, PathBuf> {
@@ -133,11 +174,13 @@ impl Session {
             if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(22) {
                 return Err(io::Error::last_os_error());
             }
-            self.watches.remove(&wd);
-            LIVE_WATCHES.fetch_sub(1, Ordering::AcqRel);
+            if let Some(path) = self.watches.remove(&wd) {
+                self.reverse.remove(&path);
+            }
+            self.release_watches(1);
             self.expected_ignored.insert(wd);
         }
-        if self.expected_ignored.len() > PROCESS_WATCH_CAP {
+        if self.expected_ignored.len() > self.limit {
             return Err(io::Error::other("retired descriptor budget exhausted"));
         }
         Ok(())
@@ -152,6 +195,11 @@ impl Session {
                 };
             }
         }
+        self.reverse = self
+            .watches
+            .iter()
+            .map(|(wd, path)| (path.clone(), *wd))
+            .collect();
     }
     pub(crate) fn acknowledge_ignored(&mut self, ids: &[i32]) {
         for wd in ids {

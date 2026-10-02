@@ -13,6 +13,8 @@ pub(crate) struct LinuxEvents {
     limits: EventLimits,
     session: Option<Session>,
     stopped: bool,
+    watch_limit: usize,
+    scale: bool,
     logical: BTreeMap<i32, PathBuf>,
     retired: BTreeSet<i32>,
     consumed_ignored: BTreeSet<i32>,
@@ -21,8 +23,45 @@ pub(crate) struct LinuxEvents {
 }
 
 impl LinuxEvents {
+    pub(crate) fn resources(&self) -> crate::engine::Resources {
+        let (process_watches, process_inotify_fds) = crate::linux_inotify::process_usage();
+        crate::engine::Resources {
+            observed: true,
+            session_watches: self.session.as_ref().map_or(0, Session::count),
+            session_watch_limit: self.watch_limit,
+            process_watches,
+            process_watch_limit: crate::linux_inotify::PROCESS_TOTAL_WATCH_CAP,
+            inotify_fds: usize::from(self.session.is_some()),
+            process_inotify_fds,
+            process_fd_limit: crate::linux_inotify::PROCESS_SESSION_CAP,
+            queued_events: self.pending.len(),
+            queue_limit: self.limits.max_events(),
+            queued_event_bytes: self.pending.iter().map(|event| 16 + event.name.len()).sum(),
+            queue_byte_limit: self.limits.max_events().saturating_mul(16 + 4096),
+            event_buffer_bytes: self.limits.buffer_bytes(),
+        }
+    }
     pub(crate) fn open(root: &Path, limits: EventLimits) -> io::Result<Self> {
-        let mut session = Session::new(PROCESS_WATCH_CAP)?;
+        Self::open_budgeted(root, limits, PROCESS_WATCH_CAP, false)
+    }
+    pub(crate) fn open_scale(
+        root: &Path,
+        limits: EventLimits,
+        watch_limit: usize,
+    ) -> io::Result<Self> {
+        Self::open_budgeted(root, limits, watch_limit, true)
+    }
+    fn open_budgeted(
+        root: &Path,
+        limits: EventLimits,
+        watch_limit: usize,
+        scale: bool,
+    ) -> io::Result<Self> {
+        let mut session = if scale {
+            Session::new_scale(watch_limit)?
+        } else {
+            Session::new(watch_limit)?
+        };
         session.add(root)?;
         let logical = session.paths().clone();
         Ok(Self {
@@ -30,6 +69,8 @@ impl LinuxEvents {
             limits,
             session: Some(session),
             stopped: false,
+            watch_limit,
+            scale,
             logical,
             retired: BTreeSet::new(),
             consumed_ignored: BTreeSet::new(),
@@ -43,18 +84,15 @@ impl LinuxEvents {
             .as_mut()
             .ok_or_else(|| io::Error::other("Linux source stopped"))?;
         session.add(path)?;
-        for (wd, watched) in session
-            .paths()
-            .iter()
-            .filter(|(_, watched)| *watched == path)
-        {
-            if self.retired.contains(wd) {
-                return Err(io::Error::other(
-                    "ambiguous reused logical watch descriptor",
-                ));
-            }
-            self.logical.entry(*wd).or_insert_with(|| watched.clone());
+        let wd = session
+            .descriptor_for(path)
+            .ok_or_else(|| io::Error::other("watch registration missing"))?;
+        if self.retired.contains(&wd) {
+            return Err(io::Error::other(
+                "ambiguous reused logical watch descriptor",
+            ));
         }
+        self.logical.entry(wd).or_insert_with(|| path.to_path_buf());
         Ok(())
     }
     pub(crate) fn begin_reconcile(&mut self) -> io::Result<()> {
@@ -68,7 +106,11 @@ impl LinuxEvents {
         self.logical.clear();
         self.retired.clear();
         self.consumed_ignored.clear();
-        let mut next = Session::new(PROCESS_WATCH_CAP)?;
+        let mut next = if self.scale {
+            Session::new_scale(self.watch_limit)?
+        } else {
+            Session::new(self.watch_limit)?
+        };
         next.add(&self.root)?;
         self.logical = next.paths().clone();
         self.session = Some(next);
@@ -287,7 +329,7 @@ impl EventSource for LinuxEvents {
         }
         self.consumed_ignored
             .extend(translated.ignored.iter().copied());
-        if self.retired.union(&self.consumed_ignored).count() > PROCESS_WATCH_CAP {
+        if self.retired.union(&self.consumed_ignored).count() > self.watch_limit {
             // A long publication gap must not grow retirement metadata without
             // bound. Engine correction discards this topology and its fd.
             self.retired.clear();
