@@ -67,6 +67,15 @@ fn raw(path: &Path) -> Vec<u16> {
 fn ordinary(attributes: u32) -> bool {
     attributes & DIRECTORY != 0 && attributes & REPARSE == 0
 }
+fn native_references_supported(records: &[Record]) -> io::Result<()> {
+    if records
+        .iter()
+        .any(|record| record.object > u64::MAX as u128 || record.parent > u64::MAX as u128)
+    {
+        return Err(io::Error::new(io::ErrorKind::Unsupported,"native namespace uses complete 64-bit NTFS references; wider USN object/parent identities require rebuild with a compatible source"));
+    }
+    Ok(())
+}
 fn check(cancel: &AtomicBool, began: Instant) -> io::Result<()> {
     if cancel.load(Ordering::Acquire) {
         return Err(io::Error::new(
@@ -494,6 +503,7 @@ impl Backend {
                 return Ok(());
             }
             let (next, records) = volume.read(journal.id, candidate.checkpoint.cursor)?;
+            native_references_supported(&records)?;
             if next <= candidate.checkpoint.cursor
                 || records
                     .iter()
@@ -688,6 +698,16 @@ mod tests {
         }
     }
     #[test]
+    fn native_namespace_rejects_wide_object_and_parent_before_invalidation() {
+        assert!(native_references_supported(&[record(1, u64::MAX as u128)]).is_ok());
+        for wide in [record(1, 1u128 << 64), record(1u128 << 64, 2)] {
+            assert_eq!(
+                native_references_supported(&[wide]).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+    }
+    #[test]
     fn directory_rename_derives_descendants_without_rewriting_children() {
         let mut entries =
             BTreeMap::from([(entry(1, 2, "old"), DIRECTORY), (entry(2, 3, "child"), 0)]);
@@ -832,6 +852,7 @@ mod tests {
             .as_nanos();
         let literal = base.join(format!("scanner-race-unit-{}-{unique}", std::process::id()));
         fs::create_dir(&literal).unwrap();
+        let root_pin = DirectoryPins::hold(&literal).unwrap();
         let root = fs::canonicalize(&literal).unwrap();
         for number in 0..1000 {
             fs::write(root.join(format!("stable-{number:04}.txt")), []).unwrap();
@@ -892,6 +913,7 @@ mod tests {
         for item in fs::read_dir(&root).unwrap() {
             fs::remove_file(item.unwrap().path()).unwrap();
         }
+        drop(root_pin);
         fs::remove_dir(root).unwrap();
     }
     #[test]

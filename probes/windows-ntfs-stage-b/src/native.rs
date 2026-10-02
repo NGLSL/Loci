@@ -314,6 +314,12 @@ mod tests {
             .unwrap();
         let run = worktree.join(".scratch/windows-ntfs-stage-b/run");
         // Pin literal ancestors before creating even our owned tiny fixture.
+        let _parent_pin = crate::win::DirectoryPins::hold(run.parent().unwrap()).unwrap();
+        match fs::create_dir(&run) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("engineering run creation failed: {error}"),
+        }
         let _pins = crate::win::DirectoryPins::hold(&run).unwrap();
         let owned = run.join(format!(
             "native-hint-{}-{}-{}",
