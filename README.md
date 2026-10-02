@@ -2,7 +2,9 @@
 
 Loci 是独立的 Rust 文件名/路径搜索实验，包含紧凑路径记录、块级 trigram 候选过滤、短词摘要及最终精确匹配。实时原型将 Linux inotify 接到不可变查询快照，支持有界增量更新、失效校正、取消和并发读者；保留全量重扫作为对照。
 
-项目使用 Rust **1.99.0** 和标准库，无第三方 Cargo 依赖，无 GUI。当前为原型；原生监听仅支持 x86_64 Linux。许可证尚未决定，没有添加 LICENSE 文件。
+项目使用 Rust **1.99.0** 和标准库，无第三方 Cargo 依赖，无 GUI。Windows v0.1 引擎已接入原生递归监听、版本化持久库存和停止生命周期；原 Linux 增量原型仍支持 x86_64 Linux，新的 Linux EventSource 装配和用户 CLI 尚未完成。许可证尚未决定，没有添加 LICENSE 文件。
+
+嵌入式 `engine::Engine::open/poll/query/save/stop` 和 `storage::Snapshot::new/save/load` 用法、数据库位置、格式、预算及验证范围见 [docs/PERSISTENCE.md](docs/PERSISTENCE.md)。完整 v0.1 仍须后续跨平台及 CLI 验收。
 
 查询为大小写不敏感的 AND 子串，可使用 `ext:rs` 精确扩展名条件。first50 返回记录顺序前50项，complete 计算完整匹配数并保留前50项；没有相关性排序、全文、拼音或 mmap。
 
@@ -20,7 +22,7 @@ cargo +1.99.0 test --release --offline
 bash scripts/validate-linux.sh --kernel-overflow --live-metrics
 ```
 
-Windows可运行共享查询、恢复及真实夹具测试，文件变更通知显式模拟：
+Windows可运行共享查询、恢复、持久化与引擎夹具测试；原型通知显式模拟，新引擎及 `windows_events` 使用原生通知：
 
 ```powershell
 cargo +1.99.0 test --release --offline --target-dir target/stage3

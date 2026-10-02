@@ -51,3 +51,10 @@
 !/tests/incremental_rename_regressions.rs
 !/src/events.rs
 !/docs/V0.1-INTERFACES.md
+!/src/storage.rs
+!/src/engine.rs
+!/src/windows_events.rs
+!/tests/storage.rs
+!/tests/engine.rs
+!/tests/windows_events.rs
+!/docs/PERSISTENCE.md

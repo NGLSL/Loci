@@ -489,6 +489,13 @@ impl EventSource for WindowsEvents {
                 break;
             }
         }
+        // An old-only completion consumed a real event. Until it is paired or
+        // expires, even another empty poll cannot represent a reliable cut.
+        // Keep the name for bounded cross-read pairing; the engine discards
+        // this incomplete batch and remains Pending instead of publishing it.
+        if self.old_name.is_some() {
+            batch.losses.insert(Loss::UnpairedRename);
+        }
         Ok(batch)
     }
     fn stop(&mut self) -> io::Result<()> {

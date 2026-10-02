@@ -15,3 +15,10 @@ mod partitioned;
 
 /// Stable event-source seam under v0.1 development.
 pub mod events;
+
+pub mod engine;
+/// Versioned, bounded root inventories for the v0.1 engine.
+pub mod storage;
+
+#[cfg(windows)]
+pub mod windows_events;

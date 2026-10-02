@@ -80,8 +80,13 @@ pub(crate) fn validate_limits(limits: Limits) -> io::Result<()> {
     }
     Ok(())
 }
-fn valid(path: &Path) -> io::Result<()> {
-    if path.as_os_str().is_empty() || !path.components().all(|c| matches!(c, Component::Normal(_)))
+pub(crate) fn valid(path: &Path) -> io::Result<()> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.is_empty()
+        || !path.components().all(|c| matches!(c, Component::Normal(_)))
+        || bytes
+            .split(|c| *c == b'/' || (cfg!(windows) && *c == b'\\'))
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
     {
         return Err(io::Error::other("unsafe relative event path"));
     }
@@ -93,8 +98,11 @@ fn valid(path: &Path) -> io::Result<()> {
             "Windows stream paths are not filename entries",
         ));
     }
-    if path.as_os_str().len() > 4096 {
+    if bytes.len() > 4096 {
         return Err(io::Error::other("event path byte budget"));
+    }
+    if bytes.contains(&0) {
+        return Err(io::Error::other("NUL in event path"));
     }
     Ok(())
 }
@@ -302,7 +310,12 @@ pub(crate) fn apply(
                 for (path, kind) in moved {
                     inv.entries.remove(&path);
                     let tail = path.strip_prefix(from).map_err(io::Error::other)?;
-                    inv.entries.insert(to.join(tail), kind);
+                    let renamed = if tail.as_os_str().is_empty() {
+                        to.clone()
+                    } else {
+                        to.join(tail)
+                    };
+                    inv.entries.insert(renamed, kind);
                 }
                 topology(Topology::Rename {
                     from: root.join(from),

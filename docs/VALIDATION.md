@@ -1,4 +1,4 @@
-> 本文记录基础提交7415280的验收。增量分支的新增范围、Windows联合51项结果及Linux待复验入口见[INCREMENTAL.md](INCREMENTAL.md)。
+> 本文记录基础提交7415280的历史验收。增量分支的新增范围、Windows联合51项结果及Linux待复验入口见[INCREMENTAL.md](INCREMENTAL.md)。本轮 Windows 原生引擎、持久化与停止生命周期见 [PERSISTENCE.md](PERSISTENCE.md)；历史结果不代表当前精确提交已经跨平台复验。
 
 # 验证范围
 
@@ -34,4 +34,4 @@ bash scripts/validate-linux.sh --kernel-overflow --live-metrics
 
 百万条在线重建、长期压力、其它Linux架构/文件系统、恶意TOCTOU和生产调用方集成尚未完成验证。
 
-低层API约束：收到WatchLost的Session应丢弃并重建，直接复用可能保留过时登记。QueryHandle可以比发布者活得更久，当前没有独立的监控停止状态；调用方必须管理发布者生命周期，不能把停止poll后的快照称为持续监控。
+低层API约束：收到WatchLost的Session应丢弃并重建，直接复用可能保留过时登记。QueryHandle可以比发布者活得更久；当前 Store/Engine 停止或 drop 后，留下的 query handle 显示 Stopped。运行中的引擎仍需要调用方定期 poll，不能把未继续 poll 的快照称为持续校正。

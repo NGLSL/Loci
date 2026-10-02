@@ -19,6 +19,7 @@ pub enum Status {
     Validated,
     Failed(String),
     ReadersPinned,
+    Stopped,
 }
 #[derive(Clone, Debug)]
 pub struct View {
@@ -42,6 +43,7 @@ struct Shared {
     current: Option<Arc<Snapshot>>,
     retired: Weak<Snapshot>,
     view: View,
+    stopped: bool,
 }
 #[derive(Clone)]
 pub struct QueryHandle {
@@ -66,6 +68,8 @@ pub struct QueryResult {
     pub paths: Vec<PathBuf>,
     pub matches: usize,
     pub cancelled: bool,
+    /// Complete matching count; first50 can stop before visiting all records.
+    pub complete: bool,
 }
 impl QueryHandle {
     pub fn view(&self) -> View {
@@ -137,6 +141,7 @@ impl QueryLease {
             paths: out.paths,
             matches: out.matches,
             cancelled: out.cancelled,
+            complete: !out.cancelled && (!first50 || out.matches < 50),
         })
     }
 }
@@ -174,6 +179,7 @@ impl Store {
                     current: None,
                     retired: Weak::new(),
                     view,
+                    stopped: false,
                 })),
             },
             staged: None,
@@ -189,6 +195,9 @@ impl Store {
     }
     pub fn observe(&mut self, state: &Recovery) {
         let mut shared = self.handle.shared.lock().unwrap();
+        if shared.stopped {
+            return;
+        }
         let changed = shared.view.observed_generation != state.generation;
         shared.view.observed_generation = state.generation;
         shared.view.reasons = state.reasons.clone();
@@ -201,12 +210,25 @@ impl Store {
     pub fn fail(&mut self, error: impl ToString) {
         self.staged = None;
         let message: String = error.to_string().chars().take(256).collect();
-        self.handle.shared.lock().unwrap().view.status = Status::Failed(message);
+        let mut shared = self.handle.shared.lock().unwrap();
+        if !shared.stopped {
+            shared.view.status = Status::Failed(message);
+        }
+    }
+    /// End monitoring while preserving immutable snapshots for existing readers.
+    pub fn stop(&mut self) {
+        self.staged = None;
+        let mut shared = self.handle.shared.lock().unwrap();
+        shared.stopped = true;
+        shared.view.status = Status::Stopped;
     }
     pub fn needs_update(&self) -> bool {
         self.handle.view().status != Status::Validated
     }
     fn prepare(&mut self, state: &Recovery) -> io::Result<Option<(Vec<PathBuf>, Vec<String>)>> {
+        if self.handle.shared.lock().unwrap().stopped {
+            return Err(io::Error::other("query store is stopped"));
+        }
         self.observe(state);
         if state.dirty || !state.inventory.complete {
             return Ok(None);
@@ -295,6 +317,9 @@ impl Store {
             return false;
         }
         let mut shared = self.handle.shared.lock().unwrap();
+        if shared.stopped {
+            return false;
+        }
         if shared.retired.strong_count() > 0 {
             shared.view.status = Status::ReadersPinned;
             return false;
@@ -318,6 +343,11 @@ impl Store {
         shared.view.status = Status::Validated;
         shared.view.reasons.clear();
         true
+    }
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 /// Explicit caller clock makes storm throttling reproducible without sleeps.
