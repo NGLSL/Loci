@@ -1,7 +1,7 @@
 //! Snapshot-owned derived filters. Full normalized paths are cached only for
 //! directories; other entries retain compact trigram and pair filters.
 use super::inventory::{EntryId, Kind};
-use crate::signatures::{trigram_signature, ShortSignature};
+use crate::signatures::{trigram_signature, PairSignature, ShortSignature};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ const SHORT_BLOCK: usize = 64;
 #[derive(Clone)]
 struct Filters {
     grams: [u128; SEGMENT],
-    pairs: [u128; SEGMENT],
+    pairs: [PairSignature; SEGMENT],
     short: [ShortSignature; SEGMENT / SHORT_BLOCK],
     ready: [u64; SEGMENT / 64],
 }
@@ -18,7 +18,7 @@ impl Default for Filters {
     fn default() -> Self {
         Self {
             grams: [0; SEGMENT],
-            pairs: [0; SEGMENT],
+            pairs: [PairSignature::default(); SEGMENT],
             short: std::array::from_fn(|_| ShortSignature::default()),
             ready: [0; SEGMENT / 64],
         }
@@ -140,9 +140,9 @@ impl SearchIndex {
             filter.ready[word] |= bit;
         }
         filter.grams[id as usize % SEGMENT] = trigram_signature(&path);
-        let mut entry_short = ShortSignature::default();
-        entry_short.insert(&path);
-        filter.pairs[id as usize % SEGMENT] = entry_short.pairs;
+        let mut entry_pairs = PairSignature::default();
+        entry_pairs.insert(&path);
+        filter.pairs[id as usize % SEGMENT] = entry_pairs;
         // Union-only block filters remain safe when an entry is renamed/deleted.
         filter.short[id as usize % SEGMENT / SHORT_BLOCK].insert(&path);
         if kind == Kind::Directory {
@@ -174,10 +174,16 @@ impl SearchIndex {
         );
         append_normalized(name, path);
     }
-    pub fn admits(&self, id: EntryId, grams: u128, short: &ShortSignature) -> bool {
+    pub fn admits(
+        &self,
+        id: EntryId,
+        grams: u128,
+        short: &ShortSignature,
+        pairs: &PairSignature,
+    ) -> bool {
         let filter = &self.filters[id as usize / SEGMENT];
         filter.grams[id as usize % SEGMENT] & grams == grams
-            && filter.pairs[id as usize % SEGMENT] & short.pairs == short.pairs
+            && filter.pairs[id as usize % SEGMENT].contains(pairs)
             && filter.short[id as usize % SEGMENT / SHORT_BLOCK].contains(short)
     }
 }

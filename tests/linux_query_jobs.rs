@@ -220,6 +220,40 @@ fn filters_preserve_raw_unicode_ancestor_slash_and_extension_semantics() {
     }
 }
 #[test]
+fn every_ascii_pair_remains_lossless_across_native_names_and_ancestry() {
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = Fixture::new();
+    let directory = fixture.root.join("SHARED_PREFIX");
+    fs::create_dir(&directory).unwrap();
+    for first in b'A'..=b'Z' {
+        for second in b'A'..=b'Z' {
+            let name = format!("{}{}.TXT", char::from(first), char::from(second));
+            fs::write(directory.join(name), b"").unwrap();
+        }
+    }
+    let engine = Engine::open_with_options(&fixture.root, None, EngineOptions::scale()).unwrap();
+    let paths = native_paths(&fixture.root);
+    for first in b'a'..=b'z' {
+        for second in b'a'..=b'z' {
+            let query = format!("{}{}", char::from(first), char::from(second));
+            let expected: Vec<_> = paths
+                .iter()
+                .filter(|path| {
+                    oracle_match(
+                        path.strip_prefix(&fixture.root)
+                            .unwrap()
+                            .as_os_str()
+                            .as_bytes(),
+                        &query,
+                    )
+                })
+                .cloned()
+                .collect();
+            assert_eq!(complete_paths(&engine.query(), &query), expected, "{query}");
+        }
+    }
+}
+#[test]
 fn directory_move_keeps_old_filters_and_invalidates_new_ancestry() {
     let fixture = Fixture::new();
     fs::create_dir_all(fixture.root.join("old/sub")).unwrap();

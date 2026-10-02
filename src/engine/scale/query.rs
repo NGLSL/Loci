@@ -260,7 +260,7 @@ impl Lease {
             ));
         }
         let query = Query::parse(raw);
-        let (grams, short) = query.filter();
+        let (grams, short, pairs) = query.filter();
         let mut offset = cursor.map_or(1, |cursor| cursor.offset);
         let mut paths = Vec::with_capacity(size);
         let mut kinds = Vec::with_capacity(size);
@@ -278,7 +278,7 @@ impl Lease {
             if !self.snapshot.data.entry(id).alive {
                 continue;
             }
-            if self.matches(id, &query, grams, &short, &mut normalized) {
+            if self.matches(id, &query, grams, &short, &pairs, &mut normalized) {
                 paths.push(self.snapshot.data.path(id));
                 kinds.push(self.kind(id));
             }
@@ -316,6 +316,7 @@ impl Lease {
         query: &Query,
         grams: u128,
         short: &crate::signatures::ShortSignature,
+        pairs: &crate::signatures::PairSignature,
         normalized: &mut Vec<u8>,
     ) -> bool {
         let data = &self.snapshot.data;
@@ -323,7 +324,7 @@ impl Lease {
         if query.unfiltered() {
             return entry.alive;
         }
-        if !entry.alive || !data.search.admits(id, grams, short) {
+        if !entry.alive || !data.search.admits(id, grams, short, pairs) {
             return false;
         }
         data.search
@@ -362,7 +363,7 @@ impl Lease {
             ));
         }
         let query = Query::parse(raw);
-        let (grams, short) = query.filter();
+        let (grams, short, pairs) = query.filter();
         let mut normalized = Vec::new();
         for id in 1..self.snapshot.data.slots as u32 {
             if id % 64 == 0 {
@@ -376,7 +377,7 @@ impl Lease {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            if self.matches(id, &query, grams, &short, &mut normalized) {
+            if self.matches(id, &query, grams, &short, &pairs, &mut normalized) {
                 matched(id)?;
             }
         }

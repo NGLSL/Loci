@@ -4,13 +4,36 @@ pub struct ShortSignature {
     pub bytes: [u64; 4],
     pub pairs: u128,
 }
-fn bits(key: u32) -> u128 {
-    // Integer mixing, two positions. No third-party hashing implementation.
+fn mixed(key: u32) -> u64 {
     let mut mixed = u64::from(key).wrapping_mul(0x9e3779b97f4a7c15);
     mixed ^= mixed >> 29;
     mixed = mixed.wrapping_mul(0xd6e8feb86659fd93);
     mixed ^= mixed >> 32;
+    mixed
+}
+fn bits(key: u32) -> u128 {
+    // Keep the legacy serialized signatures' hash positions unchanged.
+    let mixed = mixed(key);
     (1u128 << ((mixed >> 7) & 127)) | (1u128 << ((mixed >> 39) & 127))
+}
+/// Scale-only derived pair filter. Wider positions reduce shared-ancestry
+/// collisions; the exact matcher remains authoritative.
+#[cfg(target_os = "linux")]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct PairSignature([u128; 2]);
+#[cfg(target_os = "linux")]
+impl PairSignature {
+    pub(crate) fn insert(&mut self, data: &[u8]) {
+        for pair in data.windows(2) {
+            let mixed = mixed(u32::from(pair[0]) | u32::from(pair[1]) << 8);
+            for position in [(mixed >> 7) & 255, (mixed >> 39) & 255] {
+                self.0[position as usize / 128] |= 1u128 << (position & 127);
+            }
+        }
+    }
+    pub(crate) fn contains(&self, needle: &Self) -> bool {
+        self.0[0] & needle.0[0] == needle.0[0] && self.0[1] & needle.0[1] == needle.0[1]
+    }
 }
 pub(super) fn trigram_signature(bytes: &[u8]) -> u128 {
     bytes

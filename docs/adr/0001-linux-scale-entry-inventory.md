@@ -127,6 +127,17 @@ establish million-entry, native Windows, filesystem or RSS acceptance.
 
 ## Typed page export and live capacity extension (LOCI-LINUX-001-14)
 
+Million-entry short-query tuning widens only the scale per-entry adjacent-byte
+pair filter to 256 bits. The 128-bit trigram filter and 128-bit pair/byte block
+union remain unchanged. Queries derive the wider filter once; false positives
+still pass through the exact normalized matcher. Legacy serialized control
+signatures retain their original hash positions and format. LOCISCL1 continues
+to store the canonical raw graph and rebuilds derived filters after restoration.
+The additional 16 bytes per physical slot join conservative owner admission;
+actual filter capacities, COW candidates and retained segments are charged by
+their sizes against the existing snapshot/retained limits before allocation.
+No full path cache is added for files.
+
 QueryPage.kinds is optional, positionally aligned with paths. Linux scale normal
 and completed-sort pages collect kind directly from matching immutable entry
 IDs. This avoids the existing linear QueryLease::entry_kind(path) lookup in a

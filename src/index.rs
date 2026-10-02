@@ -331,18 +331,21 @@ impl Query {
         self.tokens.is_empty() && self.ext.is_none()
     }
     #[cfg(target_os = "linux")]
-    pub(crate) fn filter(&self) -> (u128, ShortSignature) {
+    pub(crate) fn filter(&self) -> (u128, ShortSignature, crate::signatures::PairSignature) {
         let mut short = ShortSignature::default();
+        let mut pairs = crate::signatures::PairSignature::default();
         let mut grams = 0;
         for token in &self.tokens {
             short.insert(token.as_bytes());
+            pairs.insert(token.as_bytes());
             grams |= trigram_signature(token.as_bytes());
         }
         if let Some(extension) = &self.ext {
             short.insert(extension.as_bytes());
+            pairs.insert(extension.as_bytes());
             grams |= trigram_signature(extension.as_bytes());
         }
-        (grams, short)
+        (grams, short, pairs)
     }
     /// Already-lowercased UTF-8 runs separated by byte FF; valid queries cannot
     /// contain that separator, so terms cannot bridge invalid filesystem bytes.

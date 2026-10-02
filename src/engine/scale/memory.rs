@@ -67,6 +67,9 @@ pub(crate) fn owner(options: &EngineOptions, native: bool) -> io::Result<Arc<Res
         // accounting hash sets, status/error/path/page scratch, bounded commands.
         Some(160 * 1024 * 1024),
         slots.checked_mul(16),
+        // Additional 128 bits in each scale-only 256-bit pair signature. Actual
+        // candidate/retired filter capacities also join max_retained_bytes above.
+        slots.checked_mul(16),
     ];
     let bytes = bounds
         .into_iter()
