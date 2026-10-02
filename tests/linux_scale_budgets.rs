@@ -124,7 +124,7 @@ fn cli_waits_for_batched_scale_build_before_exporting_all_rows() {
 }
 
 #[test]
-fn deleted_slots_still_count_toward_the_physical_budget() {
+fn deleted_slots_are_reclaimed_before_another_live_entry_exhausts_the_budget() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join("old"), b"").unwrap();
     let mut options = EngineOptions::scale();
@@ -140,8 +140,11 @@ fn deleted_slots_still_count_toward_the_physical_budget() {
     let version = engine.view().version;
     assert!(paths(&engine.query()).is_empty());
     fs::write(fixture.root.join("new"), b"").unwrap();
-    fail(&mut engine);
-    assert_eq!(engine.view().version, version);
-    assert!(paths(&engine.query()).is_empty());
+    while engine.view().version <= version || engine.view().status != Status::Validated {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert_eq!(paths(&engine.query()), [fixture.root.join("new")]);
+    assert_eq!(engine.metrics().full_scans, 1);
     assert_eq!(engine.view().resources.inventory_slots, 2);
 }

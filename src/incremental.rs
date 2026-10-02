@@ -64,6 +64,13 @@ pub struct Metrics {
     pub changed_paths: usize,
     pub audited_directories: usize,
     pub correction_attempts: usize,
+    pub compaction_attempts: usize,
+    pub compactions: usize,
+    pub compaction_restarts: usize,
+    pub compacted_entries: usize,
+    pub reclaimed_slots: usize,
+    pub reclaimed_name_bytes: usize,
+    pub scope_checks: usize,
     /// Scale inventory work in the last local transaction, excluding derived
     /// path/query cache and native watch topology work.
     pub last_touched_entries: usize,

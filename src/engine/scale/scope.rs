@@ -4,9 +4,14 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 const MAX_MOUNTINFO: u64 = 16 * 1024 * 1024;
+pub(super) fn input_identity() -> io::Result<(u64, u64)> {
+    let metadata = fs::metadata("/proc/self/mountinfo")?;
+    Ok((metadata.dev(), metadata.ino()))
+}
 #[derive(PartialEq, Eq)]
 pub(super) struct Scope {
     pub root_mount: u64,
@@ -35,8 +40,8 @@ impl Scope {
         let mut nested = BTreeMap::new();
         let mut selected_found = false;
         for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
-            let fields: Vec<_> = line.split(|byte| *byte == b' ').collect();
-            if fields.len() < 10 || !fields.iter().any(|field| *field == b"-") {
+            let fields: Vec<_> = line.split(|byte| *byte == b' ').take(6).collect();
+            if fields.len() < 6 || !line.windows(3).any(|field| field == b" - ") {
                 return Err(io::Error::other("unrecognized mount scope table record"));
             }
             let id = std::str::from_utf8(fields[0])

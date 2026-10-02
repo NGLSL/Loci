@@ -365,6 +365,9 @@ fn coverage(handle: &QueryHandle) {
             resources.process_inotify_fds, resources.process_fd_limit, resources.queued_events,
             resources.queue_limit, resources.queued_event_bytes, resources.queue_byte_limit, resources.event_buffer_bytes);
         eprintln!("engine,inventory_slots={}/{},inventory_name_bytes={}/{},snapshot_bytes={}/{},retained_snapshot_bytes={}/{}", resources.inventory_slots, resources.slot_limit, resources.inventory_name_bytes, resources.name_byte_limit, resources.snapshot_bytes, resources.snapshot_byte_limit, resources.retained_snapshot_bytes, resources.retained_byte_limit);
+        eprintln!("engine,inventory_epoch={},compaction_in_progress={},memory_reserved_bytes={},process_memory_reserved_bytes={},process_memory_limit={},memory_measurement=conservative_capacity,kernel_slab_bytes=unavailable",
+            resources.inventory_epoch, resources.compaction_in_progress, resources.memory_reserved_bytes,
+            resources.process_memory_reserved_bytes, resources.process_memory_limit);
     }
     for gap in &view.coverage_gaps {
         eprintln!(
