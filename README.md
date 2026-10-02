@@ -8,6 +8,8 @@ Loci 是独立的 Rust 文件名/路径搜索实验，包含紧凑路径记录�
 
 新引擎代码提交 `657412e` 已在同一次 [Rust 1.99 跨平台 CI](https://github.com/NGLSL/Loci/actions/runs/37045846370) 验证：Linux/ext4 debug、release 各119 passed，Windows/NTFS 各96 passed，均0 failed。Linux 覆盖实际新 Engine 的跨进程保存与离线变化恢复、递归监听、真实内核溢出校正和 watch/fd 释放；此记录与旧原型验收分开。
 
+Linux scale 开发提交 `57cca5b` 在真实百万非根条目上通过完整字节路径 oracle：生产 20 ms owner 的实际进程静默 600.09 秒，CPU 为单逻辑核的 0.282%，RSS 168.39 MiB，HWM 183.83 MiB，20,001 个实际 watches；停止后 watches 为零。另在真实 100k 条目上各测量 200 次新增、删除、重命名，p95 均不超过 22.6 ms，压缩前后全路径一致且没有额外整根扫描。测量 SHA、进程、容量预算与 RSS 的区别及原始记录见 [压缩与静默验证](docs/LINUX-SCALE-COMPACTION-VALIDATION.md)。此处使用原生 inotify/overlayfs；最终 SSD/ext4/Btrfs、百万变更与长跑验收仍待完成。
+
 查询为大小写不敏感的 AND 子串，可使用 `ext:rs` 精确扩展名条件。first50 返回记录顺序前50项，complete 计算完整匹配数并保留前50项；没有相关性排序、全文、拼音或 mmap。
 
 实时原型最多4096项、总UTF-8输入1 MiB；单条路径4096 bytes、查询512 bytes。非UTF-8候选明确失败，旧结果保留并标待校正。最多8查询租约、两代索引；Loci 管理的会话共享128 watches /8 sessions预算。成功尝试冷却250ms，失败退避至多2秒。独立CLI的100k/1M合成记录基准不受实时4096项限制。
