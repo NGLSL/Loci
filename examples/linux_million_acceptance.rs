@@ -146,7 +146,7 @@ fn main() {
         println!(
             "Opt-in native Linux acceptance; Engine runs in a separate production-owner PID.\n\
 linux_million_acceptance --controller|--worker --root ABS --database ABS --output ABS --sha 40HEX\n\
-  [--queries UTF8_LINES] [--phase all|smoke|correctness|queries|events|restart|idle|fixture]\n\
+  [--queries UTF8_LINES] [--phase all|smoke|correctness|queries|events|restart|idle|fixture|directory-heavy|stages]\n\
   [--repetitions 200] [--idle-seconds 600] [--output-budget-mib 4096] [--smoke]\n\
 Reduced samples/windows require --smoke and cannot establish acceptance."
         );
