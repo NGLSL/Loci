@@ -22,7 +22,7 @@ cargo +1.99.0 test --offline --locked --test linux_engine_regressions -- --test-
 cargo +1.99.0 test --release --offline --locked --test linux_engine_regressions -- --test-threads=1
 ```
 
-On the affected base, each test command reports **0 passed, 2 failed** and exits
+With the original `104b218` test file on the affected base, each test command reports **0 passed, 2 failed** and exits
 101. The assertions express correct behavior; they are not ignored or inverted
 to make known defects pass. Other platforms exclude this Linux-specific file.
 Only ordinary scoped fixture operations and actual native notifications are used;
@@ -100,5 +100,30 @@ There are no new performance, power-loss, other-filesystem, or long-run claims.
   between-call relocation is checked. Windows pathname saving is unchanged and
   does not inherit the Linux directory-relative guarantee.
 
-Final validation results are recorded after testing the repair code, not inferred
-from the existing 119-pass base or the original validation branch.
+## Repair validation
+
+The exact repair code commit `0c4fb7d439bd3b2d473d36804251ef4ea83b6bb0` was checked
+on 2026-10-02: x86_64 Linux, kernel 6.18.44, cloud workspace overlayfs, Rust
+1.99.0 (`b940084d7`). Debug and release ran serial test harnesses with wall
+budgets of 180 and 240 seconds respectively; neither budget was exceeded.
+
+| Check | Result |
+| --- | --- |
+| fmt / Linux all-targets / Linux linux-ffi-check | Passed |
+| Linux debug full suite | 124 passed, 0 failed, 6 ignored |
+| Linux release full suite | 124 passed, 0 failed, 6 ignored |
+| Public Engine regression file | 3 passed in both suites; original two first failed before repair |
+| Database parent fd lifecycle | Stop/drop returned actual descriptor count to baseline |
+| Native new Engine kernel overflow | Actual IN_Q_OVERFLOW observed and reconciled in both suites |
+| Windows GNU all-targets cross-check | Passed, including a separate linux-ffi-check pass; type checks only |
+| Two-axis final repair review | Standards 0 actionable findings; Spec 0 actionable findings |
+
+The six ignored cases are the existing four explicit performance measurements and
+two old prototype kernel-overflow tests; they are not counted as passes. The new
+Engine overflow regression ran normally. Windows cross-checks emit the existing
+test-injection/FFI-check dead-code warnings; this is not Windows native execution.
+
+The initial Spec-axis review identified the successful-save assertion gap; it was
+fixed before the final two-axis review. No new throughput or scale claim is made.
+Windows native, ext4/Btrfs repair execution, long runs and power-loss durability
+remain unverified for this repair. The branch has not been merged into main.
