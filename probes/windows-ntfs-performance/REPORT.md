@@ -7,6 +7,7 @@
 - 分支：`codex/windows-ntfs-performance`。
 - 工作树：`D:\Project\Loci\.scratch\worktrees\windows-ntfs-performance`。
 - 分叉基线：`0589af74a59480eefeb3d2801e0000bcd44cdc3f`；阶段 B 原生正确性源码：`e9684d5988b1b963c2091426e998b7f35eeb18b8`。
+- 本轮实测源码提交：`6df213a54628f65c1d351796cec1271366afa8af`，runner 记录 `source_dirty=False`；release exe SHA-256 `0870CB904255F1E3263761F91C4440E1E4BC2B02F3F3560FA1479B9D36F90CFF`。后续报告提交不改变实测源码。
 - main 核对为 `e204917644fb771e5c92e74d130a34127ca8f74e`；用户的 main `.gitignore` 修改和未跟踪任务文件保留。阶段 B 工作树保持干净。
 - 新 Cargo 项目 `loci-ntfs-performance`，Rust 1.99.0、edition 2021、std-only、独立 workspace／lock／target。只读复用阶段 A 的 checkpoint、model、win 模块；阶段 A／B 源码、根 Cargo 和共享核心均未改动。
 - `.scratch/windows-ntfs-performance/spec.md` 被跟踪，仅本地 `target/`、`run/` 被忽略。没有 main 合并、push、PR、release 或共享 ADR 接受操作。
@@ -37,7 +38,9 @@ D: 文件系统 NTFS，legacy serial `0xf228c46d`，volume GUID `\\?\Volume{3b1b
 
 证据目录（本地保留、不提交用户文件名）：
 
-`.scratch/windows-ntfs-performance/run/native-20261002T221755Z-91236e5813ed4d68a2e5dc6888904e21/`
+`.scratch/windows-ntfs-performance/run/native-20261002T222309Z-efe2bcfb5449461e8e1f730aae08e523/`
+
+提交前预验证的 `native-20261002T221755Z-91236e5813ed4d68a2e5dc6888904e21/` 也保留；下表使用提交后、源码干净且记录了 exe hash 的第二次运行。
 
 runner 使用 release、offline、locked，创建新的真实工程夹具：1,000／10,000 普通数据文件加场景项；实际搜索目录项 1,045／10,125。每次扫描核对完整 EntryId → attributes map，以及独立目录遍历的完整 raw UTF-16 路径集合；不是 count／checksum／前 50 项替代验收。
 
@@ -45,19 +48,19 @@ runner 使用 release、offline、locked，创建新的真实工程夹具：1,00
 
 | 实际目录项 | 扫描 baseline p50 | 批量扫描 p50 | 比率 | 索引一次构建 |
 |---:|---:|---:|---:|---:|
-| 1,045 | 79.19 ms | 13.38 ms | 5.92× | 3.262 ms |
-| 10,125 | 609.20 ms | 125.15 ms | 4.87× | 18.490 ms |
+| 1,045 | 78.90 ms | 13.17 ms | 5.99× | 2.376 ms |
+| 10,125 | 665.63 ms | 128.85 ms | 5.17× | 19.556 ms |
 
 逐项身份打开：1,045／10,125 → 0；目录批次：31／111。目录打开／身份校验成本包含在扫描时间内。
 
 | 10k 查询（limit 50） | baseline p50 | 常驻索引 p50 | 常驻索引 p95 | 比率 |
 |---|---:|---:|---:|---:|
-| 空查询，全部 10,125 匹配 | 5.743 ms | 1.0 µs | 2.4 µs | 5,743× |
-| 短词，10,001 匹配 | 5.913 ms | 331.7 µs | 361.1 µs | 17.83× |
-| 完整路径片段，1 匹配 | 5.596 ms | 50.7 µs | 77.1 µs | 110.37× |
-| literal／Unicode，1 匹配 | 5.832 ms | 281.2 µs | 310.5 µs | 20.74× |
-| 不存在的词 | 5.590 ms | 20.5 µs | 43.1 µs | 272.66× |
-| 原始 UTF-16 D800，1 匹配 | 5.955 ms | 414.4 µs | 507.1 µs | 14.37× |
+| 空查询，全部 10,125 匹配 | 6.263 ms | 1.2 µs | 4.0 µs | 5,219.5× |
+| 短词，10,001 匹配 | 6.633 ms | 373.4 µs | 442.8 µs | 17.76× |
+| 完整路径片段，1 匹配 | 6.171 ms | 52.0 µs | 139.4 µs | 118.67× |
+| literal／Unicode，1 匹配 | 6.402 ms | 284.1 µs | 345.2 µs | 22.53× |
+| 不存在的词 | 5.904 ms | 19.8 µs | 83.6 µs | 298.18× |
+| 原始 UTF-16 D800，1 匹配 | 6.140 ms | 473.1 µs | 587.9 µs | 12.98× |
 
 空查询收益来自直接读取数量，并不能推广到任意搜索。普通 literal 查询仍线性检查常驻路径，不是百万级倒排／trigram／SIMD 索引。本轮未运行或测量 Everything，不能据此声称相当于或超过 Everything。
 
@@ -67,12 +70,12 @@ runner 使用 release、offline、locked，创建新的真实工程夹具：1,00
 
 | 目录项 | 路径 UTF-16 payload | 索引构建 WS 增量 | private commit 增量 | 索引句柄增量 | 整个 bench peak WS |
 |---:|---:|---:|---:|---:|---:|
-| 1,045 | 52,368 B | 1.598 MiB | 1.543 MiB | 0 | 9.012 MiB |
-| 10,125 | 503,968 B | 16.906 MiB | 17.047 MiB | 0 | 35.324 MiB |
+| 1,045 | 52,368 B | 1.734 MiB | 1.563 MiB | 0 | 8.934 MiB |
+| 10,125 | 503,968 B | 17.160 MiB | 16.555 MiB | 0 | 35.145 MiB |
 
 bench 完整进程句柄均为 89 → 89，包含创建夹具、路径／身份 oracle、两份库存与重复采样；不能拿它的峰值当产品引擎占用。常驻索引保留多张 BTreeMap 和重复 EntryId 名称，当前内存布局不适合直接外推百万规模。下一阶段先测净活跃堆并压缩／intern object、entry、name、parent 数据，而不是只放大上限。
 
-整条 bench 命令分别耗时 757 ms／7,617 ms；采样部分 442 ms／3,728 ms。这些包含多个对照样本和校验，均不是建库时间。真实 Backend 建库、同步、保存、重开恢复耗时等待新原生 lane；旧阶段 B 的 12.632 秒整体验收包含夹具与 oracle，不能作为新原型性能对照。
+整条 bench 命令分别耗时 786 ms／8,511 ms；采样部分 447 ms／3,925 ms。这些包含多个对照样本和校验，均不是建库时间。真实 Backend 建库、同步、保存、重开恢复耗时等待新原生 lane；旧阶段 B 的 12.632 秒整体验收包含夹具与 oracle，不能作为新原型性能对照。
 
 ## 正确性与未验证项
 

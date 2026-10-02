@@ -29,3 +29,5 @@ Blocked by: None
 2026-10-03：用户要求按 Everything 性能方向安排实现；基线 `0589af74a59480eefeb3d2801e0000bcd44cdc3f`，原生正确性源码基线 `e9684d5988b1b963c2091426e998b7f35eeb18b8`。平台私有优化不等待共享 ADR 冻结，但不自行装配或接受 ADR。
 
 2026-10-03：release 40／40、真实 1k／10k 普通权限性能对照通过，10k 批量扫描 609.20 → 125.15 ms，短词查询 5.913 → 0.332 ms。当前索引私有提交增量约 17.047 MiB，不能直接放大为百万产品。管理员 USN／跨进程恢复和 opt-in MFT 仍待本原型独立验证。详见 `probes/windows-ntfs-performance/REPORT.md`。
+
+2026-10-03：源码 `6df213a54628f65c1d351796cec1271366afa8af` 提交后在干净工作树复验通过，10k 批量扫描 665.63 → 128.85 ms，短词查询 6.633 → 0.373 ms，private commit 增量 16.555 MiB。runner 已记录 source commit／dirty 和 release exe hash；已单独请求新原型一次 UAC 授权，未收到前不提权。
