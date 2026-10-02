@@ -55,6 +55,7 @@ pub(super) fn compaction(worker: &mut Worker, options: &Options, log: &mut Log) 
             ("before", before),
             ("after", after),
             ("waited_for_publication", b(true)),
+            ("resources", process::sample(worker.child.id())?),
         ]),
     )?;
     correctness(worker, options, "compaction", log)?;
@@ -70,6 +71,7 @@ pub(super) fn corrections(worker: &mut Worker, options: &Options, log: &mut Log)
             "full-correction",
             Json::object([
                 ("trial", n(trial as u64)),
+                ("resources", process::sample(worker.child.id())?),
                 ("elapsed_ns", n(start.elapsed().as_nanos())),
                 ("before", before),
                 ("after", after),
