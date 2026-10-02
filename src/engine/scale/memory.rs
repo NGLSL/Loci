@@ -108,7 +108,10 @@ pub(crate) fn owner(options: &EngineOptions, native: bool) -> io::Result<Arc<Res
         Some(options.scale_budgets.max_retained_bytes),
         slots.checked_mul(32),
         entries.checked_mul(384),
-        dirs.checked_mul(512),
+        // Two writer adjacency maps, including geometric bucket capacity and
+        // the inline64 child IDs; large child-vector overflow also joins the
+        // per-entry writer bound above.
+        dirs.checked_mul(2048),
         dirs.checked_mul(4096 + 128),
         if native {
             options.watch_limit.checked_mul(3 * (4096 + 256))

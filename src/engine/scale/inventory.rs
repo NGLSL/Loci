@@ -8,6 +8,57 @@ use std::sync::Arc;
 
 const BLOCK: usize = 1024;
 pub(super) type EntryId = u32;
+// Most scan directories have small child lists. Keep their IDs in the writer
+// hash table rather than separate persistent allocator chunks that pin free
+// pages between maintenance epochs. Large directories retain a Vec fallback.
+struct Children {
+    inline: [EntryId; 64],
+    length: usize,
+    overflow: Vec<EntryId>,
+}
+impl Default for Children {
+    fn default() -> Self {
+        Self {
+            inline: [0; 64],
+            length: 0,
+            overflow: Vec::new(),
+        }
+    }
+}
+impl std::ops::Deref for Children {
+    type Target = [EntryId];
+    fn deref(&self) -> &[EntryId] {
+        if self.overflow.capacity() == 0 {
+            &self.inline[..self.length]
+        } else {
+            &self.overflow
+        }
+    }
+}
+impl Children {
+    fn push(&mut self, id: EntryId) {
+        if self.overflow.capacity() != 0 {
+            self.overflow.push(id);
+        } else if self.length < self.inline.len() {
+            self.inline[self.length] = id;
+            self.length += 1;
+        } else {
+            self.overflow.reserve_exact(self.inline.len() * 2);
+            self.overflow.extend_from_slice(&self.inline);
+            self.overflow.push(id);
+        }
+    }
+    fn swap_remove(&mut self, index: usize) {
+        if self.overflow.capacity() != 0 {
+            self.overflow.swap_remove(index);
+        } else {
+            assert!(index < self.length);
+            self.length -= 1;
+            self.inline[index] = self.inline[self.length];
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
     File,
@@ -108,7 +159,7 @@ pub(super) struct Inventory {
     pub copied_segments: usize,
     pub name_bytes: usize,
     pub live_name_bytes: usize,
-    children: HashMap<EntryId, Vec<EntryId>>,
+    children: HashMap<EntryId, Children>,
     positions: Vec<usize>,
     budgets: ScaleBudgets,
     allocation_credit: usize,
@@ -125,8 +176,11 @@ impl Drop for Inventory {
             .positions
             .capacity()
             .saturating_mul(std::mem::size_of::<usize>());
-        self.reclaim
-            .arm(lookup_bytes.saturating_add(position_bytes));
+        self.reclaim.arm(
+            lookup_bytes.saturating_add(position_bytes).saturating_add(
+                self.children.capacity() * std::mem::size_of::<(EntryId, Children)>(),
+            ),
+        );
     }
 }
 fn hash(bytes: &[u8]) -> u64 {
