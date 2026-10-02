@@ -19,6 +19,44 @@ use std::time::{Duration, Instant};
 const MAX_EXPORT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_JOBS: usize = 12;
 const MAX_HELD_LEASES: usize = 2;
+// Diagnostic only: glibc chunk accounting is neither process RSS nor a census
+// of live Rust payload. The production library acquires no mallinfo2 dependency.
+fn allocator_snapshot() -> Json {
+    #[cfg(target_env = "gnu")]
+    {
+        #[repr(C)]
+        struct MallInfo2 {
+            arena: usize,
+            ordblks: usize,
+            smblks: usize,
+            hblks: usize,
+            hblkhd: usize,
+            usmblks: usize,
+            fsmblks: usize,
+            uordblks: usize,
+            fordblks: usize,
+            keepcost: usize,
+        }
+        unsafe extern "C" {
+            fn mallinfo2() -> MallInfo2;
+        }
+        // This opt-in GNU diagnostic requires glibc 2.33 or later.
+        let stats = unsafe { mallinfo2() };
+        return Json::object([
+            ("glibc_arena_bytes", n(stats.arena)),
+            ("glibc_in_use_arena_bytes", n(stats.uordblks)),
+            ("glibc_mmap_bytes", n(stats.hblkhd)),
+            ("glibc_free_arena_bytes", n(stats.fordblks)),
+            ("glibc_releasable_top_bytes", n(stats.keepcost)),
+            (
+                "accounting",
+                s("glibc chunks; not RSS or live Rust payload"),
+            ),
+        ]);
+    }
+    #[cfg(not(target_env = "gnu"))]
+    Json::Null
+}
 enum Job {
     Monitor {
         request: MonitorRequest,
@@ -298,6 +336,7 @@ fn status(owner: &MonitorOwner) -> Json {
     let r = v.resources;
     let m = owner.metrics();
     Json::object([
+        ("process_allocator", allocator_snapshot()),
         ("status", s(format!("{:?}", v.status))),
         ("version", n(v.version)),
         ("leases", n(v.leases)),
