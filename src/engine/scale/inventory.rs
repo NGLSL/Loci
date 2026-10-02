@@ -54,6 +54,19 @@ pub(super) struct Data {
     pub slots: usize,
     pub epoch: u64,
     allocated: usize,
+    // Last: request only after raw/search fields finish freeing their buffers.
+    reclaim: super::memory::ReclaimOnDrop,
+}
+impl Drop for Data {
+    fn drop(&mut self) {
+        let unique_raw_bytes = self
+            .segments
+            .iter()
+            .filter(|segment| Arc::strong_count(segment) == 1)
+            .map(|segment| segment.allocated_bytes())
+            .fold(0usize, usize::saturating_add);
+        self.reclaim.arm(unique_raw_bytes);
+    }
 }
 impl Data {
     pub fn allocated_bytes(&self) -> usize {
@@ -103,6 +116,22 @@ pub(super) struct Inventory {
     positions: Vec<usize>,
     budgets: ScaleBudgets,
     allocation_credit: usize,
+    // Last: all unique writer lookup/graph allocations have dropped first.
+    reclaim: super::memory::ReclaimOnDrop,
+}
+impl Drop for Inventory {
+    fn drop(&mut self) {
+        let lookup_bytes = self
+            .lookup
+            .capacity()
+            .saturating_mul(std::mem::size_of::<((EntryId, u64), EntryId)>());
+        let position_bytes = self
+            .positions
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>());
+        self.reclaim
+            .arm(lookup_bytes.saturating_add(position_bytes));
+    }
 }
 fn hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, byte| {
@@ -118,6 +147,7 @@ impl Inventory {
                 epoch,
                 search: Default::default(),
                 allocated: std::mem::size_of::<Data>(),
+                reclaim: Default::default(),
             },
             lookup: HashMap::new(),
             collisions: HashMap::new(),
@@ -133,6 +163,7 @@ impl Inventory {
             positions: vec![],
             budgets,
             allocation_credit: budgets.max_retained_bytes,
+            reclaim: Default::default(),
         }
     }
     pub fn validate_restored_lookup(&self) -> io::Result<()> {

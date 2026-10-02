@@ -48,7 +48,13 @@ fn settle_resources(
 ) -> io::Result<()> {
     let before = worker.status()?;
     let first = process::sample(worker.child.id())?;
-    let requested = if options.smoke { 1 } else { 5 };
+    let requested = if options.smoke {
+        1
+    } else if stage == "correction-2" {
+        10
+    } else {
+        5
+    };
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(requested) {
         thread::sleep(Duration::from_millis(100));
@@ -68,6 +74,21 @@ fn settle_resources(
         Json::object([
             ("stage", s(stage)),
             ("actual_ns", n(started.elapsed().as_nanos())),
+            ("requested_seconds", n(requested)),
+            (
+                "cpu_percent_one_core",
+                Json::Number(
+                    (100.0
+                        * last
+                            .get("cpu_ticks")?
+                            .number()?
+                            .saturating_sub(first.get("cpu_ticks")?.number()?)
+                            as f64
+                        / last.get("clock_ticks_per_second")?.number()? as f64
+                        / started.elapsed().as_secs_f64())
+                    .to_string(),
+                ),
+            ),
             ("before", before),
             ("after", after),
             ("first_resources", first),

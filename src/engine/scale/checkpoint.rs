@@ -11,6 +11,8 @@ const MAGIC: &[u8; 8] = b"LOCISCL1";
 pub(crate) struct Encoded {
     bytes: Vec<u8>,
     _memory: super::memory::Reservation,
+    // Last: the encoded Vec has actually freed its admitted capacity first.
+    _reclaim: super::memory::ReclaimOnDrop,
 }
 impl std::ops::Deref for Encoded {
     type Target = [u8];
@@ -120,6 +122,7 @@ pub(super) fn encode(
     let sum = checksum(&bytes);
     bytes.extend_from_slice(&sum.to_le_bytes());
     Ok(Encoded {
+        _reclaim: super::memory::ReclaimOnDrop::new(bytes.capacity()),
         bytes,
         _memory: memory,
     })

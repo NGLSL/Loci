@@ -5,6 +5,64 @@ use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+const LARGE_RELEASE: usize = 16 * 1024 * 1024;
+#[cfg(target_env = "gnu")]
+static RECLAIM_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_env = "gnu")]
+static RECLAIM_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare this field last, so its destructor runs after the owned allocations
+/// it describes. Arm only for allocations actually owned by the dropping value.
+#[derive(Clone, Default)]
+pub(super) struct ReclaimOnDrop {
+    released_bytes: usize,
+}
+impl ReclaimOnDrop {
+    pub(super) fn new(released_bytes: usize) -> Self {
+        Self { released_bytes }
+    }
+    pub(super) fn arm(&mut self, released_bytes: usize) {
+        self.released_bytes = released_bytes;
+    }
+}
+impl Drop for ReclaimOnDrop {
+    fn drop(&mut self) {
+        if self.released_bytes >= LARGE_RELEASE {
+            #[cfg(target_env = "gnu")]
+            RECLAIM_REQUESTED.store(true, Ordering::Release);
+        }
+    }
+}
+/// Called outside shared snapshot locks. Quiet polls only check an atomic;
+/// allocator maintenance occurs once after a real large allocation release.
+pub(super) fn reclaim_released() -> bool {
+    #[cfg(target_env = "gnu")]
+    {
+        if !RECLAIM_REQUESTED.load(Ordering::Acquire)
+            || RECLAIM_RUNNING
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            return false;
+        }
+        let requested = RECLAIM_REQUESTED.swap(false, Ordering::AcqRel);
+        if requested {
+            unsafe extern "C" {
+                fn malloc_trim(pad: usize) -> std::ffi::c_int;
+            }
+            // GNU libc returns only unused allocator pages. It neither moves
+            // nor invalidates live buffers, including immutable leased data.
+            unsafe {
+                malloc_trim(0);
+            }
+        }
+        RECLAIM_RUNNING.store(false, Ordering::Release);
+        return requested;
+    }
+    #[cfg(not(target_env = "gnu"))]
+    false
+}
+
 pub const PROCESS_MEMORY_LIMIT: usize = 4 * 1024 * 1024 * 1024;
 static RESERVED: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn reserved_bytes() -> usize {

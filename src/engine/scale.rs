@@ -448,6 +448,7 @@ impl Runtime {
         self.store.status(Status::Stopped);
         let result = self.source.stop();
         self.update_resources();
+        memory::reclaim_released();
         result
     }
     fn excluded(&self, relative: &Path) -> bool {
@@ -528,6 +529,13 @@ impl Runtime {
         Ok(())
     }
     pub fn poll_with_cancel(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
+        let result = self.poll_work(cancel);
+        if memory::reclaim_released() {
+            self.update_resources();
+        }
+        result
+    }
+    fn poll_work(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
         if self.failures >= self.options.recovery.retry_limit
             || self.retry_after.is_some_and(|after| Instant::now() < after)
         {
