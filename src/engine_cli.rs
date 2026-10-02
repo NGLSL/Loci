@@ -3,11 +3,19 @@ use loci_experiment::engine::{
     Engine, EngineMode, EngineOptions, QueryHandle, Status, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
 use std::ffi::OsString;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Write};
+#[cfg(not(target_os = "linux"))]
+use std::io::{BufRead, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+#[cfg(not(target_os = "linux"))]
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+mod watch;
+#[cfg(target_os = "linux")]
+use watch::watch;
 
 const HELP: &str = "Real directory commands (public Engine, not synthetic data):
   engine build ROOT DATABASE
@@ -63,15 +71,24 @@ fn run(args: &[OsString]) -> io::Result<()> {
     let (nul, all, fresh, page_size, options) = query_options(&args[base..], action)?;
     let root = Path::new(&args[1]);
     let database = Path::new(&args[2]);
+    #[cfg(target_os = "linux")]
+    let _watch_signals = if action == "watch" {
+        Some(watch::Signals::install()?)
+    } else {
+        None
+    };
     let mut startup = StartupTiming::new();
     let mut engine = Engine::open_with_options(root, Some(database), options.clone())?;
+    if action == "watch" {
+        if engine.view().version > 0 {
+            startup.searchable(&engine);
+        }
+        return watch(engine, root, database, nul, options, startup);
+    }
     wait_for_snapshot(&mut engine, false, &mut startup)?;
     startup.searchable(&engine);
     if fresh || all || action == "build" || action == "rebuild" {
         wait_for_snapshot(&mut engine, true, &mut startup)?;
-    }
-    if action == "watch" {
-        return watch(engine, root, database, nul, options, startup);
     }
     let raw = if action == "query" {
         args[3].to_str().ok_or_else(|| {
@@ -248,11 +265,14 @@ impl StartupTiming {
         }
     }
     fn observe(&mut self, engine: &Engine) {
-        if !self.validated && engine.view().status == Status::Validated {
+        self.observe_progress(engine.view().status, engine.metrics().scanned_entries);
+    }
+    fn observe_progress(&mut self, state: Status, scanned_entries: usize) {
+        if !self.validated && state == Status::Validated {
             eprintln!(
                 "engine,phase=validated,full_correction_ms={},scanned_entries={}",
                 self.started.elapsed().as_millis(),
-                engine.metrics().scanned_entries
+                scanned_entries
             );
             self.validated = true;
         } else if !self.validated
@@ -261,8 +281,7 @@ impl StartupTiming {
         {
             eprintln!(
                 "engine,phase=correcting,scanned_entries={},state={:?}",
-                engine.metrics().scanned_entries,
-                engine.view().status
+                scanned_entries, state
             );
             self.last_progress = Instant::now();
         }
@@ -431,6 +450,7 @@ fn write_paths(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn watch(
     mut engine: Engine,
     root: &Path,

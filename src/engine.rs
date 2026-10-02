@@ -12,6 +12,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub use crate::live::Status;
+mod owner;
+pub use owner::{
+    MonitorOwner, MonitorRequest, MONITOR_COMMAND_CAPACITY, MONITOR_OWNER_CAPACITY,
+    MONITOR_POLL_INTERVAL,
+};
 
 #[cfg(target_os = "linux")]
 mod scale;
@@ -1011,9 +1016,7 @@ impl Engine {
         self.pending.clear();
         self.store.stop();
         #[cfg(target_os = "linux")]
-        if let Some(scale) = &mut self.scale {
-            scale.stop()?;
-        }
+        let scale_result = self.scale.as_mut().map_or(Ok(()), |scale| scale.stop());
         let result = self
             .source
             .take()
@@ -1023,6 +1026,9 @@ impl Engine {
         self.database_parent.take();
         #[cfg(target_os = "linux")]
         self.writer_lock.take();
+        #[cfg(target_os = "linux")]
+        return scale_result.and(result);
+        #[cfg(not(target_os = "linux"))]
         result
     }
 }

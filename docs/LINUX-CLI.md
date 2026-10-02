@@ -13,12 +13,18 @@ cargo run --release -- engine watch /path/to/data /path/outside/data/index.loci 
 ```
 
 `watch` continuously polls the native Engine while accepting newline-delimited
-commands on stdin: `query QUERY`, `status`, `save`, `rebuild`, and `stop`.
-An empty `query` searches all entries. Type `stop`, or close stdin, to save and
-release monitoring. It installs no system service. A bounded eight-command queue
-and 4096-byte command limit prevent terminal input from growing without a bound.
-`rebuild` requests fresh correction from the scale Engine, or reopens the bounded
-Engine, and reconciles the complete selected root. A damaged or incompatible database
+commands on stdin: `query QUERY`, `export QUERY`, `status`, `save`, `rebuild`,
+`cancel`, and `stop`.
+An empty `query` searches all entries. Type `stop`, close stdin, or send SIGINT/
+SIGTERM on Linux to attempt saving a validated cut and release monitoring. It
+installs no system service. One background owner polls independently of one
+foreground query/export task, including when a stdout pipe is full. A second
+foreground task returns an explicit busy error; `cancel` joins the current task
+and requests scale correction cancellation. Linux input and output are pollable
+and cancellation-aware, with no detached stdin reader. Eight bounded owner
+commands and a 4096-byte command limit prevent queued input from growing without
+a bound. `rebuild` requests fresh correction while preserving immutable queries
+in either Engine mode and reconciles the complete selected root. A damaged or incompatible database
 fails explicitly and remains available for recovery.
 
 Query terms use the existing case-insensitive AND substring and exact extension
@@ -30,7 +36,9 @@ count. Default queries return at most fifty paths; `--all` enumerates the comple
 snapshot through bounded pages. Snapshot completeness and validation describe different things.
 `Validated` describes the last reliable observed filesystem cutoff, while
 `Pending`, `ReadersPinned`, or `Failed` can retain older searchable results.
-They never claim those results are current. `Stopped` confirms release of ownership.
+They never claim those results are current. Shutdown diagnostics distinguish
+`state=Stopped` from `joined=true`; only the joined result confirms worker and
+resource release.
 
 The existing v0.1 limits still apply: 4096 entries, 128 directories and 1 MiB of
 UTF-8 paths. Unsupported raw-byte filenames and implicit experimental exclusions
@@ -149,3 +157,54 @@ partial coverage produces an inspectable Failed Engine with no published snapsho
 Retries wait 250 ms and stop after four failures; restoration before exhaustion can
 recover, while an explicit reopening/rebuild restarts an exhausted attempt. No system
 watch limits are changed. Native source replacement and stop/drop release resources.
+
+## Background ownership through the public Engine
+
+`Engine::spawn(self) -> io::Result<MonitorOwner>` moves the existing writer onto
+one background thread. `owner.query()` returns the existing `QueryHandle`;
+retaining it or a lease does not retain monitoring ownership. `owner.view()`
+returns the public snapshot/coverage/resource state, and `owner.metrics()` copies
+only the small public counters, including `scanned_entries`, `audited_directories`
+and `correction_attempts`. The ordinary production cadence is the public
+`MONITOR_POLL_INTERVAL` (20 ms), including scan batches and event delivery; it is
+not a benchmark-only fast-poll path. The interval is a scheduling target: an OS
+operation or bounded batch can take longer.
+
+At most `MONITOR_OWNER_CAPACITY` (eight) background owners exist per process,
+including owners using external event sources. Each has
+`MONITOR_COMMAND_CAPACITY` (eight) queued fixed-size save/rebuild commands and
+exactly one writer thread. Native descriptor/watch limits and immutable lease/
+retention limits remain independently enforced. CLI watch adds at most one
+foreground query thread and one page of output at a time. Slow readers can pin
+an old snapshot and report `ReadersPinned`; they cannot create unlimited retained
+snapshots or tasks.
+
+`owner.save()` and `owner.request_rebuild()` admit commands without blocking and
+return `MonitorRequest`. A full queue returns `WouldBlock`. `request.wait(timeout)`
+or `request.try_complete()` reports that operation's result; a timed-out wait
+leaves the operation admitted and can be retried on the same request. Rebuild
+completion means correction was scheduled, not that the filesystem is validated.
+Save completion means the atomic checkpoint operation completed. Save while
+Pending, ReadersPinned or failed reports unsaved and preserves the prior database.
+Shutdown logs `shutdown_saved=false,unsaved=true` when it cannot establish a
+validated save, stops ownership anyway, and exits nonzero.
+
+`owner.cancel()` sets scale correction cancellation outside the command queue;
+the public Pending/Cancelled coverage gap confirms the correction stopped. Native
+events still drain with bounded work, and rebuild resumes correction. Cancellation
+of a bounded compatibility scan explicitly returns `Unsupported`; its monitoring
+continues. Query cancellation uses the independent query API's existing atomic
+flag. CLI `cancel` also cancels and joins its foreground output task.
+
+`owner.stop(timeout)` requests cancellation independently of queued commands.
+`owner.is_joined()` distinguishes an actual join from a timeout even when a
+source stop error was returned. Successful stop means the worker joined and its
+root/source/database-parent descriptors,
+native watches and writer lock were released, even while old query leases survive
+with Stopped status. Repeated successful stop is harmless. A `TimedOut` result
+means the owner still holds the worker and resources may remain held; retry stop
+to establish completion. Drop requests stop and joins rather than detaching the
+worker. Cooperative deadlines cannot forcibly complete a blocked OS filesystem
+read or durable sync; Drop can wait for such an operation. Linux CLI reports
+`joined=false` before retaining/joining a timed-out owner, never claiming release
+from a deadline alone.
