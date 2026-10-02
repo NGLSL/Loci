@@ -225,7 +225,7 @@ namespace LociManualNtfs {
     New-Item -ItemType HardLink -Path (Join-Path $fixture 'offline-link-added.txt') -Target (Join-Path $fixture 'offline-link-source.txt') | Out-Null
     'offline add/delete/file rename/directory rename/hard-link add/delete completed after bootstrap process exit' |
         Set-Content -LiteralPath (Join-Path $script:evidence 'offline-mutations.txt')
-    $recoverLog = Invoke-Logged $binary @('recover', $fixture, $checkpoint) 'recover'
+    $recoverLog = Invoke-Logged $binary @('recover', $fixture, $checkpoint, '--verify-offline-fixture-events') 'recover'
     if (-not (Select-String -LiteralPath $recoverLog -Pattern '(?i)native_complete\s*=\s*true' -Quiet)) {
         throw 'recover exited successfully without NativeComplete=true; refusing to treat it as complete.'
     }

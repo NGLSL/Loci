@@ -4,6 +4,8 @@
 
 本文件保留首份提交 `61528a899377b7f97851402f1d609d7027132ded` 的实测数据。继续实现后的持久库存、跨进程恢复、路径保护和最新命令见 [IMPLEMENTATION.md](IMPLEMENTATION.md)。旧 `ntfs` 单进程命令已经移除，使用新的 `bootstrap` / `recover` 或 `verify-ntfs.ps1`；下文的旧命令仅解释历史拒绝证据，不能直接照旧运行。用户已决定先完成实现，解除 Aura 后再做未注入环境及管理员 NTFS 验证；本轮没有执行提权。
 
+后续用户解除 Aura 后的普通权限/管理员实测及流式修正记录见 [VALIDATION-2026-10-03.md](VALIDATION-2026-10-03.md)，不要以本历史报告中的阻断状态代替最新结果。
+
 不能把本报告中的目录扫描、ReadDirectoryChangesW 或记录字节注入测试当作 FSCTL 成功，也不能继承旧 Windows 引擎验收来填补本轮缺口。
 
 ## 基线、隔离与产物
