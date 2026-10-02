@@ -1,5 +1,5 @@
 //! Snapshot-owned derived filters. Full normalized paths are cached only for
-//! directories; every other entry retains only a 128-bit lossy filter.
+//! directories; other entries retain compact trigram and pair filters.
 use super::inventory::{EntryId, Kind};
 use crate::signatures::{trigram_signature, ShortSignature};
 use std::collections::{HashMap, HashSet};

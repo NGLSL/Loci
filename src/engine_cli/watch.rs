@@ -343,6 +343,11 @@ pub(super) fn watch(
                     coverage(&handle);
                     let view = handle.view();
                     eprintln!("engine,version={},state={:?},leases={}", view.version, view.status, view.leases);
+                    let metrics = owner.metrics();
+                    eprintln!("engine,full_scans={},scanned_entries={},audited_directories={},scope_checks={},compactions={},compaction_attempts={},compaction_restarts={},compacted_entries={},reclaimed_slots={},reclaimed_name_bytes={}",
+                        metrics.full_scans, metrics.scanned_entries, metrics.audited_directories, metrics.scope_checks,
+                        metrics.compactions, metrics.compaction_attempts, metrics.compaction_restarts,
+                        metrics.compacted_entries, metrics.reclaimed_slots, metrics.reclaimed_name_bytes);
                     report("status", Ok(()));
                 }
                 "cancel" => {
@@ -351,11 +356,12 @@ pub(super) fn watch(
                     else { report("cancel", result); }
                 }
                 "save" => report("save", owner.save().and_then(|request| request.wait(Duration::from_secs(2)))),
+                "compact" => report("compact", owner.request_compaction().and_then(|request| request.wait(Duration::from_secs(2)))),
                 "rebuild" => {
                     startup = StartupTiming::new();
                     report("rebuild", owner.request_rebuild().and_then(|request| request.wait(Duration::from_secs(2))));
                 }
-                _ => report("invalid", Err(io::Error::new(io::ErrorKind::InvalidInput, "watch commands: query QUERY | export QUERY | count QUERY | sort QUERY | status | rebuild | cancel | save | stop"))),
+                _ => report("invalid", Err(io::Error::new(io::ErrorKind::InvalidInput, "watch commands: query QUERY | export QUERY | count QUERY | sort QUERY | status | rebuild | compact | cancel | save | stop"))),
             }
         }
         Ok(())

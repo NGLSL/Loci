@@ -15,6 +15,7 @@ struct Shared {
     retired: Weak<Snapshot>,
     view: View,
     budgets: crate::engine::ScaleBudgets,
+    _memory: Arc<super::memory::Reservation>,
 }
 #[derive(Clone)]
 pub(crate) struct Handle {
@@ -35,13 +36,17 @@ pub(crate) struct Store {
     pub handle: Handle,
 }
 impl Store {
-    pub fn new(budgets: crate::engine::ScaleBudgets) -> Self {
+    pub fn new(
+        budgets: crate::engine::ScaleBudgets,
+        memory: Arc<super::memory::Reservation>,
+    ) -> Self {
         Self {
             handle: Handle {
                 shared: Arc::new(Mutex::new(Shared {
                     snapshot: None,
                     retired: Weak::new(),
                     budgets,
+                    _memory: memory,
                     view: View {
                         version: 0,
                         status: Status::Empty,
@@ -180,7 +185,9 @@ impl Store {
 }
 impl Handle {
     pub fn view(&self) -> View {
-        self.shared.lock().unwrap().view.clone()
+        let mut view = self.shared.lock().unwrap().view.clone();
+        view.resources.process_memory_reserved_bytes = super::memory::reserved_bytes();
+        view
     }
     pub fn lease(&self) -> io::Result<Lease> {
         let mut shared = self.shared.lock().unwrap();

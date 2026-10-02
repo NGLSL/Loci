@@ -8,6 +8,16 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 const MAGIC: &[u8; 8] = b"LOCISCL1";
+pub(crate) struct Encoded {
+    bytes: Vec<u8>,
+    _memory: super::memory::Reservation,
+}
+impl std::ops::Deref for Encoded {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -57,13 +67,25 @@ pub(super) fn encode(
     options: &EngineOptions,
     data: &Data,
     version: u64,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Encoded> {
     if data.epoch == u64::MAX || version == 0 || version == u64::MAX {
         return Err(invalid(
             "checkpoint publication epoch/version exhausted; rebuild required",
         ));
     }
-    let mut bytes = MAGIC.to_vec();
+    let scope = scope(options)?;
+    let length = (0..data.slots as u32)
+        .try_fold(
+            84usize + root.as_os_str().as_bytes().len() + scope.len(),
+            |bytes, id| bytes.checked_add(26 + data.name(id).len()),
+        )
+        .ok_or_else(|| invalid("checkpoint length overflow"))?;
+    if root.as_os_str().as_bytes().len() > 4096 || length > max_bytes(options)? {
+        return Err(invalid("checkpoint byte budget"));
+    }
+    let memory = super::memory::Reservation::acquire(length)?;
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(&0u64.to_le_bytes()); // Final coherent encoded length.
     put(&mut bytes, root.as_os_str().as_bytes())?;
@@ -72,7 +94,7 @@ pub(super) fn encode(
     bytes.extend_from_slice(&mount.to_le_bytes());
     bytes.extend_from_slice(&data.epoch.to_le_bytes());
     bytes.extend_from_slice(&version.to_le_bytes());
-    put(&mut bytes, &scope(options)?)?;
+    put(&mut bytes, &scope)?;
     bytes.extend_from_slice(&(data.slots as u64).to_le_bytes());
     for id in 0..data.slots as u32 {
         let entry = data.entry(id);
@@ -97,7 +119,10 @@ pub(super) fn encode(
     bytes[12..20].copy_from_slice(&(final_length as u64).to_le_bytes());
     let sum = checksum(&bytes);
     bytes.extend_from_slice(&sum.to_le_bytes());
-    Ok(bytes)
+    Ok(Encoded {
+        bytes,
+        _memory: memory,
+    })
 }
 unsafe extern "C" {
     fn openat(directory: c_int, name: *const c_char, flags: c_int, ...) -> c_int;
@@ -188,8 +213,31 @@ pub(super) fn load(
     if !metadata.is_file() || metadata.len() > maximum as u64 {
         return Err(invalid("checkpoint regular-file/byte budget"));
     }
-    let mut bytes = Vec::new();
-    file.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
+    let length = metadata.len() as usize;
+    // Exact bounded buffer, plus graph-validation arrays/hash set scratch.
+    // Both credits precede allocations and coexist with owner admission.
+    let _input_credit = super::memory::Reservation::acquire(length + 1)?;
+    let _graph_credit = super::memory::Reservation::acquire(
+        options
+            .scale_budgets
+            .max_slots
+            .checked_mul(80)
+            .ok_or_else(|| invalid("checkpoint graph budget"))?,
+    )?;
+    let mut bytes = vec![0u8; length + 1];
+    let mut input_file = file.take(length as u64 + 1);
+    let mut read = 0;
+    while read < bytes.len() {
+        let count = input_file.read(&mut bytes[read..])?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    if read != length {
+        return Err(invalid("checkpoint length changed while reading"));
+    }
+    bytes.truncate(read);
     if bytes.len() > maximum {
         return Err(invalid("checkpoint byte budget"));
     }
@@ -284,6 +332,8 @@ pub(super) fn load(
     let mut colors = vec![0u8; slots];
     colors[0] = 2;
     let mut depths = vec![0usize; slots];
+    let mut path_bytes = vec![0usize; slots];
+    path_bytes[0] = root.as_os_str().as_bytes().len();
     for id in 1..slots {
         let entry = inventory.data.entry(id as u32);
         if inventory.data.entry(entry.parent).kind != Kind::Directory
@@ -305,12 +355,18 @@ pub(super) fn load(
             return Err(invalid("checkpoint parent cycle"));
         }
         let mut depth = depths[cursor];
+        let mut path_length = path_bytes[cursor];
         for member in chain.into_iter().rev() {
             depth += 1;
+            path_length += 1 + inventory.data.name(member as u32).len();
+            if path_length > 4096 {
+                return Err(invalid("checkpoint full path byte budget"));
+            }
             if depth > options.limits.depth + 1 {
                 return Err(invalid("checkpoint depth budget"));
             }
             depths[member] = depth;
+            path_bytes[member] = path_length;
             colors[member] = 2;
         }
     }

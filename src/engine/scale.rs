@@ -29,13 +29,27 @@ struct Scan {
     current: Option<(Directory, ReadDir)>,
     generation: u64,
 }
+struct CompactFrame {
+    source: EntryId,
+    target: EntryId,
+    offset: usize,
+}
+struct Compact {
+    inventory: Inventory,
+    stack: Vec<CompactFrame>,
+    generation: u64,
+}
 pub(super) struct Runtime {
     root: PathBuf,
     source: Source,
     options: EngineOptions,
     scope: scope::Scope,
+    last_scope: Instant,
+    scope_input: (u64, u64),
     inventory: Inventory,
     scan: Option<Scan>,
+    compact: Option<Compact>,
+    compact_requested: bool,
     pending: Vec<Change>,
     pending_bytes: usize,
     correction: bool,
@@ -49,9 +63,15 @@ pub(super) struct Runtime {
     drain_polls: usize,
     pub store: query::Store,
     pub metrics: Metrics,
+    memory: std::sync::Arc<memory::Reservation>,
 }
 impl Runtime {
-    pub fn new(root: &Path, source: Source, options: EngineOptions) -> io::Result<Self> {
+    pub fn new(
+        root: &Path,
+        source: Source,
+        options: EngineOptions,
+        memory: std::sync::Arc<memory::Reservation>,
+    ) -> io::Result<Self> {
         if options.limits.entries == 0
             || options.limits.entries > 1_000_000
             || options.limits.directories == 0
@@ -70,6 +90,19 @@ impl Runtime {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "scan batch must be positive",
+            ));
+        }
+        if options.exclusions.len() > 65536
+            || options
+                .exclusions
+                .iter()
+                .map(|path| path.as_os_str().as_bytes().len() + 32)
+                .sum::<usize>()
+                > 1024 * 1024
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scale exclusion byte budget",
             ));
         }
         for exclusion in &options.exclusions {
@@ -102,10 +135,14 @@ impl Runtime {
         Ok(Self {
             root: root.to_path_buf(),
             scope: scope::Scope::read(root)?,
+            last_scope: Instant::now(),
+            scope_input: scope::input_identity()?,
             source,
             options,
             inventory: Inventory::empty(0, budgets),
             scan: None,
+            compact: None,
+            compact_requested: false,
             pending: vec![],
             pending_bytes: 0,
             correction: true,
@@ -117,8 +154,9 @@ impl Runtime {
             audit_cursor: None,
             last_audit: Instant::now(),
             drain_polls: 0,
-            store: query::Store::new(budgets),
+            store: query::Store::new(budgets, memory.clone()),
             metrics: Metrics::default(),
+            memory,
         })
     }
     pub fn restore_checkpoint(
@@ -143,7 +181,7 @@ impl Runtime {
         self.update_resources();
         Ok(true)
     }
-    pub fn encode_checkpoint(&self, source: (u64, u64)) -> io::Result<Vec<u8>> {
+    pub fn encode_checkpoint(&self, source: (u64, u64)) -> io::Result<checkpoint::Encoded> {
         let (data, version) = self.store.checkpoint()?;
         checkpoint::encode(
             &self.root,
@@ -165,15 +203,30 @@ impl Runtime {
         self.retry_after = None;
         self.drain_polls = 0;
         self.scan = None;
+        self.compact = None;
         self.clear_pending();
         self.correction = true;
         self.generation += 1;
         self.store.status(Status::Pending);
         Ok(())
     }
+    pub fn request_compaction(&mut self) -> io::Result<()> {
+        if self.stopped {
+            return Err(io::Error::other("engine stopped"));
+        }
+        if self.correction {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "correction pending",
+            ));
+        }
+        self.compact_requested = true;
+        Ok(())
+    }
     fn cancel_recovery(&mut self) {
         self.cancelled = true;
         self.scan = None;
+        self.compact = None;
         self.clear_pending();
         self.correction = true;
         self.store.gap(CoverageGap {
@@ -207,18 +260,28 @@ impl Runtime {
         let inventory = self
             .scan
             .as_ref()
-            .map_or(&self.inventory, |scan| &scan.inventory);
+            .map(|scan| &scan.inventory)
+            .or_else(|| self.compact.as_ref().map(|compact| &compact.inventory))
+            .unwrap_or(&self.inventory);
         resources.inventory_slots = inventory.data.slots;
         resources.inventory_name_bytes = inventory.name_bytes;
         resources.snapshot_bytes = inventory.data.allocated_bytes();
         resources.retained_snapshot_bytes = self.store.retained_bytes(
             &self.inventory.data,
-            self.scan.as_ref().map(|scan| &scan.inventory.data),
+            self.scan
+                .as_ref()
+                .map(|scan| &scan.inventory.data)
+                .or_else(|| self.compact.as_ref().map(|compact| &compact.inventory.data)),
         );
         resources.slot_limit = self.options.scale_budgets.max_slots;
         resources.name_byte_limit = self.options.scale_budgets.max_name_bytes;
         resources.snapshot_byte_limit = self.options.scale_budgets.max_snapshot_bytes;
         resources.retained_byte_limit = self.options.scale_budgets.max_retained_bytes;
+        resources.memory_reserved_bytes = self.memory.bytes();
+        resources.process_memory_reserved_bytes = memory::reserved_bytes();
+        resources.process_memory_limit = memory::PROCESS_MEMORY_LIMIT;
+        resources.compaction_in_progress = self.compact.is_some();
+        resources.inventory_epoch = self.inventory.data.epoch;
         self.store.resources(resources);
     }
     pub fn check_selected_mount(&self, selected: &std::fs::File) -> io::Result<()> {
@@ -229,7 +292,32 @@ impl Runtime {
         }
         Ok(())
     }
-    fn update_scope(&mut self) -> io::Result<()> {
+    fn update_scope(&mut self, force: bool) -> io::Result<()> {
+        // Source/root device+inode checks stay per poll in Engine. Mount ID is
+        // checked on a newly opened root, so a same-inode bind rebind also fails
+        // immediately; only whole mount-table parsing is interval-budgeted.
+        let selected = crate::engine::open_linux_root(&self.root)?;
+        if let Err(error) = self.check_selected_mount(&selected) {
+            let _ = self.source.stop();
+            self.stopped = true;
+            self.store.gap(CoverageGap {
+                path: self.root.clone(),
+                kind: CoverageGapKind::MountChanged,
+                error: error.to_string(),
+                errno: error.raw_os_error(),
+            });
+            return Err(error);
+        }
+        let input = scope::input_identity()?;
+        if !force
+            && input == self.scope_input
+            && self.last_scope.elapsed() < std::time::Duration::from_secs(1)
+        {
+            return Ok(());
+        }
+        self.last_scope = Instant::now();
+        self.scope_input = input;
+        self.metrics.scope_checks += 1;
         let scope = scope::Scope::read(&self.root).map_err(|error| {
             self.store.gap(CoverageGap {
                 path: self.root.clone(),
@@ -332,11 +420,13 @@ impl Runtime {
         ));
         self.correction = true;
         self.scan = None;
+        self.compact = None;
     }
     pub fn stop(&mut self) -> io::Result<()> {
         self.stopped = true;
         self.clear_pending();
         self.scan = None;
+        self.compact = None;
         self.store.status(Status::Stopped);
         let result = self.source.stop();
         self.update_resources();
@@ -367,9 +457,8 @@ impl Runtime {
         }
     }
     fn capture(&mut self) -> io::Result<()> {
-        self.update_scope()?;
+        self.update_scope(false)?;
         let batch = self.source.poll()?;
-        self.update_resources();
         if batch.state == SourceState::Stopped {
             if !batch.losses.is_empty() {
                 self.record_losses(&batch.losses);
@@ -415,7 +504,9 @@ impl Runtime {
                 self.pending.extend(batch.changes);
             }
         }
-        self.update_resources();
+        if !self.pending.is_empty() || self.correction {
+            self.update_resources();
+        }
         Ok(())
     }
     pub fn poll_with_cancel(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
@@ -430,6 +521,26 @@ impl Runtime {
         self.capture()?;
         if self.stopped {
             return Ok(false);
+        }
+        if self
+            .compact
+            .as_ref()
+            .is_some_and(|compact| compact.generation != self.generation)
+        {
+            self.compact = None;
+            self.metrics.compaction_restarts += 1;
+        }
+        if !self.correction {
+            let names = self.pending.iter().map(Self::change_bytes).sum();
+            if self.compact_requested
+                || self.compact.is_some()
+                || self.inventory.needs_compaction(self.pending.len(), names)
+            {
+                if !self.store.ready() {
+                    return Ok(false);
+                }
+                return self.compact_step(cancel);
+            }
         }
         if !self.correction && self.pending.is_empty() {
             self.audit()?;
@@ -472,6 +583,18 @@ impl Runtime {
             .set_allocation_credit(self.store.allocation_credit(&self.inventory.data, None)?);
         let changes = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
+        if changes.iter().any(|change| match change {
+            Change::Rename { from, .. } => self
+                .inventory
+                .find(from)
+                .is_some_and(|id| self.inventory.data.entry(id).kind == Kind::Directory),
+            _ => false,
+        }) {
+            self.update_scope(true)?;
+            if self.correction {
+                return Ok(false);
+            }
+        }
         if crate::incremental::requires_reconcile(&self.root, &changes, &mut self.metrics)? {
             self.correction = true;
             return Ok(false);
@@ -502,20 +625,21 @@ impl Runtime {
         Ok(published)
     }
     fn correct(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
+        self.compact = None;
         if self.scan.is_none() {
+            self.update_scope(true)?;
             self.source.begin_reconcile()?;
             self.clear_pending();
             self.metrics.full_scans += 1;
             self.metrics.correction_attempts += 1;
             self.scan = Some(Scan {
-                inventory: Inventory::new(
+                inventory: self.candidate_inventory(
                     self.inventory.data.epoch.checked_add(1).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             "source epoch exhausted; rebuild required",
                         )
                     })?,
-                    self.options.scale_budgets,
                 )?,
                 todo: vec![Directory {
                     id: 0,
@@ -545,6 +669,10 @@ impl Runtime {
                     return Err(io::Error::other("scale directory depth exhausted"));
                 }
                 processed += 1;
+                let opened = crate::engine::open_linux_root(&directory.path)?;
+                if scope::mount_id(&opened)? != self.scope.root_mount {
+                    continue;
+                }
                 self.source
                     .before_directory(&directory.path)
                     .map_err(|error| self.scoped_error(&directory.path, error))?;
@@ -594,6 +722,9 @@ impl Runtime {
                 });
             }
         }
+        if scan.current.is_none() && scan.todo.is_empty() {
+            self.update_scope(true)?;
+        }
         self.capture()?;
         if self.stopped {
             return Ok(false);
@@ -620,6 +751,108 @@ impl Runtime {
         let published = self.store.publish(self.inventory.data.clone())?;
         self.update_resources();
         Ok(published)
+    }
+    fn compact_step(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
+        if cancel.load(Ordering::Relaxed) {
+            self.compact = None;
+            self.update_resources();
+            return Ok(false);
+        }
+        if self.compact.is_none() {
+            let epoch = self
+                .inventory
+                .data
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("compaction epoch exhausted"))?;
+            self.compact = Some(Compact {
+                inventory: self.candidate_inventory(epoch)?,
+                stack: vec![CompactFrame {
+                    source: 0,
+                    target: 0,
+                    offset: 0,
+                }],
+                generation: self.generation,
+            });
+            self.metrics.compaction_attempts += 1;
+        }
+        let mut compact = self.compact.take().unwrap();
+        compact.inventory.set_allocation_credit(
+            self.store
+                .allocation_credit(&self.inventory.data, Some(&compact.inventory.data))?,
+        );
+        let mut work = 0;
+        while work < self.options.scan_batch.min(4096) {
+            if cancel.load(Ordering::Relaxed) {
+                self.update_resources();
+                return Ok(false);
+            }
+            let Some(frame) = compact.stack.last_mut() else {
+                break;
+            };
+            work += 1;
+            let Some(id) = self.inventory.child_at(frame.source, frame.offset) else {
+                compact.stack.pop();
+                continue;
+            };
+            frame.offset += 1;
+            let entry = self.inventory.data.entry(id);
+            let target = compact.inventory.insert_restored(
+                frame.target,
+                self.inventory.data.name(id),
+                entry.kind,
+                entry.dev,
+                entry.ino,
+                true,
+            )?;
+            self.metrics.compacted_entries += 1;
+            if entry.kind == Kind::Directory {
+                compact.stack.push(CompactFrame {
+                    source: id,
+                    target,
+                    offset: 0,
+                });
+            }
+        }
+        if compact.stack.is_empty() {
+            self.update_scope(true)?;
+        }
+        self.capture()?;
+        if self.stopped || self.correction || compact.generation != self.generation {
+            self.metrics.compaction_restarts += 1;
+            return Ok(false);
+        }
+        if !compact.stack.is_empty() {
+            self.compact = Some(compact);
+            self.update_resources();
+            return Ok(false);
+        }
+        compact.inventory.finish_derived(cancel)?;
+        self.metrics.reclaimed_slots += self.inventory.data.slots - compact.inventory.data.slots;
+        self.metrics.reclaimed_name_bytes +=
+            self.inventory.name_bytes - compact.inventory.name_bytes;
+        self.metrics.compactions += 1;
+        self.compact_requested = false;
+        self.inventory = compact.inventory;
+        self.audit_cursor = None;
+        // Pending events refer to the unchanged writer graph. Apply them against
+        // its compact IDs before publishing any validated filesystem cutoff.
+        let published = if self.pending.is_empty() {
+            self.store.publish(self.inventory.data.clone())?
+        } else {
+            false
+        };
+        self.update_resources();
+        Ok(published)
+    }
+    fn candidate_inventory(&self, epoch: u64) -> io::Result<Inventory> {
+        let mut candidate = Inventory::empty(epoch, self.options.scale_budgets);
+        candidate.set_allocation_credit(
+            self.store
+                .allocation_credit(&self.inventory.data, Some(&candidate.data))?,
+        );
+        candidate.insert(0, b"", Kind::Directory, 0, 0)?;
+        Ok(candidate)
     }
     fn audit(&mut self) -> io::Result<()> {
         if self.last_audit.elapsed() < self.options.recovery.audit_interval {
@@ -691,6 +924,12 @@ impl Runtime {
                 && (kind != Kind::Directory || self.scope.boundary(&path))
             {
                 return Ok(None);
+            }
+            if components.peek().is_some() && kind == Kind::Directory {
+                let opened = crate::engine::open_linux_root(&path)?;
+                if scope::mount_id(&opened)? != self.scope.root_mount {
+                    return Ok(None);
+                }
             }
             result = Some((kind, metadata));
         }

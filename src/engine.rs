@@ -22,6 +22,8 @@ pub use query_job::{QueryJob, QueryJobState, MAX_QUERY_WORKERS};
 
 #[cfg(target_os = "linux")]
 mod scale;
+#[cfg(target_os = "linux")]
+pub use scale::memory::PROCESS_MEMORY_LIMIT;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EngineMode {
@@ -166,6 +168,13 @@ pub struct Resources {
     pub name_byte_limit: usize,
     pub snapshot_byte_limit: usize,
     pub retained_byte_limit: usize,
+    /// Conservative owner/process admission, including writer and native tables.
+    /// Capacity reservations are separate from measured process RSS.
+    pub memory_reserved_bytes: usize,
+    pub process_memory_reserved_bytes: usize,
+    pub process_memory_limit: usize,
+    pub compaction_in_progress: bool,
+    pub inventory_epoch: u64,
 }
 #[derive(Clone, Debug)]
 pub struct View {
@@ -474,10 +483,11 @@ impl Engine {
         identity: RootIdentity,
         source: Source,
         options: EngineOptions,
+        memory: Arc<scale::memory::Reservation>,
     ) -> io::Result<Self> {
         let mut engine = Self::start_unpolled(root, database, identity, source)?;
         let source = engine.source.take().unwrap();
-        let mut runtime = scale::Runtime::new(&engine.root, source, options)?;
+        let mut runtime = scale::Runtime::new(&engine.root, source, options, memory)?;
         let mut loaded = false;
         if let Some(path) = &engine.database {
             let parent = &engine.database_parent.as_ref().unwrap()._file;
@@ -517,6 +527,7 @@ impl Engine {
         }
         #[cfg(target_os = "linux")]
         {
+            let memory = scale::memory::owner(&options, true)?;
             let root = fs::canonicalize(root)?;
             let identity = RootIdentity::open(&root)?;
             let source = crate::linux_events::LinuxEvents::open_scale(
@@ -524,7 +535,14 @@ impl Engine {
                 options.event_limits,
                 options.watch_limit,
             )?;
-            Self::start_scale(root, database, identity, Source::Linux(source), options)
+            Self::start_scale(
+                root,
+                database,
+                identity,
+                Source::Linux(source),
+                options,
+                memory,
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -579,6 +597,7 @@ impl Engine {
         }
         #[cfg(target_os = "linux")]
         {
+            let memory = scale::memory::owner(&options, false)?;
             let root = fs::canonicalize(root)?;
             let identity = RootIdentity::open(&root)?;
             Self::start_scale(
@@ -587,6 +606,7 @@ impl Engine {
                 identity,
                 Source::External(Box::new(source)),
                 options,
+                memory,
             )
         }
         #[cfg(not(target_os = "linux"))]
@@ -805,6 +825,18 @@ impl Engine {
         self.invalidate(Signal::Periodic);
         self.gate = Gate::default();
         Ok(())
+    }
+    /// Reclaim obsolete scale names and slots in bounded polling batches.
+    /// Existing leases retain their immutable paths and cursors.
+    pub fn request_compaction(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(scale) = &mut self.scale {
+            return scale.request_compaction();
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "compaction requires scale mode",
+        ))
     }
     pub fn poll(&mut self) -> io::Result<bool> {
         self.poll_with_cancel(&AtomicBool::new(false))

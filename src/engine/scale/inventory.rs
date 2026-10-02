@@ -53,17 +53,11 @@ pub(super) struct Data {
     pub search: super::search_index::SearchIndex,
     pub slots: usize,
     pub epoch: u64,
+    allocated: usize,
 }
 impl Data {
     pub fn allocated_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.segments.capacity() * std::mem::size_of::<Arc<Segment>>()
-            + self
-                .segments
-                .iter()
-                .map(|segment| segment.allocated_bytes())
-                .sum::<usize>()
-            + self.search.allocated_bytes()
+        self.allocated + self.search.allocated_bytes()
     }
     pub fn accounted_bytes(&self, seen: &mut HashSet<usize>) -> usize {
         std::mem::size_of::<Self>()
@@ -104,6 +98,7 @@ pub(super) struct Inventory {
     pub copied_entries: usize,
     pub copied_segments: usize,
     pub name_bytes: usize,
+    pub live_name_bytes: usize,
     children: HashMap<EntryId, Vec<EntryId>>,
     positions: Vec<usize>,
     budgets: ScaleBudgets,
@@ -115,11 +110,6 @@ fn hash(bytes: &[u8]) -> u64 {
     })
 }
 impl Inventory {
-    pub fn new(epoch: u64, budgets: ScaleBudgets) -> io::Result<Self> {
-        let mut out = Self::empty(epoch, budgets);
-        out.insert(0, b"", Kind::Directory, 0, 0)?;
-        Ok(out)
-    }
     pub fn empty(epoch: u64, budgets: ScaleBudgets) -> Self {
         Self {
             data: Data {
@@ -127,6 +117,7 @@ impl Inventory {
                 slots: 0,
                 epoch,
                 search: Default::default(),
+                allocated: std::mem::size_of::<Data>(),
             },
             lookup: HashMap::new(),
             collisions: HashMap::new(),
@@ -137,6 +128,7 @@ impl Inventory {
             copied_entries: 0,
             copied_segments: 0,
             name_bytes: 0,
+            live_name_bytes: 0,
             children: HashMap::new(),
             positions: vec![],
             budgets,
@@ -167,6 +159,7 @@ impl Inventory {
     ) -> io::Result<EntryId> {
         let id = self.insert(parent, name, kind, dev, ino)?;
         if !alive {
+            self.live_name_bytes -= name.len();
             self.detach_child(parent, id);
             self.remove_lookup(id);
             self.edit(id)?.alive = false;
@@ -192,7 +185,9 @@ impl Inventory {
         if self.data.allocated_bytes().saturating_add(bytes) > self.budgets.max_snapshot_bytes {
             return Err(io::Error::other("snapshot byte budget exhausted"));
         }
-        self.credit(bytes)
+        self.credit(bytes)?;
+        self.data.allocated += bytes;
+        Ok(())
     }
     fn name_budget(&self, bytes: usize) -> io::Result<()> {
         if self.name_bytes.saturating_add(bytes) > self.budgets.max_name_bytes {
@@ -279,6 +274,7 @@ impl Inventory {
         });
         self.data.slots += 1;
         self.name_bytes += name.len();
+        self.live_name_bytes += name.len();
         self.touched += 1;
         if id != 0 {
             self.add_lookup(parent, name, id);
@@ -306,7 +302,10 @@ impl Inventory {
             .search
             .allocation(id, parent, kind, self.data.name(id));
         if bytes != 0 {
-            self.allocation(bytes)?;
+            if self.data.allocated_bytes().saturating_add(bytes) > self.budgets.max_snapshot_bytes {
+                return Err(io::Error::other("snapshot byte budget exhausted"));
+            }
+            self.credit(bytes)?;
         }
         let name = self.data.name(id).to_vec();
         self.data.search.set(id, parent, kind, &name);
@@ -402,6 +401,19 @@ impl Inventory {
         self.copied_entries = 0;
         self.copied_segments = 0;
     }
+    pub fn child_at(&self, parent: EntryId, offset: usize) -> Option<EntryId> {
+        self.children.get(&parent)?.get(offset).copied()
+    }
+    pub fn needs_compaction(&self, slots: usize, names: usize) -> bool {
+        let dead = self.data.slots.saturating_sub(self.entries + 1);
+        let obsolete = self.name_bytes.saturating_sub(self.live_name_bytes);
+        (dead > 0
+            && (dead >= (self.data.slots / 4).max(1)
+                || self.data.slots.saturating_add(slots) >= self.budgets.max_slots))
+            || (obsolete > 0
+                && (obsolete >= (self.name_bytes / 4).max(1)
+                    || self.name_bytes.saturating_add(names) >= self.budgets.max_name_bytes))
+    }
     pub fn remove(&mut self, id: EntryId) -> io::Result<()> {
         if id == 0 || !self.data.entry(id).alive {
             return Ok(());
@@ -415,6 +427,7 @@ impl Inventory {
             self.directory_ids.remove(&id);
         }
         self.detach_child(self.data.entry(id).parent, id);
+        self.live_name_bytes -= self.data.name(id).len();
         self.remove_lookup(id);
         self.edit(id)?.alive = false;
         self.entries -= 1;
@@ -424,6 +437,7 @@ impl Inventory {
         self.name_budget(name.len())?;
         self.reserve_names(id as usize / BLOCK, name.len())?;
         let previous_parent = self.data.entry(id).parent;
+        let previous_length = self.data.name(id).len();
         if previous_parent != parent {
             self.detach_child(previous_parent, id);
             let siblings = self.children.entry(parent).or_default();
@@ -446,6 +460,7 @@ impl Inventory {
         entry.offset = offset;
         entry.length = length;
         self.name_bytes += name.len();
+        self.live_name_bytes = self.live_name_bytes - previous_length + name.len();
         self.add_lookup(parent, name, id);
         // A directory rename changes every descendant's searchable ancestry.
         // Old leases retain the old cache and filter segments through Arc COW.
