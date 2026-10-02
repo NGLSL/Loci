@@ -3,7 +3,6 @@ use crate::engine::{QueryPage, QueryResult, Status, View, MAX_PAGE_SIZE};
 use crate::index::Query;
 use std::collections::HashSet;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -254,10 +253,12 @@ impl Lease {
             ));
         }
         let query = Query::parse(raw);
+        let (grams, short) = query.filter();
         let mut offset = cursor.map_or(1, |cursor| cursor.offset);
         let mut paths = Vec::with_capacity(size);
         let mut visited = 0;
         let mut cancelled = false;
+        let mut normalized = Vec::new();
         while offset < self.snapshot.data.slots {
             if cancel.load(Ordering::Relaxed) {
                 cancelled = true;
@@ -269,11 +270,8 @@ impl Lease {
             if !self.snapshot.data.entry(id).alive {
                 continue;
             }
-            let path = self.snapshot.data.path(id);
-            let mut raw_path = vec![b'/'];
-            raw_path.extend_from_slice(path.as_os_str().as_bytes());
-            if query.matches_raw(&raw_path) {
-                paths.push(path);
+            if self.matches(id, &query, grams, &short, &mut normalized) {
+                paths.push(self.snapshot.data.path(id));
             }
             if visited % 64 == 0 {
                 progress.store(visited, Ordering::Release);
@@ -300,6 +298,101 @@ impl Lease {
                     offset,
                 }),
             }),
+        })
+    }
+    fn matches(
+        &self,
+        id: u32,
+        query: &Query,
+        grams: u128,
+        short: &crate::signatures::ShortSignature,
+        normalized: &mut Vec<u8>,
+    ) -> bool {
+        let data = &self.snapshot.data;
+        let entry = data.entry(id);
+        if query.unfiltered() {
+            return entry.alive;
+        }
+        if !entry.alive || !data.search.admits(id, grams, short) {
+            return false;
+        }
+        data.search
+            .fill_path(entry.parent, data.name(id), normalized);
+        query.matches_normalized(normalized)
+    }
+    pub(crate) fn sort_budget(&self) -> usize {
+        self.shared.lock().unwrap().budgets.max_sort_bytes
+    }
+    pub(crate) fn stopped(&self) -> bool {
+        self.shared.lock().unwrap().view.status == Status::Stopped
+    }
+    pub(crate) fn path(&self, id: u32) -> std::path::PathBuf {
+        self.snapshot.data.path(id)
+    }
+    /// Stream matching IDs without resolving any result paths. Return false on
+    /// cancellation; callbacks own their bounded accumulation policy.
+    pub(crate) fn visit_matches(
+        &self,
+        raw: &str,
+        cancel: &AtomicBool,
+        progress: &AtomicUsize,
+        mut matched: impl FnMut(u32) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        if raw.len() > 512 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "query budget exceeded",
+            ));
+        }
+        let query = Query::parse(raw);
+        let (grams, short) = query.filter();
+        let mut normalized = Vec::new();
+        for id in 1..self.snapshot.data.slots as u32 {
+            if id % 64 == 0 {
+                progress.store(id as usize, Ordering::Release);
+                if cancel.load(Ordering::Acquire)
+                    || self.shared.lock().unwrap().view.status == Status::Stopped
+                {
+                    return Ok(false);
+                }
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            if self.matches(id, &query, grams, &short, &mut normalized) {
+                matched(id)?;
+            }
+        }
+        progress.store(
+            self.snapshot.data.slots.saturating_sub(1),
+            Ordering::Release,
+        );
+        Ok(!cancel.load(Ordering::Acquire)
+            && self.shared.lock().unwrap().view.status != Status::Stopped)
+    }
+    pub(crate) fn sorted_page(
+        &self,
+        ids: &[u32],
+        offset: usize,
+        size: usize,
+    ) -> io::Result<QueryPage> {
+        if !(1..=MAX_PAGE_SIZE).contains(&size) || offset > ids.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sorted page budget/offset",
+            ));
+        }
+        let end = offset.saturating_add(size).min(ids.len());
+        let finished = self.shared.lock().unwrap().view.clone();
+        Ok(QueryPage {
+            version: self.snapshot.version,
+            started: self.started.clone(),
+            validated_at_start_and_finish: self.validated(&finished),
+            finished,
+            paths: ids[offset..end].iter().map(|id| self.path(*id)).collect(),
+            cancelled: false,
+            complete: end == ids.len(),
+            next: None,
         })
     }
     pub fn search(

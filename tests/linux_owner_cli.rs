@@ -242,3 +242,66 @@ fn eof_during_stale_correction_reports_unsaved_and_preserves_last_checkpoint() {
     .unwrap();
     reopened.stop().unwrap();
 }
+
+#[test]
+fn independent_count_and_sort_follow_an_immediate_watch_query() {
+    use std::io::{Read, Write};
+    let f = Fixture::new();
+    for name in ["z.txt", "b.txt", "A.txt"] {
+        fs::write(f.root.join(name), "").unwrap();
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loci-experiment"))
+        .args(["engine", "watch"])
+        .arg(&f.root)
+        .arg(f.base.join("db"))
+        .args(["--scale", "--null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            tx.send(line.unwrap()).unwrap();
+        }
+    });
+    let mut logs = Vec::new();
+    let wait = |needle: &str, logs: &mut Vec<String>| loop {
+        let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let found = line.contains(needle);
+        logs.push(line);
+        if found {
+            break;
+        }
+    };
+    wait("watch-ready", &mut logs);
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "query ext:txt").unwrap();
+    wait("command=query,ok=true", &mut logs);
+    writeln!(input, "count ext:txt").unwrap();
+    wait("command=count,ok=true", &mut logs);
+    assert!(logs
+        .iter()
+        .any(|line| line.contains("job=count,state=Complete") && line.contains("matches=3")));
+    writeln!(input, "sort ext:txt").unwrap();
+    wait("command=sort,ok=true", &mut logs);
+    writeln!(input, "stop").unwrap();
+    drop(input);
+    let mut bytes = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    reader.join().unwrap();
+    let mut sorted = Vec::new();
+    for name in ["A.txt", "b.txt", "z.txt"] {
+        sorted.extend_from_slice(f.root.join(name).as_os_str().as_encoded_bytes());
+        sorted.push(0);
+    }
+    assert!(bytes.ends_with(&sorted));
+}

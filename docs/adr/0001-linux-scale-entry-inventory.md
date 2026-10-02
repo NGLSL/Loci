@@ -85,3 +85,42 @@ The CLI routes root/database/exclusion arguments as OS strings and supports
 UTF-8. Native scope evidence includes same-device bind mounts and root rebinding
 in a private user/mount namespace; these overlayfs tests do not establish ext4 or
 Btrfs scale acceptance.
+
+## Responsive query extension (LOCI-LINUX-001-12)
+
+Scale snapshots now include derived segment filters: a 128-bit trigram signature
+and a 128-bit adjacent-byte-pair signature per slot, plus one byte/pair union
+filter per 64 slots. False positives go to the exact matcher; no filter decides
+that a result matches. Normalized ancestry is cached only for directories. Query
+verification reuses one scratch buffer and constructs original raw paths only
+for returned entries. Invalid UTF-8 runs remain separated by byte FF during
+normalization; valid query text cannot cross that separator. Ancestor, slash,
+AND, Unicode lowercase expansion and extension semantics remain authoritative.
+
+Derived filters are snapshot-owned Arc segments. File updates copy touched
+filter segments; a directory move rederives its affected subtree and replaces
+cached ancestry while older leases retain the old view. It retains the entry ID
+and source epoch. This subtree work and native watch topology work are separate
+from the public metrics for primary inventory parent/name edits. Checkpoints
+persist the canonical raw graph and rebuild derived state after graph validation;
+parent-first compaction derives incrementally as it inserts. Derived allocations
+and directory cache COW are charged before allocation against inventory snapshot
+and retained byte budgets. The checkpoint format remains LOCISCL1.
+
+Immediate pages retain entry-ID order and stop at the requested page size.
+Independent exact-count and optional lexical-sort jobs pin a single snapshot.
+Count streams matching IDs; sort retains only IDs and merge scratch rather than
+all reconstructed paths. Sort comparisons use raw filesystem bytes, with stable
+ordering during cancellation, and cancellation checks between 1,024-ID sorting
+chunks and each 256 merge steps. Completed sorted results provide offset pages
+and retain their lease until dropped. Count drops its lease on completion.
+
+At most two query workers run per process, independently of the lease limit.
+Sort ID/merge capacity has an explicit 16 MiB default budget and each worker
+admits an additional 512 KiB scratch reservation into the shared 4 GiB conservative
+process capacity policy. Reservations describe capacity, not RSS or kernel watch
+memory. Cancellation and monitor stop prevent active jobs publishing a partial
+exact total; direct immutable leases remain readable after stop. Bounded/Windows
+pagination and matching are unchanged; optional sorting explicitly requires the
+Linux scale mode. The 100k measurements are documented separately and do not
+establish million-entry, native Windows, filesystem or RSS acceptance.

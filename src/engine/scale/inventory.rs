@@ -50,16 +50,25 @@ impl Segment {
 #[derive(Clone)]
 pub(super) struct Data {
     segments: Vec<Arc<Segment>>,
+    pub search: super::search_index::SearchIndex,
     pub slots: usize,
     pub epoch: u64,
 }
 impl Data {
     pub fn allocated_bytes(&self) -> usize {
-        self.accounted_bytes(&mut HashSet::new())
+        std::mem::size_of::<Self>()
+            + self.segments.capacity() * std::mem::size_of::<Arc<Segment>>()
+            + self
+                .segments
+                .iter()
+                .map(|segment| segment.allocated_bytes())
+                .sum::<usize>()
+            + self.search.allocated_bytes()
     }
     pub fn accounted_bytes(&self, seen: &mut HashSet<usize>) -> usize {
         std::mem::size_of::<Self>()
             + self.segments.capacity() * std::mem::size_of::<Arc<Segment>>()
+            + self.search.accounted_bytes(seen)
             + self
                 .segments
                 .iter()
@@ -117,6 +126,7 @@ impl Inventory {
                 segments: vec![],
                 slots: 0,
                 epoch,
+                search: Default::default(),
             },
             lookup: HashMap::new(),
             collisions: HashMap::new(),
@@ -283,7 +293,51 @@ impl Inventory {
             self.directory_ids.insert(id);
             self.directories += 1;
         }
+        if id == 0 || self.data.search.has_parent(parent) {
+            self.derive_entry(id)?;
+        }
         Ok(id)
+    }
+    pub fn derive_entry(&mut self, id: EntryId) -> io::Result<()> {
+        let entry = self.data.entry(id);
+        let (parent, kind) = (entry.parent, entry.kind);
+        let bytes = self
+            .data
+            .search
+            .allocation(id, parent, kind, self.data.name(id));
+        if bytes != 0 {
+            self.allocation(bytes)?;
+        }
+        let name = self.data.name(id).to_vec();
+        self.data.search.set(id, parent, kind, &name);
+        Ok(())
+    }
+    /// Compaction inserts parent-first and has already derived every entry.
+    /// Checkpoint records can contain forward parent IDs and need this traversal
+    /// after the graph has been validated. Published snapshots never lack filters.
+    pub fn finish_derived(&mut self, cancel: &std::sync::atomic::AtomicBool) -> io::Result<()> {
+        if self.data.search.derived == self.data.slots {
+            return Ok(());
+        }
+        let mut stack = vec![0];
+        while let Some(id) = stack.pop() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "derived index cancelled",
+                ));
+            }
+            self.derive_entry(id)?;
+            if let Some(children) = self.children.get(&id) {
+                stack.extend(
+                    children
+                        .iter()
+                        .copied()
+                        .filter(|child| self.data.entry(*child).alive),
+                );
+            }
+        }
+        Ok(())
     }
     fn add_lookup(&mut self, parent: EntryId, name: &[u8], id: EntryId) {
         let key = (parent, hash(name));
@@ -393,6 +447,17 @@ impl Inventory {
         entry.length = length;
         self.name_bytes += name.len();
         self.add_lookup(parent, name, id);
+        // A directory rename changes every descendant's searchable ancestry.
+        // Old leases retain the old cache and filter segments through Arc COW.
+        let mut stack = vec![id];
+        while let Some(entry) = stack.pop() {
+            self.derive_entry(entry)?;
+            if self.data.entry(entry).kind == Kind::Directory {
+                if let Some(children) = self.children.get(&entry) {
+                    stack.extend(children.iter().copied());
+                }
+            }
+        }
         Ok(())
     }
 }

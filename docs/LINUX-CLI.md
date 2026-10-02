@@ -208,3 +208,36 @@ worker. Cooperative deadlines cannot forcibly complete a blocked OS filesystem
 read or durable sync; Drop can wait for such an operation. Linux CLI reports
 `joined=false` before retaining/joining a timed-out owner, never claiming release
 from a deadline alone.
+
+## Immediate pages and independent query jobs
+
+Scale first-page queries filter compact snapshot records and stop after 50
+results. They do not need an exact total or global sorting. In a watch session,
+run `query REPORT` for that immediate page, followed by `count REPORT` for a
+complete count or `sort REPORT` for an optional full raw-byte lexical export.
+These commands reuse the single foreground slot; `cancel`, stop, EOF and signals
+cancel and join active work while monitoring continues independently. Results
+go to stdout and Pending/Complete/Cancelled/Failed job diagnostics go to stderr.
+Complete describes computation of one pinned snapshot; the diagnostic's
+`validated` and observed state separately report current coverage.
+
+The public `QueryHandle::start_count(query)` and `start_sort(query)` return
+`QueryJob`. Inspect `state()`, `progress()` (entry slots visited during filtering),
+`version()` and `count()`; the exact count is `Some` only after Complete. Call
+`cancel()` to request cooperative cancellation. Dropping a job cancels and joins
+its worker. A cancelled or failed job never supplies a partial exact count.
+A completed sort provides `page(offset, size)` with sizes 1–1024; advance offset
+by returned rows. Its pages have no entry-ID cursor and reconstruct only returned
+paths. The completed sort pins its snapshot until dropped, including across
+renames or newer publication. Ordinary typed cursor ordering remains unchanged.
+
+At most two workers run process-wide and configured reader limits still apply.
+Busy admission returns an explicit error. Count streams IDs; optional sorting
+stores bounded IDs and merge scratch, defaulting to 16 MiB via
+`EngineOptions.scale_budgets.max_sort_bytes`, with an additional 512 KiB shared
+scratch reservation. Capacity exhaustion produces Failed rather than an incomplete
+exact total. Sort can take substantially longer than first-page retrieval and
+remains cancellable during filtering, sorting and merging. New jobs are refused
+after monitor stop; directly retained snapshot leases remain queryable. Optional
+sort explicitly requires Linux scale mode. No million-entry timing or RSS target
+is inferred from the 100k query baseline.

@@ -1,5 +1,5 @@
 //! Lossless prefilter: collisions admit extra candidates, final verifier decides.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ShortSignature {
     pub bytes: [u64; 4],
     pub pairs: u128,

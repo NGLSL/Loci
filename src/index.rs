@@ -326,6 +326,38 @@ pub struct Query {
     ext: Option<String>,
 }
 impl Query {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn unfiltered(&self) -> bool {
+        self.tokens.is_empty() && self.ext.is_none()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn filter(&self) -> (u128, ShortSignature) {
+        let mut short = ShortSignature::default();
+        let mut grams = 0;
+        for token in &self.tokens {
+            short.insert(token.as_bytes());
+            grams |= trigram_signature(token.as_bytes());
+        }
+        if let Some(extension) = &self.ext {
+            short.insert(extension.as_bytes());
+            grams |= trigram_signature(extension.as_bytes());
+        }
+        (grams, short)
+    }
+    /// Already-lowercased UTF-8 runs separated by byte FF; valid queries cannot
+    /// contain that separator, so terms cannot bridge invalid filesystem bytes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn matches_normalized(&self, path: &[u8]) -> bool {
+        self.tokens
+            .iter()
+            .all(|token| contains(path, token.as_bytes()))
+            && self.ext.as_ref().is_none_or(|ext| {
+                let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+                name.iter()
+                    .rposition(|byte| *byte == b'.')
+                    .is_some_and(|dot| &name[dot + 1..] == ext.as_bytes())
+            })
+    }
     pub fn parse(raw: &str) -> Self {
         let mut q = Self {
             tokens: vec![],

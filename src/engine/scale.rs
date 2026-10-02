@@ -2,8 +2,10 @@
 //! native mode; persistence and increased scale budgets are separate milestones.
 pub(super) mod checkpoint;
 mod inventory;
+pub(crate) mod memory;
 pub(super) mod query;
 mod scope;
+mod search_index;
 use super::{CoverageGap, CoverageGapKind, EngineOptions, Source, Status};
 use crate::events::{Change, EventSource, Loss, SourceState};
 use crate::incremental::{Metrics, Topology};
@@ -79,6 +81,7 @@ impl Runtime {
             || options.scale_budgets.max_snapshot_bytes == 0
             || options.scale_budgets.max_retained_bytes < options.scale_budgets.max_snapshot_bytes
             || options.scale_budgets.max_queue_bytes == 0
+            || options.scale_budgets.max_sort_bytes > 64 * 1024 * 1024
             || !(1..=crate::live::MAX_LEASES).contains(&options.scale_budgets.max_leases)
         {
             return Err(io::Error::new(

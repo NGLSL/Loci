@@ -56,9 +56,12 @@ fn exhausted_name_arena_preserves_published_paths_and_reports_usage() {
 fn retained_byte_credit_rejects_a_local_copy_before_publication() {
     let fixture = Fixture::new();
     fs::write(fixture.root.join("seed.txt"), b"").unwrap();
+    let baseline = Engine::open_with_options(&fixture.root, None, EngineOptions::scale()).unwrap();
+    let bytes = baseline.view().resources.snapshot_bytes;
+    drop(baseline);
     let mut options = EngineOptions::scale();
-    options.scale_budgets.max_snapshot_bytes = 50_000;
-    options.scale_budgets.max_retained_bytes = 51_000;
+    options.scale_budgets.max_snapshot_bytes = bytes + 1024;
+    options.scale_budgets.max_retained_bytes = bytes + 2048;
     let mut engine = Engine::open_with_options(&fixture.root, None, options).unwrap();
     // A small snapshot uses one fixed-capacity segment. The next local COW
     // would retain two segments, exceeding this deliberately narrow budget.
@@ -69,7 +72,7 @@ fn retained_byte_credit_rejects_a_local_copy_before_publication() {
     fail(&mut engine);
     assert_eq!(engine.view().version, version);
     assert_eq!(paths(&handle), [fixture.root.join("seed.txt")]);
-    assert!(engine.view().resources.retained_snapshot_bytes <= 51_000);
+    assert!(engine.view().resources.retained_snapshot_bytes <= bytes + 2048);
 }
 #[test]
 fn configured_lease_limit_is_released_when_a_reader_drops() {

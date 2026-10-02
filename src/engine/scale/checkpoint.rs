@@ -320,6 +320,7 @@ pub(super) fn load(
         return Err(invalid("checkpoint live inventory budget"));
     }
     inventory.validate_restored_lookup()?;
+    inventory.finish_derived(&std::sync::atomic::AtomicBool::new(false))?;
     inventory.reset_work();
     Ok(Some((inventory, version)))
 }

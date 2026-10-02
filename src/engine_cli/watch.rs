@@ -171,6 +171,75 @@ fn spawn_task(handle: QueryHandle, raw: String, nul: bool, export: bool) -> io::
         name,
     })
 }
+fn spawn_job(handle: QueryHandle, raw: String, nul: bool, sort: bool) -> io::Result<Task> {
+    use loci_experiment::engine::QueryJobState;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let name = if sort { "sort" } else { "count" };
+    let worker = std::thread::Builder::new()
+        .name("loci-cli-job".into())
+        .spawn(move || {
+            let job = if sort {
+                handle.start_sort(&raw)?
+            } else {
+                handle.start_count(&raw)?
+            };
+            eprintln!("engine,job={name},state=Pending,version={}", job.version());
+            loop {
+                if worker_cancel.load(Ordering::Acquire) || INTERRUPTED.load(Ordering::Relaxed) {
+                    job.cancel();
+                }
+                match job.state() {
+                    QueryJobState::Pending | QueryJobState::Running => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    QueryJobState::Complete => break,
+                    QueryJobState::Cancelled => {
+                        eprintln!("engine,job={name},state=Cancelled");
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "query job cancelled",
+                        ));
+                    }
+                    QueryJobState::Failed(error) => {
+                        eprintln!("engine,job={name},state=Failed");
+                        return Err(io::Error::other(error));
+                    }
+                }
+            }
+            let view = handle.view();
+            let validated = view.status == Status::Validated && view.version == job.version();
+            eprintln!(
+                "engine,job={name},state=Complete,version={},observed_state={:?},validated={validated},matches={},visited={}",
+                job.version(),
+                view.status,
+                job.count().unwrap(),
+                job.progress()
+            );
+            if sort {
+                let mut output = Output {
+                    cancel: worker_cancel,
+                };
+                let mut offset = 0;
+                loop {
+                    let page = job.page(offset, DEFAULT_PAGE_SIZE)?;
+                    offset += page.paths.len();
+                    write_paths(&mut output, page.paths, nul)?;
+                    if !page.validated_at_start_and_finish { return Err(io::Error::new(io::ErrorKind::WouldBlock, "sorted snapshot pending")); }
+                    if page.complete {
+                        return output.flush();
+                    }
+                }
+            }
+            if validated { Ok(()) } else { Err(io::Error::new(io::ErrorKind::WouldBlock, "counted snapshot pending")) }
+        })?;
+    eprintln!("engine,command={name},started=true");
+    Ok(Task {
+        cancel,
+        worker,
+        name,
+    })
+}
 fn owner_progress(startup: &mut StartupTiming, owner: &MonitorOwner) {
     startup.observe_progress(owner.view().status, owner.metrics().scanned_entries);
 }
@@ -265,8 +334,9 @@ pub(super) fn watch(
             }
             let (name, raw) = line.split_once(' ').unwrap_or((line, ""));
             match name {
-                "query" | "export" => {
+                "query" | "export" | "count" | "sort" => {
                     if task.is_some() { report(name, Err(io::Error::new(io::ErrorKind::WouldBlock, "one foreground query/export is already active; cancel it first"))); }
+                    else if matches!(name, "count" | "sort") { task = Some(spawn_job(handle.clone(), raw.to_owned(), nul, name == "sort")?); }
                     else { task = Some(spawn_task(handle.clone(), raw.to_owned(), nul, name == "export")?); }
                 }
                 "status" => {
@@ -285,7 +355,7 @@ pub(super) fn watch(
                     startup = StartupTiming::new();
                     report("rebuild", owner.request_rebuild().and_then(|request| request.wait(Duration::from_secs(2))));
                 }
-                _ => report("invalid", Err(io::Error::new(io::ErrorKind::InvalidInput, "watch commands: query QUERY | export QUERY | status | rebuild | cancel | save | stop"))),
+                _ => report("invalid", Err(io::Error::new(io::ErrorKind::InvalidInput, "watch commands: query QUERY | export QUERY | count QUERY | sort QUERY | status | rebuild | cancel | save | stop"))),
             }
         }
         Ok(())

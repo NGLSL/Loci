@@ -13,10 +13,12 @@ use std::time::Instant;
 
 pub use crate::live::Status;
 mod owner;
+mod query_job;
 pub use owner::{
     MonitorOwner, MonitorRequest, MONITOR_COMMAND_CAPACITY, MONITOR_OWNER_CAPACITY,
     MONITOR_POLL_INTERVAL,
 };
+pub use query_job::{QueryJob, QueryJobState, MAX_QUERY_WORKERS};
 
 #[cfg(target_os = "linux")]
 mod scale;
@@ -36,6 +38,8 @@ pub struct ScaleBudgets {
     pub max_retained_bytes: usize,
     pub max_queue_bytes: usize,
     pub max_leases: usize,
+    /// Total matched-ID plus merge scratch capacity for one optional sort job.
+    pub max_sort_bytes: usize,
 }
 impl Default for ScaleBudgets {
     fn default() -> Self {
@@ -46,6 +50,7 @@ impl Default for ScaleBudgets {
             max_retained_bytes: 384 * 1024 * 1024,
             max_queue_bytes: 16 * 1024 * 1024,
             max_leases: 8,
+            max_sort_bytes: 16 * 1024 * 1024,
         }
     }
 }
