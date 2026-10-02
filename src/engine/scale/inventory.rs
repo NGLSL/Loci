@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use crate::engine::ScaleBudgets;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -25,10 +26,26 @@ pub(super) struct Entry {
     offset: u32,
     length: u32,
 }
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct Segment {
     entries: Vec<Entry>,
     names: Vec<u8>,
+}
+impl Clone for Segment {
+    fn clone(&self) -> Self {
+        let mut entries = Vec::with_capacity(self.entries.capacity());
+        entries.extend_from_slice(&self.entries);
+        let mut names = Vec::with_capacity(self.names.capacity());
+        names.extend_from_slice(&self.names);
+        Self { entries, names }
+    }
+}
+impl Segment {
+    fn allocated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.entries.capacity() * std::mem::size_of::<Entry>()
+            + self.names.capacity()
+    }
 }
 #[derive(Clone)]
 pub(super) struct Data {
@@ -37,6 +54,19 @@ pub(super) struct Data {
     pub epoch: u64,
 }
 impl Data {
+    pub fn allocated_bytes(&self) -> usize {
+        self.accounted_bytes(&mut HashSet::new())
+    }
+    pub fn accounted_bytes(&self, seen: &mut HashSet<usize>) -> usize {
+        std::mem::size_of::<Self>()
+            + self.segments.capacity() * std::mem::size_of::<Arc<Segment>>()
+            + self
+                .segments
+                .iter()
+                .filter(|segment| seen.insert(Arc::as_ptr(segment) as usize))
+                .map(|segment| segment.allocated_bytes())
+                .sum::<usize>()
+    }
     pub fn entry(&self, id: EntryId) -> &Entry {
         &self.segments[id as usize / BLOCK].entries[id as usize % BLOCK]
     }
@@ -63,6 +93,11 @@ pub(super) struct Inventory {
     pub touched: usize,
     pub copied_entries: usize,
     pub copied_segments: usize,
+    pub name_bytes: usize,
+    children: HashMap<EntryId, Vec<EntryId>>,
+    positions: Vec<usize>,
+    budgets: ScaleBudgets,
+    allocation_credit: usize,
 }
 fn hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, byte| {
@@ -70,8 +105,13 @@ fn hash(bytes: &[u8]) -> u64 {
     })
 }
 impl Inventory {
-    pub fn new(epoch: u64) -> Self {
-        let mut out = Self {
+    pub fn new(epoch: u64, budgets: ScaleBudgets) -> io::Result<Self> {
+        let mut out = Self::empty(epoch, budgets);
+        out.insert(0, b"", Kind::Directory, 0, 0)?;
+        Ok(out)
+    }
+    pub fn empty(epoch: u64, budgets: ScaleBudgets) -> Self {
+        Self {
             data: Data {
                 segments: vec![],
                 slots: 0,
@@ -84,9 +124,34 @@ impl Inventory {
             touched: 0,
             copied_entries: 0,
             copied_segments: 0,
-        };
-        out.insert(0, b"", Kind::Directory, 0, 0).unwrap();
-        out
+            name_bytes: 0,
+            children: HashMap::new(),
+            positions: vec![],
+            budgets,
+            allocation_credit: budgets.max_retained_bytes,
+        }
+    }
+    pub fn set_allocation_credit(&mut self, credit: usize) {
+        self.allocation_credit = credit;
+    }
+    fn credit(&mut self, bytes: usize) -> io::Result<()> {
+        if bytes > self.allocation_credit {
+            return Err(io::Error::other("retained snapshot byte budget exhausted"));
+        }
+        self.allocation_credit -= bytes;
+        Ok(())
+    }
+    fn allocation(&mut self, bytes: usize) -> io::Result<()> {
+        if self.data.allocated_bytes().saturating_add(bytes) > self.budgets.max_snapshot_bytes {
+            return Err(io::Error::other("snapshot byte budget exhausted"));
+        }
+        self.credit(bytes)
+    }
+    fn name_budget(&self, bytes: usize) -> io::Result<()> {
+        if self.name_bytes.saturating_add(bytes) > self.budgets.max_name_bytes {
+            return Err(io::Error::other("scale name byte budget exhausted"));
+        }
+        Ok(())
     }
     pub fn child(&self, parent: EntryId, name: &[u8]) -> Option<EntryId> {
         let key = (parent, hash(name));
@@ -123,12 +188,31 @@ impl Inventory {
         dev: u64,
         ino: u64,
     ) -> io::Result<EntryId> {
+        if self.data.slots >= self.budgets.max_slots {
+            return Err(io::Error::other("scale physical slot budget exhausted"));
+        }
+        self.name_budget(name.len())?;
         let id = u32::try_from(self.data.slots)
             .map_err(|_| io::Error::other("scale entry ID budget exhausted"))?;
         if self.data.slots.is_multiple_of(BLOCK) {
-            self.data.segments.push(Arc::new(Segment::default()));
+            if self.data.segments.len() == self.data.segments.capacity() {
+                let target = (self.data.segments.capacity() * 2).max(4);
+                self.allocation(
+                    (target - self.data.segments.capacity()) * std::mem::size_of::<Arc<Segment>>(),
+                )?;
+                self.data
+                    .segments
+                    .reserve_exact(target - self.data.segments.len());
+            }
+            self.allocation(BLOCK * std::mem::size_of::<Entry>() + std::mem::size_of::<Segment>())?;
+            self.data.segments.push(Arc::new(Segment {
+                entries: Vec::with_capacity(BLOCK),
+                names: vec![],
+            }));
         }
-        let segment = self.segment_mut(self.data.segments.len() - 1);
+        let block = self.data.segments.len() - 1;
+        self.reserve_names(block, name.len())?;
+        let segment = self.segment_mut(block)?;
         let offset = u32::try_from(segment.names.len())
             .map_err(|_| io::Error::other("scale name arena exhausted"))?;
         let length = u32::try_from(name.len())
@@ -147,10 +231,16 @@ impl Inventory {
             length,
         });
         self.data.slots += 1;
+        self.name_bytes += name.len();
         self.touched += 1;
         if id != 0 {
             self.add_lookup(parent, name, id);
+            let siblings = self.children.entry(parent).or_default();
+            self.positions.push(siblings.len());
+            siblings.push(id);
             self.entries += 1;
+        } else {
+            self.positions.push(0);
         }
         if kind == Kind::Directory {
             self.directories += 1;
@@ -180,45 +270,76 @@ impl Inventory {
             self.collisions.remove(&key);
         }
     }
-    fn edit(&mut self, id: EntryId) -> &mut Entry {
+    fn edit(&mut self, id: EntryId) -> io::Result<&mut Entry> {
         self.touched += 1;
-        &mut self.segment_mut(id as usize / BLOCK).entries[id as usize % BLOCK]
+        Ok(&mut self.segment_mut(id as usize / BLOCK)?.entries[id as usize % BLOCK])
     }
-    fn segment_mut(&mut self, block: usize) -> &mut Segment {
+    fn segment_mut(&mut self, block: usize) -> io::Result<&mut Segment> {
         if Arc::strong_count(&self.data.segments[block]) > 1 {
+            self.credit(self.data.segments[block].allocated_bytes())?;
             self.copied_segments += 1;
             self.copied_entries += self.data.segments[block].entries.len();
         }
-        Arc::make_mut(&mut self.data.segments[block])
+        Ok(Arc::make_mut(&mut self.data.segments[block]))
+    }
+    fn reserve_names(&mut self, block: usize, extra: usize) -> io::Result<()> {
+        let segment = &self.data.segments[block];
+        let required = segment
+            .names
+            .len()
+            .checked_add(extra)
+            .ok_or_else(|| io::Error::other("name arena overflow"))?;
+        if required > segment.names.capacity() {
+            let target = (segment.names.capacity() * 2).max(required).max(64);
+            self.allocation(target - segment.names.capacity())?;
+            let segment = self.segment_mut(block)?;
+            segment.names.reserve_exact(target - segment.names.len());
+        }
+        Ok(())
+    }
+    fn detach_child(&mut self, parent: EntryId, id: EntryId) {
+        let siblings = self.children.get_mut(&parent).unwrap();
+        let position = self.positions[id as usize];
+        siblings.swap_remove(position);
+        if let Some(moved) = siblings.get(position) {
+            self.positions[*moved as usize] = position;
+        }
     }
     pub fn reset_work(&mut self) {
         self.touched = 0;
         self.copied_entries = 0;
         self.copied_segments = 0;
     }
-    pub fn remove(&mut self, id: EntryId) {
+    pub fn remove(&mut self, id: EntryId) -> io::Result<()> {
         if id == 0 || !self.data.entry(id).alive {
-            return;
+            return Ok(());
         }
         if self.data.entry(id).kind == Kind::Directory {
-            let children: Vec<_> = (1..self.data.slots as u32)
-                .filter(|child| {
-                    self.data.entry(*child).alive && self.data.entry(*child).parent == id
-                })
-                .collect();
-            for child in children {
-                self.remove(child);
+            while let Some(child) = self.children.get(&id).and_then(|ids| ids.last()).copied() {
+                self.remove(child)?;
             }
+            self.children.remove(&id);
             self.directories -= 1;
         }
+        self.detach_child(self.data.entry(id).parent, id);
         self.remove_lookup(id);
-        self.edit(id).alive = false;
+        self.edit(id)?.alive = false;
         self.entries -= 1;
+        Ok(())
     }
     pub fn rename(&mut self, id: EntryId, parent: EntryId, name: &[u8]) -> io::Result<()> {
+        self.name_budget(name.len())?;
+        self.reserve_names(id as usize / BLOCK, name.len())?;
+        let previous_parent = self.data.entry(id).parent;
+        if previous_parent != parent {
+            self.detach_child(previous_parent, id);
+            let siblings = self.children.entry(parent).or_default();
+            self.positions[id as usize] = siblings.len();
+            siblings.push(id);
+        }
         self.remove_lookup(id);
         self.touched += 1;
-        let segment = self.segment_mut(id as usize / BLOCK);
+        let segment = self.segment_mut(id as usize / BLOCK)?;
         let offset = u32::try_from(segment.names.len())
             .map_err(|_| io::Error::other("scale name arena exhausted"))?;
         let length = u32::try_from(name.len())
@@ -231,6 +352,7 @@ impl Inventory {
         entry.parent = parent;
         entry.offset = offset;
         entry.length = length;
+        self.name_bytes += name.len();
         self.add_lookup(parent, name, id);
         Ok(())
     }

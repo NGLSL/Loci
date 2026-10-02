@@ -33,6 +33,7 @@ pub(super) struct Runtime {
     inventory: Inventory,
     scan: Option<Scan>,
     pending: Vec<Change>,
+    pending_bytes: usize,
     correction: bool,
     stopped: bool,
     generation: u64,
@@ -44,7 +45,7 @@ pub(super) struct Runtime {
 impl Runtime {
     pub fn new(root: &Path, source: Source, options: EngineOptions) -> io::Result<Self> {
         if options.limits.entries == 0
-            || options.limits.entries > 4096
+            || options.limits.entries > 1_000_000
             || options.limits.directories == 0
             || options.limits.directories > 65536
             || options.limits.depth == 0
@@ -66,22 +67,73 @@ impl Runtime {
         for exclusion in &options.exclusions {
             crate::incremental::valid(exclusion)?;
         }
+        if options.scale_budgets.max_slots < 2
+            || options.scale_budgets.max_slots > u32::MAX as usize
+            || options.scale_budgets.max_name_bytes == 0
+            || options.scale_budgets.max_snapshot_bytes == 0
+            || options.scale_budgets.max_retained_bytes < options.scale_budgets.max_snapshot_bytes
+            || options.scale_budgets.max_queue_bytes == 0
+            || !(1..=crate::live::MAX_LEASES).contains(&options.scale_budgets.max_leases)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid scale memory/query budgets",
+            ));
+        }
+        let budgets = options.scale_budgets;
         Ok(Self {
             root: root.to_path_buf(),
             scope: scope::Scope::read(root)?,
             source,
             options,
-            inventory: Inventory::new(0),
+            inventory: Inventory::empty(0, budgets),
             scan: None,
             pending: vec![],
+            pending_bytes: 0,
             correction: true,
             stopped: false,
             generation: 1,
             retry_after: None,
             failures: 0,
-            store: query::Store::new(),
+            store: query::Store::new(budgets),
             metrics: Metrics::default(),
         })
+    }
+    fn clear_pending(&mut self) {
+        self.pending.clear();
+        self.pending_bytes = 0;
+    }
+    fn change_bytes(change: &Change) -> usize {
+        std::mem::size_of::<Change>()
+            + match change {
+                Change::Refresh(path) | Change::Remove(path) => path.as_os_str().as_bytes().len(),
+                Change::Rename { from, to } => {
+                    from.as_os_str().as_bytes().len() + to.as_os_str().as_bytes().len()
+                }
+            }
+    }
+    fn update_resources(&self) {
+        let mut resources = self.source.resources();
+        resources.queued_events += self.pending.len();
+        resources.queue_limit += self.options.limits.queue;
+        resources.queued_event_bytes += self.pending_bytes;
+        resources.queue_byte_limit += self.options.scale_budgets.max_queue_bytes;
+        let inventory = self
+            .scan
+            .as_ref()
+            .map_or(&self.inventory, |scan| &scan.inventory);
+        resources.inventory_slots = inventory.data.slots;
+        resources.inventory_name_bytes = inventory.name_bytes;
+        resources.snapshot_bytes = inventory.data.allocated_bytes();
+        resources.retained_snapshot_bytes = self.store.retained_bytes(
+            &self.inventory.data,
+            self.scan.as_ref().map(|scan| &scan.inventory.data),
+        );
+        resources.slot_limit = self.options.scale_budgets.max_slots;
+        resources.name_byte_limit = self.options.scale_budgets.max_name_bytes;
+        resources.snapshot_byte_limit = self.options.scale_budgets.max_snapshot_bytes;
+        resources.retained_byte_limit = self.options.scale_budgets.max_retained_bytes;
+        self.store.resources(resources);
     }
     pub fn check_selected_mount(&self, selected: &std::fs::File) -> io::Result<()> {
         if scope::mount_id(selected)? != self.scope.root_mount {
@@ -103,7 +155,7 @@ impl Runtime {
             self.generation += 1;
             self.correction = true;
             self.scan = None;
-            self.pending.clear();
+            self.clear_pending();
             self.store.status(Status::Pending);
         }
         Ok(())
@@ -135,7 +187,7 @@ impl Runtime {
                 errno: error.raw_os_error(),
             });
         }
-        self.store.resources(self.source.resources());
+        self.update_resources();
         self.failures += 1;
         self.retry_after = Some(Instant::now() + Duration::from_millis(250));
         self.store.status(Status::Failed(
@@ -146,11 +198,11 @@ impl Runtime {
     }
     pub fn stop(&mut self) -> io::Result<()> {
         self.stopped = true;
-        self.pending.clear();
+        self.clear_pending();
         self.scan = None;
         self.store.status(Status::Stopped);
         let result = self.source.stop();
-        self.store.resources(self.source.resources());
+        self.update_resources();
         result
     }
     fn excluded(&self, relative: &Path) -> bool {
@@ -162,12 +214,12 @@ impl Runtime {
     fn capture(&mut self) -> io::Result<()> {
         self.update_scope()?;
         let batch = self.source.poll()?;
-        self.store.resources(self.source.resources());
+        self.update_resources();
         if batch.state == SourceState::Stopped {
             return self.stop();
         }
         if !batch.losses.is_empty() {
-            self.pending.clear();
+            self.clear_pending();
             self.scan = None;
             self.correction = true;
             self.generation += 1;
@@ -186,14 +238,20 @@ impl Runtime {
         if !batch.changes.is_empty() {
             self.generation += 1;
             self.store.status(Status::Pending);
-            if self.pending.len().saturating_add(batch.changes.len()) > self.options.limits.queue {
-                self.pending.clear();
+            let bytes = batch.changes.iter().map(Self::change_bytes).sum::<usize>();
+            if self.pending.len().saturating_add(batch.changes.len()) > self.options.limits.queue
+                || self.pending_bytes.saturating_add(bytes)
+                    > self.options.scale_budgets.max_queue_bytes
+            {
+                self.clear_pending();
                 self.scan = None;
                 self.correction = true;
             } else {
+                self.pending_bytes += bytes;
                 self.pending.extend(batch.changes);
             }
         }
+        self.update_resources();
         Ok(())
     }
     pub fn poll(&mut self) -> io::Result<bool> {
@@ -218,7 +276,10 @@ impl Runtime {
         }
         let generation = self.generation;
         self.inventory.reset_work();
+        self.inventory
+            .set_allocation_credit(self.store.allocation_credit(&self.inventory.data, None)?);
         let changes = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
         if crate::incremental::requires_reconcile(&self.root, &changes, &mut self.metrics)? {
             self.correction = true;
             return Ok(false);
@@ -244,15 +305,20 @@ impl Runtime {
         self.metrics.last_touched_entries = self.inventory.touched;
         self.metrics.last_copied_entries = self.inventory.copied_entries;
         self.metrics.last_copied_segments = self.inventory.copied_segments;
-        Ok(self.store.publish(self.inventory.data.clone()))
+        let published = self.store.publish(self.inventory.data.clone())?;
+        self.update_resources();
+        Ok(published)
     }
     fn correct(&mut self) -> io::Result<bool> {
         if self.scan.is_none() {
             self.source.begin_reconcile()?;
-            self.pending.clear();
+            self.clear_pending();
             self.metrics.full_scans += 1;
             self.scan = Some(Scan {
-                inventory: Inventory::new(self.inventory.data.epoch + 1),
+                inventory: Inventory::new(
+                    self.inventory.data.epoch + 1,
+                    self.options.scale_budgets,
+                )?,
                 todo: vec![Directory {
                     id: 0,
                     path: self.root.clone(),
@@ -263,6 +329,10 @@ impl Runtime {
             });
         }
         let mut scan = self.scan.take().unwrap();
+        scan.inventory.set_allocation_credit(
+            self.store
+                .allocation_credit(&self.inventory.data, Some(&scan.inventory.data))?,
+        );
         let mut processed = 0;
         while processed < self.options.scan_batch {
             if scan.current.is_none() {
@@ -275,7 +345,7 @@ impl Runtime {
                 self.source
                     .before_directory(&directory.path)
                     .map_err(|error| self.scoped_error(&directory.path, error))?;
-                self.store.resources(self.source.resources());
+                self.update_resources();
                 let listing = fs::read_dir(&directory.path)
                     .map_err(|error| self.scoped_error(&directory.path, error))?;
                 scan.current = Some((directory, listing));
@@ -298,6 +368,9 @@ impl Runtime {
                 continue;
             };
             let name = child.file_name();
+            if scan.inventory.entries >= self.options.limits.entries {
+                return Err(io::Error::other("scale live entry budget exhausted"));
+            }
             let id = scan.inventory.insert(
                 directory.id,
                 name.as_bytes(),
@@ -329,6 +402,7 @@ impl Runtime {
         }
         if scan.current.is_some() || !scan.todo.is_empty() {
             self.scan = Some(scan);
+            self.update_resources();
             return Ok(false);
         }
         self.inventory = scan.inventory;
@@ -336,7 +410,9 @@ impl Runtime {
         self.failures = 0;
         self.retry_after = None;
         self.store.clear_gaps();
-        Ok(self.store.publish(self.inventory.data.clone()))
+        let published = self.store.publish(self.inventory.data.clone())?;
+        self.update_resources();
+        Ok(published)
     }
     fn inspect(&mut self, relative: &Path) -> io::Result<Option<(Kind, Metadata)>> {
         if self.excluded(relative) {
@@ -370,7 +446,7 @@ impl Runtime {
             if self.inventory.data.entry(id).kind == Kind::Directory {
                 self.source.topology(Topology::Remove(path.to_path_buf()))?;
             }
-            self.inventory.remove(id);
+            self.inventory.remove(id)?;
             self.metrics.changed_paths += 1;
         }
         Ok(())

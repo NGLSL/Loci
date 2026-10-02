@@ -22,6 +22,28 @@ pub enum EngineMode {
     Bounded,
     Scale,
 }
+/// Physical inventory and retained snapshot bounds, independently of live rows.
+#[derive(Clone, Copy, Debug)]
+pub struct ScaleBudgets {
+    pub max_slots: usize,
+    pub max_name_bytes: usize,
+    pub max_snapshot_bytes: usize,
+    pub max_retained_bytes: usize,
+    pub max_queue_bytes: usize,
+    pub max_leases: usize,
+}
+impl Default for ScaleBudgets {
+    fn default() -> Self {
+        Self {
+            max_slots: 2_000_001,
+            max_name_bytes: 128 * 1024 * 1024,
+            max_snapshot_bytes: 192 * 1024 * 1024,
+            max_retained_bytes: 384 * 1024 * 1024,
+            max_queue_bytes: 16 * 1024 * 1024,
+            max_leases: 8,
+        }
+    }
+}
 /// Explicit opt-in. Bounded behavior and format remain the default on both OSes.
 #[derive(Clone, Debug)]
 pub struct EngineOptions {
@@ -33,6 +55,7 @@ pub struct EngineOptions {
     /// Scale-only actual native watch budget, including the selected root.
     pub watch_limit: usize,
     pub event_limits: EventLimits,
+    pub scale_budgets: ScaleBudgets,
 }
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -43,6 +66,7 @@ impl Default for EngineOptions {
             exclusions: Vec::new(),
             watch_limit: 32768,
             event_limits: EventLimits::default(),
+            scale_budgets: ScaleBudgets::default(),
         }
     }
 }
@@ -51,9 +75,11 @@ impl EngineOptions {
         Self {
             mode: EngineMode::Scale,
             limits: Limits {
+                entries: 1_000_000,
                 directories: 32768,
                 ..Limits::default()
             },
+            scan_batch: 4096,
             ..Self::default()
         }
     }
@@ -90,6 +116,14 @@ pub struct Resources {
     pub queued_event_bytes: usize,
     pub queue_byte_limit: usize,
     pub event_buffer_bytes: usize,
+    pub inventory_slots: usize,
+    pub inventory_name_bytes: usize,
+    pub snapshot_bytes: usize,
+    pub retained_snapshot_bytes: usize,
+    pub slot_limit: usize,
+    pub name_byte_limit: usize,
+    pub snapshot_byte_limit: usize,
+    pub retained_byte_limit: usize,
 }
 #[derive(Clone, Debug)]
 pub struct View {

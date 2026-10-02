@@ -7,7 +7,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HELP: &str = "Real directory commands (public Engine, not synthetic data):
   engine build ROOT DATABASE
@@ -25,6 +25,7 @@ Results go to stdout (escaped Rust strings, or exact NUL-delimited paths with --
 Status and errors go to stderr. Validated means last reliable observation, not perpetual freshness.
 Exit codes: 0 success, 2 invalid arguments, 3 failure, 4 pending/incomplete results.
 All engine commands accept --scale [--exclude RELATIVE_PATH] (repeatable).
+Scale limits can be selected with --entries N --directories N --scan-batch N.
 Scale mode preserves raw names and lists symlinks without following targets; defaults to
 no configured exclusions and no descent across nested mount points. Scale checkpoints
 are currently unsupported; transient query/status work, saving reports Unsupported.
@@ -62,6 +63,7 @@ fn run(args: &[OsString]) -> io::Result<()> {
     let root = Path::new(&args[1]);
     let database = Path::new(&args[2]);
     let mut engine = Engine::open_with_options(root, Some(database), options.clone())?;
+    wait_for_snapshot(&mut engine)?;
     if action == "watch" {
         return watch(engine, root, database, nul, options);
     }
@@ -98,6 +100,7 @@ fn query_options(
     let mut size_given = false;
     let mut scale = false;
     let mut options = EngineOptions::default();
+    let mut limits = [None; 3];
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str().unwrap_or("") {
@@ -117,6 +120,32 @@ fn query_options(
                             "--exclude requires a relative path",
                         )
                     })?);
+            }
+            "--entries" | "--directories" | "--scan-batch" => {
+                let slot = match args[i].to_str().unwrap() {
+                    "--entries" => 0,
+                    "--directories" => 1,
+                    _ => 2,
+                };
+                if limits[slot].is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "duplicate scale limit",
+                    ));
+                }
+                i += 1;
+                limits[slot] = Some(
+                    args.get(i)
+                        .and_then(|value| value.to_str())
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "scale limit requires a positive integer",
+                            )
+                        })?,
+                );
             }
             "--page-size" if !size_given && action == "query" => {
                 i += 1;
@@ -146,6 +175,22 @@ fn query_options(
             exclusions,
             ..EngineOptions::scale()
         };
+        if let Some(entries) = limits[0] {
+            options.limits.entries = entries;
+        }
+        if let Some(directories) = limits[1] {
+            options.limits.directories = directories;
+            options.watch_limit = directories;
+        }
+        if let Some(batch) = limits[2] {
+            options.scan_batch = batch;
+        }
+    }
+    if !scale && limits.iter().any(Option::is_some) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "scale limits require --scale",
+        ));
     }
     if !options.exclusions.is_empty() && !scale {
         return Err(io::Error::new(
@@ -154,6 +199,25 @@ fn query_options(
         ));
     }
     Ok((nul, all, page_size, options))
+}
+
+fn wait_for_snapshot(engine: &mut Engine) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while engine.view().version == 0 {
+        if let Status::Failed(error) = engine.view().status {
+            coverage(&engine.query());
+            return Err(io::Error::other(error));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "initial build is still pending",
+            ));
+        }
+        engine.poll()?;
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
 }
 
 fn export(handle: &QueryHandle, raw: &str, nul: bool, page_size: usize) -> io::Result<()> {
@@ -196,6 +260,7 @@ fn coverage(handle: &QueryHandle) {
             resources.process_watches, resources.process_watch_limit, resources.inotify_fds,
             resources.process_inotify_fds, resources.process_fd_limit, resources.queued_events,
             resources.queue_limit, resources.queued_event_bytes, resources.queue_byte_limit, resources.event_buffer_bytes);
+        eprintln!("engine,inventory_slots={}/{},inventory_name_bytes={}/{},snapshot_bytes={}/{},retained_snapshot_bytes={}/{}", resources.inventory_slots, resources.slot_limit, resources.inventory_name_bytes, resources.name_byte_limit, resources.snapshot_bytes, resources.snapshot_byte_limit, resources.retained_snapshot_bytes, resources.retained_byte_limit);
     }
     for gap in &view.coverage_gaps {
         eprintln!(
@@ -358,6 +423,7 @@ fn watch(
                     // Opening the public Engine performs a new root reconciliation.
                     engine.stop()?;
                     engine = Engine::open_with_options(root, Some(database), options.clone())?;
+                    wait_for_snapshot(&mut engine)?;
                     failed = false;
                     ("rebuild", status(&engine.query()))
                 }

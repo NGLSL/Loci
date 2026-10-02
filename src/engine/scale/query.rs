@@ -1,6 +1,7 @@
 use super::inventory::{Data, Kind};
 use crate::engine::{QueryPage, QueryResult, Status, View, MAX_PAGE_SIZE};
 use crate::index::Query;
+use std::collections::HashSet;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -14,6 +15,7 @@ struct Shared {
     snapshot: Option<Arc<Snapshot>>,
     retired: Weak<Snapshot>,
     view: View,
+    budgets: crate::engine::ScaleBudgets,
 }
 #[derive(Clone)]
 pub(crate) struct Handle {
@@ -34,12 +36,13 @@ pub(crate) struct Store {
     pub handle: Handle,
 }
 impl Store {
-    pub fn new() -> Self {
+    pub fn new(budgets: crate::engine::ScaleBudgets) -> Self {
         Self {
             handle: Handle {
                 shared: Arc::new(Mutex::new(Shared {
                     snapshot: None,
                     retired: Weak::new(),
+                    budgets,
                     view: View {
                         version: 0,
                         status: Status::Empty,
@@ -50,6 +53,36 @@ impl Store {
                 })),
             },
         }
+    }
+    pub(super) fn retained_bytes(&self, writer: &Data, candidate: Option<&Data>) -> usize {
+        let shared = self.handle.shared.lock().unwrap();
+        let mut seen = HashSet::new();
+        let mut bytes = writer.accounted_bytes(&mut seen);
+        if let Some(candidate) = candidate {
+            bytes += candidate.accounted_bytes(&mut seen);
+        }
+        if let Some(current) = &shared.snapshot {
+            bytes += current.data.accounted_bytes(&mut seen);
+        }
+        if let Some(retired) = shared.retired.upgrade() {
+            bytes += retired.data.accounted_bytes(&mut seen);
+        }
+        bytes
+    }
+    pub(super) fn allocation_credit(
+        &self,
+        writer: &Data,
+        candidate: Option<&Data>,
+    ) -> io::Result<usize> {
+        let bytes = self.retained_bytes(writer, candidate);
+        self.handle
+            .shared
+            .lock()
+            .unwrap()
+            .budgets
+            .max_retained_bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| io::Error::other("retained snapshot byte budget exhausted"))
     }
     pub fn status(&self, status: Status) {
         self.handle.shared.lock().unwrap().view.status = status;
@@ -81,11 +114,15 @@ impl Store {
             true
         }
     }
-    pub(super) fn publish(&self, data: Data) -> bool {
+    pub(super) fn publish(&self, data: Data) -> io::Result<bool> {
         if !self.ready() {
-            return false;
+            return Ok(false);
         }
+        self.allocation_credit(&data, None)?;
         let mut shared = self.handle.shared.lock().unwrap();
+        if data.allocated_bytes() > shared.budgets.max_snapshot_bytes {
+            return Err(io::Error::other("snapshot byte budget exhausted"));
+        }
         shared.view.version += 1;
         let version = shared.view.version;
         if let Some(old) = shared.snapshot.take() {
@@ -93,7 +130,7 @@ impl Store {
         }
         shared.snapshot = Some(Arc::new(Snapshot { data, version }));
         shared.view.status = Status::Validated;
-        true
+        Ok(true)
     }
 }
 impl Handle {
@@ -102,7 +139,7 @@ impl Handle {
     }
     pub fn lease(&self) -> io::Result<Lease> {
         let mut shared = self.shared.lock().unwrap();
-        if shared.view.leases >= crate::live::MAX_LEASES {
+        if shared.view.leases >= shared.budgets.max_leases {
             return Err(io::Error::other("query lease budget exhausted"));
         }
         let snapshot = shared

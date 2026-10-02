@@ -39,6 +39,7 @@ impl LinuxEvents {
             queued_event_bytes: self.pending.iter().map(|event| 16 + event.name.len()).sum(),
             queue_byte_limit: self.limits.max_events().saturating_mul(16 + 4096),
             event_buffer_bytes: self.limits.buffer_bytes(),
+            ..crate::engine::Resources::default()
         }
     }
     pub(crate) fn open(root: &Path, limits: EventLimits) -> io::Result<Self> {
