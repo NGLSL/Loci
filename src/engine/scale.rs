@@ -3,7 +3,7 @@
 mod inventory;
 pub(super) mod query;
 mod scope;
-use super::{EngineOptions, Source, Status};
+use super::{CoverageGap, CoverageGapKind, EngineOptions, Source, Status};
 use crate::events::{Change, EventSource, SourceState};
 use crate::incremental::{Metrics, Topology};
 use inventory::{EntryId, Inventory, Kind};
@@ -12,6 +12,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 struct Directory {
     id: EntryId,
@@ -35,12 +36,27 @@ pub(super) struct Runtime {
     correction: bool,
     stopped: bool,
     generation: u64,
+    retry_after: Option<Instant>,
+    failures: usize,
     pub store: query::Store,
     pub metrics: Metrics,
 }
 impl Runtime {
     pub fn new(root: &Path, source: Source, options: EngineOptions) -> io::Result<Self> {
-        crate::incremental::validate_limits(options.limits)?;
+        if options.limits.entries == 0
+            || options.limits.entries > 4096
+            || options.limits.directories == 0
+            || options.limits.directories > 65536
+            || options.limits.depth == 0
+            || options.limits.depth > 256
+            || options.limits.queue == 0
+            || options.limits.queue > 65536
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scale limits exceed supported bounds",
+            ));
+        }
         if options.scan_batch == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -61,6 +77,8 @@ impl Runtime {
             correction: true,
             stopped: false,
             generation: 1,
+            retry_after: None,
+            failures: 0,
             store: query::Store::new(),
             metrics: Metrics::default(),
         })
@@ -90,7 +108,36 @@ impl Runtime {
         }
         Ok(())
     }
+    fn scoped_error(&self, path: &Path, error: io::Error) -> io::Error {
+        let kind = if error.raw_os_error() == Some(28) {
+            CoverageGapKind::KernelWatchLimit
+        } else if error.kind() == io::ErrorKind::PermissionDenied {
+            CoverageGapKind::Permission
+        } else if error.to_string().contains("budget") {
+            CoverageGapKind::WatchBudget
+        } else {
+            CoverageGapKind::Scan
+        };
+        self.store.gap(CoverageGap {
+            path: path.to_path_buf(),
+            kind,
+            error: error.to_string(),
+            errno: error.raw_os_error(),
+        });
+        error
+    }
     pub fn fail(&mut self, error: &io::Error) {
+        if self.store.handle.view().coverage_gaps.is_empty() {
+            self.store.gap(CoverageGap {
+                path: self.root.clone(),
+                kind: CoverageGapKind::Source,
+                error: error.to_string(),
+                errno: error.raw_os_error(),
+            });
+        }
+        self.store.resources(self.source.resources());
+        self.failures += 1;
+        self.retry_after = Some(Instant::now() + Duration::from_millis(250));
         self.store.status(Status::Failed(
             error.to_string().chars().take(256).collect(),
         ));
@@ -102,7 +149,9 @@ impl Runtime {
         self.pending.clear();
         self.scan = None;
         self.store.status(Status::Stopped);
-        self.source.stop()
+        let result = self.source.stop();
+        self.store.resources(self.source.resources());
+        result
     }
     fn excluded(&self, relative: &Path) -> bool {
         self.options
@@ -113,6 +162,7 @@ impl Runtime {
     fn capture(&mut self) -> io::Result<()> {
         self.update_scope()?;
         let batch = self.source.poll()?;
+        self.store.resources(self.source.resources());
         if batch.state == SourceState::Stopped {
             return self.stop();
         }
@@ -147,6 +197,9 @@ impl Runtime {
         Ok(())
     }
     pub fn poll(&mut self) -> io::Result<bool> {
+        if self.failures >= 4 || self.retry_after.is_some_and(|after| Instant::now() < after) {
+            return Ok(false);
+        }
         if self.stopped {
             return Ok(false);
         }
@@ -175,6 +228,9 @@ impl Runtime {
                 self.fail(&error);
                 return Ok(false);
             }
+        }
+        if self.correction {
+            return Ok(false);
         }
         self.capture()?;
         if self.stopped {
@@ -216,8 +272,12 @@ impl Runtime {
                 if directory.depth > self.options.limits.depth {
                     return Err(io::Error::other("scale directory depth exhausted"));
                 }
-                self.source.before_directory(&directory.path)?;
-                let listing = fs::read_dir(&directory.path)?;
+                self.source
+                    .before_directory(&directory.path)
+                    .map_err(|error| self.scoped_error(&directory.path, error))?;
+                self.store.resources(self.source.resources());
+                let listing = fs::read_dir(&directory.path)
+                    .map_err(|error| self.scoped_error(&directory.path, error))?;
                 scan.current = Some((directory, listing));
             }
             let (directory, listing) = scan.current.as_mut().unwrap();
@@ -225,13 +285,14 @@ impl Runtime {
                 scan.current = None;
                 continue;
             };
-            let child = child?;
+            let child = child.map_err(|error| self.scoped_error(&directory.path, error))?;
             processed += 1;
             self.metrics.scanned_entries += 1;
             if self.excluded(child.path().strip_prefix(&self.root).unwrap()) {
                 continue;
             }
-            let metadata = fs::symlink_metadata(child.path())?;
+            let metadata = fs::symlink_metadata(child.path())
+                .map_err(|error| self.scoped_error(&child.path(), error))?;
             self.metrics.metadata_calls += 1;
             let Some(kind) = kind(&metadata) else {
                 continue;
@@ -272,6 +333,9 @@ impl Runtime {
         }
         self.inventory = scan.inventory;
         self.correction = false;
+        self.failures = 0;
+        self.retry_after = None;
+        self.store.clear_gaps();
         Ok(self.store.publish(self.inventory.data.clone()))
     }
     fn inspect(&mut self, relative: &Path) -> io::Result<Option<(Kind, Metadata)>> {
@@ -330,9 +394,9 @@ impl Runtime {
         if kind == Kind::Directory {
             // New/moved-in subtrees need watch-before-enumeration. The initial
             // small mode obtains that through correction rather than guessing.
-            return Err(io::Error::other(
-                "new directory requires watched correction",
-            ));
+            self.correction = true;
+            self.store.status(Status::Pending);
+            return Ok(());
         }
         let parent = self
             .inventory

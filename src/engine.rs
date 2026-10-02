@@ -30,6 +30,9 @@ pub struct EngineOptions {
     pub scan_batch: usize,
     /// Explicit relative paths whose entries and descendants are excluded in scale mode.
     pub exclusions: Vec<PathBuf>,
+    /// Scale-only actual native watch budget, including the selected root.
+    pub watch_limit: usize,
+    pub event_limits: EventLimits,
 }
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -38,6 +41,8 @@ impl Default for EngineOptions {
             limits: Limits::default(),
             scan_batch: 256,
             exclusions: Vec::new(),
+            watch_limit: 32768,
+            event_limits: EventLimits::default(),
         }
     }
 }
@@ -45,16 +50,54 @@ impl EngineOptions {
     pub fn scale() -> Self {
         Self {
             mode: EngineMode::Scale,
+            limits: Limits {
+                directories: 32768,
+                ..Limits::default()
+            },
             ..Self::default()
         }
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoverageGapKind {
+    WatchBudget,
+    KernelWatchLimit,
+    Permission,
+    Scan,
+    Source,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverageGap {
+    pub path: PathBuf,
+    pub kind: CoverageGapKind,
+    pub error: String,
+    pub errno: Option<i32>,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Resources {
+    /// True when native scale owner has observed these usage values.
+    pub observed: bool,
+    pub session_watches: usize,
+    pub session_watch_limit: usize,
+    pub process_watches: usize,
+    pub process_watch_limit: usize,
+    pub inotify_fds: usize,
+    pub process_inotify_fds: usize,
+    pub process_fd_limit: usize,
+    pub queued_events: usize,
+    pub queue_limit: usize,
+    pub queued_event_bytes: usize,
+    pub queue_byte_limit: usize,
+    pub event_buffer_bytes: usize,
+}
 #[derive(Clone, Debug)]
 pub struct View {
     pub version: u64,
     pub status: Status,
     pub leases: usize,
+    pub coverage_gaps: Vec<CoverageGap>,
+    pub resources: Resources,
 }
 impl From<live::View> for View {
     fn from(view: live::View) -> Self {
@@ -62,6 +105,8 @@ impl From<live::View> for View {
             version: view.version,
             status: view.status,
             leases: view.leases,
+            coverage_gaps: vec![],
+            resources: Resources::default(),
         }
     }
 }
@@ -301,6 +346,13 @@ impl EventSource for Source {
     }
 }
 impl Source {
+    fn resources(&self) -> Resources {
+        match self {
+            Self::External(_) => Resources::default(),
+            #[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+            Self::Linux(source) => source.resources(),
+        }
+    }
     fn before_directory(&mut self, _path: &Path) -> io::Result<()> {
         match self {
             Self::External(_) => Ok(()),
@@ -355,13 +407,21 @@ impl Engine {
             }
             let root = fs::canonicalize(root)?;
             let identity = RootIdentity::open(&root)?;
-            let source = crate::linux_events::LinuxEvents::open(&root, EventLimits::default())?;
+            let source = crate::linux_events::LinuxEvents::open_scale(
+                &root,
+                options.event_limits,
+                options.watch_limit,
+            )?;
             let mut engine = Self::start_unpolled(root, database, identity, Source::Linux(source))?;
             let source = engine.source.take().unwrap();
             let runtime = scale::Runtime::new(&engine.root, source, options)?;
             runtime.check_selected_mount(&engine.identity.as_ref().unwrap()._file)?;
             engine.scale = Some(runtime);
-            engine.poll()?;
+            if let Err(error) = engine.poll() {
+                if engine.view().coverage_gaps.is_empty() {
+                    return Err(error);
+                }
+            }
             Ok(engine)
         }
         #[cfg(not(target_os = "linux"))]

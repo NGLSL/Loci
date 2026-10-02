@@ -44,6 +44,8 @@ impl Store {
                         version: 0,
                         status: Status::Empty,
                         leases: 0,
+                        coverage_gaps: vec![],
+                        resources: crate::engine::Resources::default(),
                     },
                 })),
             },
@@ -51,6 +53,24 @@ impl Store {
     }
     pub fn status(&self, status: Status) {
         self.handle.shared.lock().unwrap().view.status = status;
+    }
+    pub fn resources(&self, resources: crate::engine::Resources) {
+        self.handle.shared.lock().unwrap().view.resources = resources;
+    }
+    pub fn gap(&self, gap: crate::engine::CoverageGap) {
+        let mut shared = self.handle.shared.lock().unwrap();
+        if shared.view.coverage_gaps.len() < 256 {
+            shared.view.coverage_gaps.push(gap);
+        }
+    }
+    pub fn clear_gaps(&self) {
+        self.handle
+            .shared
+            .lock()
+            .unwrap()
+            .view
+            .coverage_gaps
+            .clear();
     }
     pub fn ready(&self) -> bool {
         let mut shared = self.handle.shared.lock().unwrap();
