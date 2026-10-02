@@ -1,0 +1,243 @@
+use crate::watch::*;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+struct Fixture {
+    base: PathBuf,
+    root: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let work = std::env::current_dir().unwrap().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let base = work.join(format!(
+            "watch-fixture-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&base).unwrap();
+        let root = base.join("data");
+        fs::create_dir(&root).unwrap();
+        Self {
+            base: fs::canonicalize(base).unwrap(),
+            root: fs::canonicalize(root).unwrap(),
+        }
+    }
+    fn inventory(&self) -> Inventory {
+        scan(&self.root, Limits::default(), |_| Ok(()))
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Verify the resolved path is the disposable fixture inside this project's work/.
+        let work = fs::canonicalize(std::env::current_dir().unwrap().join("work")).unwrap();
+        let base = fs::canonicalize(&self.base).unwrap();
+        assert!(
+            base.starts_with(&work)
+                && base
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("watch-fixture-")
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+}
+fn raw(wd: i32, mask: u32, cookie: u32, name: &[u8]) -> Vec<u8> {
+    let mut b = vec![];
+    b.extend(wd.to_ne_bytes());
+    b.extend(mask.to_ne_bytes());
+    b.extend(cookie.to_ne_bytes());
+    b.extend((name.len() as u32).to_ne_bytes());
+    b.extend(name);
+    b
+}
+#[test]
+fn real_add_delete_file_and_directory_rename_reconcile() {
+    let f = Fixture::new();
+    fs::create_dir(f.root.join("old")).unwrap();
+    fs::write(f.root.join("old/a.rs"), "x").unwrap();
+    let mut state = Recovery::new(4);
+    assert!(state.publish(state.ticket(), f.inventory()));
+    fs::write(f.root.join("new.txt"), "x").unwrap();
+    state.signal(Signal::Change);
+    assert!(state.publish(state.ticket(), f.inventory()));
+    assert!(state
+        .inventory
+        .entries
+        .contains_key(&PathBuf::from("new.txt")));
+    fs::rename(f.root.join("old/a.rs"), f.root.join("old/b.rs")).unwrap();
+    state.signal(Signal::Change);
+    assert!(state.publish(state.ticket(), f.inventory()));
+    fs::rename(f.root.join("old"), f.root.join("renamed")).unwrap();
+    state.signal(Signal::Change);
+    assert!(state.publish(state.ticket(), f.inventory()));
+    assert!(!state
+        .inventory
+        .entries
+        .contains_key(&PathBuf::from("old/b.rs")));
+    assert!(state
+        .inventory
+        .entries
+        .contains_key(&PathBuf::from("renamed/b.rs")));
+    fs::remove_file(f.root.join("renamed/b.rs")).unwrap();
+    fs::remove_dir(f.root.join("renamed")).unwrap();
+    state.signal(Signal::Change);
+    assert!(state.publish(state.ticket(), f.inventory()));
+    assert_eq!(state.inventory.entries.len(), 1);
+}
+#[test]
+fn simulated_loss_and_user_queue_overflow_remain_dirty_until_rescan() {
+    let f = Fixture::new();
+    let mut state = Recovery::new(2);
+    assert!(state.publish(state.ticket(), f.inventory()));
+    fs::write(f.root.join("lost.rs"), "x").unwrap(); // Event deliberately never sent.
+    state.signal(Signal::KernelOverflow);
+    assert!(state.dirty);
+    for _ in 0..10 {
+        state.signal(Signal::Change);
+        assert!(state.pending() <= 2);
+    }
+    assert!(state.reasons.contains(&Signal::UserOverflow));
+    assert!(state.reasons.contains(&Signal::KernelOverflow));
+    assert!(state.publish(state.ticket(), f.inventory()));
+    assert!(!state.dirty);
+    assert!(state
+        .inventory
+        .entries
+        .contains_key(&PathBuf::from("lost.rs")));
+}
+#[test]
+fn scan_race_rejects_old_generation_and_keeps_last_good_snapshot() {
+    let f = Fixture::new();
+    fs::write(f.root.join("a"), "x").unwrap();
+    let mut state = Recovery::new(2);
+    assert!(state.publish(state.ticket(), f.inventory()));
+    let ticket = state.ticket();
+    let old = f.inventory();
+    fs::write(f.root.join("racing"), "x").unwrap();
+    state.signal(Signal::Change);
+    assert!(!state.publish(ticket, old));
+    assert!(state.dirty);
+    assert_eq!(state.inventory.entries.len(), 1);
+    assert!(state.publish(state.ticket(), f.inventory()));
+    assert_eq!(state.inventory.entries.len(), 2);
+}
+#[test]
+fn restart_checkpoint_is_stale_and_offline_changes_are_corrected() {
+    let f = Fixture::new();
+    fs::write(f.root.join("old"), "x").unwrap();
+    let file = f.base.join("state.bin");
+    save_checkpoint(&file, &f.root, &f.inventory()).unwrap();
+    fs::remove_file(f.root.join("old")).unwrap();
+    fs::write(f.root.join("while-offline"), "x").unwrap();
+    let loaded = load_checkpoint(&file, &f.root, Limits::default()).unwrap();
+    let mut state = Recovery::restored(loaded, 2);
+    assert!(state.dirty && state.reasons.contains(&Signal::Restart));
+    assert!(state.inventory.entries.contains_key(&PathBuf::from("old")));
+    assert!(state.publish(state.ticket(), f.inventory()));
+    assert_eq!(state.inventory.entries.len(), 1);
+    assert!(state
+        .inventory
+        .entries
+        .contains_key(&PathBuf::from("while-offline")));
+    let mut bytes = fs::read(&file).unwrap();
+    bytes[12] ^= 1;
+    fs::write(&file, bytes).unwrap();
+    assert!(load_checkpoint(&file, &f.root, Limits::default()).is_err());
+}
+#[test]
+fn watch_scan_depth_entry_and_failure_budgets_cannot_publish_partial() {
+    let f = Fixture::new();
+    fs::create_dir(f.root.join("d")).unwrap();
+    fs::write(f.root.join("d/a"), "x").unwrap();
+    fs::write(f.root.join("b"), "x").unwrap();
+    for limits in [
+        Limits {
+            entries: 1,
+            ..Limits::default()
+        },
+        Limits {
+            directories: 1,
+            ..Limits::default()
+        },
+        Limits {
+            depth: 0,
+            ..Limits::default()
+        },
+    ] {
+        let out = scan(&f.root, limits, |_| Ok(()));
+        assert!(!out.complete);
+        let mut state = Recovery::new(1);
+        assert!(!state.publish(state.ticket(), out));
+        assert!(state.dirty);
+        assert!(!state.errors.is_empty());
+    }
+    let out = scan(&f.root, Limits::default(), |_| {
+        Err(std::io::Error::other("injected ENOSPC/permission error"))
+    });
+    assert!(!out.complete);
+}
+#[test]
+fn watcher_callback_precedes_each_directory_enumeration() {
+    let f = Fixture::new();
+    fs::create_dir(f.root.join("child")).unwrap();
+    let mut registered = BTreeSet::new();
+    let out = scan(&f.root, Limits::default(), |dir| {
+        registered.insert(dir.to_path_buf());
+        fs::write(dir.join("after-watch"), "x")?;
+        Ok(())
+    });
+    assert!(out.complete);
+    assert_eq!(registered.len(), 2);
+    assert!(out
+        .entries
+        .contains_key(&PathBuf::from("child/after-watch")));
+}
+#[test]
+fn overflow_wd_minus_one_is_detected_before_unknown_watch() {
+    let batch = decode_events(&raw(-1, IN_Q_OVERFLOW, 0, &[]), 4).unwrap();
+    let mut state = Recovery::new(4);
+    accept_batch(batch, &BTreeSet::new(), &mut state);
+    assert!(state.reasons.contains(&Signal::KernelOverflow));
+    assert!(!state.reasons.contains(&Signal::UnknownWatch));
+}
+#[test]
+fn raw_rename_pair_watch_loss_and_decode_capacity_are_bounded() {
+    let mut bytes = raw(1, 0x40, 99, b"old\0");
+    bytes.extend(raw(2, 0x80, 99, b"new\0"));
+    let batch = decode_events(&bytes, 4).unwrap();
+    assert_eq!(batch.events[0].cookie, batch.events[1].cookie);
+    assert_eq!(batch.events[1].name, b"new");
+    assert!(decode_events(&bytes, 1).unwrap().dropped);
+    assert!(decode_events(&bytes[..10], 4).is_err());
+    assert!(decode_events(&raw(1, 1, 0, b"../escape\0"), 4).is_err());
+    let mut state = Recovery::new(4);
+    accept_batch(
+        decode_events(&raw(7, IN_IGNORED, 0, &[]), 4).unwrap(),
+        &BTreeSet::new(),
+        &mut state,
+    );
+    assert!(state.reasons.contains(&Signal::WatchLost));
+}
+#[test]
+fn non_utf8_linux_event_names_are_preserved_as_bytes() {
+    let batch = decode_events(&raw(1, 0x100, 0, &[0xff, 0xfe, 0]), 4).unwrap();
+    assert_eq!(batch.events[0].name, [0xff, 0xfe]);
+}
+
+#[test]
+fn special_loss_flags_survive_user_batch_truncation() {
+    let mut bytes = raw(1, 0x100, 0, b"a\0");
+    bytes.extend(raw(-1, IN_Q_OVERFLOW, 0, &[]));
+    bytes.extend(raw(2, IN_IGNORED, 0, &[]));
+    let batch = decode_events(&bytes, 1).unwrap();
+    assert!(batch.dropped && batch.kernel_overflow && batch.watch_lost);
+    let mut state = Recovery::new(1);
+    accept_batch(batch, &BTreeSet::from([1]), &mut state);
+    assert!(state.reasons.contains(&Signal::KernelOverflow));
+    assert!(state.reasons.contains(&Signal::WatchLost));
+    assert!(state.reasons.contains(&Signal::UserOverflow));
+}

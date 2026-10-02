@@ -1,0 +1,19 @@
+[package]
+name = "loci-experiment"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.99"
+publish = false
+
+# Isolated from Kite; this experiment makes no standalone license decision.
+[workspace]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+
+
+[features]
+# Allows Windows cargo check to type-check FFI code; never claims Linux execution.
+linux-ffi-check = []

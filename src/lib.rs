@@ -1,0 +1,11 @@
+//! Independent bounded watcher/index snapshot experiment; no Kite integration.
+#[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+pub mod linux_inotify;
+pub mod watch;
+
+#[cfg(test)]
+mod watch_tests;
+
+pub mod index;
+pub mod live;
+mod signatures;

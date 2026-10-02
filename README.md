@@ -1,0 +1,34 @@
+# Loci
+
+Loci 是独立的 Rust 文件名/路径搜索实验，包含紧凑路径记录、块级 trigram 候选过滤、短词摘要及最终精确匹配。实时原型将 Linux inotify 的有界重扫接到不可变查询快照，支持校正状态、取消和并发读者。
+
+项目使用 Rust **1.99.0** 和标准库，无第三方 Cargo 依赖，无 GUI。当前为原型；原生监听仅支持 x86_64 Linux。许可证尚未决定，没有添加 LICENSE 文件。
+
+查询为大小写不敏感的 AND 子串，可使用 `ext:rs` 精确扩展名条件。first50 返回记录顺序前50项，complete 计算完整匹配数并保留前50项；没有相关性排序、全文、拼音或 mmap。
+
+实时原型最多4096项、总UTF-8输入1 MiB；单条路径4096 bytes、查询512 bytes。非UTF-8候选明确失败，旧结果保留并标待校正。最多8查询租约、两代索引；Loci 管理的会话共享128 watches /8 sessions预算。成功尝试冷却250ms，失败退避至多2秒。独立CLI的100k/1M合成记录基准不受实时4096项限制。
+
+```sh
+cargo +1.99.0 fmt --check
+cargo +1.99.0 test --offline
+cargo +1.99.0 test --release --offline
+```
+
+已有 Rust 1.99.0、rustfmt、Bash、timeout、Python3 的 x86_64 Linux：
+
+```sh
+bash scripts/validate-linux.sh --kernel-overflow --live-metrics
+```
+
+Windows可运行共享查询、恢复及真实夹具测试，文件变更通知显式模拟：
+
+```powershell
+cargo +1.99.0 test --release --offline --target-dir target/stage3
+python scripts/measure-live-windows.py
+```
+
+Windows的 linux-ffi-check 只能用于 cargo check；不要在Windows用该feature运行测试或构建来冒充Linux执行。
+
+基础验收：Windows debug/release各32项通过；x86_64 Linux overlayfs debug/release各53项通过，真实overflow恢复及有界原生测量另行通过。生产规模、其它文件系统和架构尚未验证。
+
+验证方法与当前通过范围见 [docs/VALIDATION.md](docs/VALIDATION.md)；合成数据、硬件与性能局限见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)；实现归属见 [THIRD_PARTY.md](THIRD_PARTY.md)。
