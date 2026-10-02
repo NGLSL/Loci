@@ -17,8 +17,8 @@ commands on stdin: `query QUERY`, `status`, `save`, `rebuild`, and `stop`.
 An empty `query` searches all entries. Type `stop`, or close stdin, to save and
 release monitoring. It installs no system service. A bounded eight-command queue
 and 4096-byte command limit prevent terminal input from growing without a bound.
-`rebuild` reopens the same public Engine and reconciles the complete selected root;
-it does not silently discard damaged databases. A damaged or incompatible database
+`rebuild` requests fresh correction from the scale Engine, or reopens the bounded
+Engine, and reconciles the complete selected root. A damaged or incompatible database
 fails explicitly and remains available for recovery.
 
 Query terms use the existing case-insensitive AND substring and exact extension
@@ -26,8 +26,8 @@ semantics. Results alone go to stdout. Default output quotes and escapes each pa
 as a Rust string; `--null` returns exact UTF-8 path bytes followed by NUL, suitable
 for tools accepting NUL-delimited paths. Diagnostics go to stderr and include the
 snapshot version, completeness, validation status, match count, and returned-path
-count. Queries currently return at most fifty paths; full enumeration is a separate
-follow-up. Snapshot completeness and validation describe different things.
+count. Default queries return at most fifty paths; `--all` enumerates the complete
+snapshot through bounded pages. Snapshot completeness and validation describe different things.
 `Validated` describes the last reliable observed filesystem cutoff, while
 `Pending`, `ReadersPinned`, or `Failed` can retain older searchable results.
 They never claim those results are current. `Stopped` confirms release of ownership.
@@ -35,9 +35,9 @@ They never claim those results are current. `Stopped` confirms release of owners
 The existing v0.1 limits still apply: 4096 entries, 128 directories and 1 MiB of
 UTF-8 paths. Unsupported raw-byte filenames and implicit experimental exclusions
 remain limitations of that bounded Engine. The database parent must exist and both
-the database and temporary saves must be outside the selected root. Every one-shot
-command opens and reconciles the root; this CLI does not yet offer fast stale-start
-loading or a separate background query service.
+the database and temporary saves must be outside the selected root. Bounded commands
+open and reconcile the root. Scale commands can return saved results before correction;
+`watch` drives correction while accepting queries and status commands.
 
 Exit codes are 0 for success, 2 for invalid arguments or unsafe database placement,
 3 for failures, and 4 for a pending/incomplete observation. A watch command error
@@ -103,6 +103,35 @@ rebuild destination; unknown or damaged databases are preserved. Loaded results
 are Pending until correction completes. The bounded format and limits remain the
 default. Complete export/build/rebuild wait for Validated; ordinary first-page
 queries can return explicitly stale saved results with exit code 4.
+
+For scale query/status, `--fresh` requests full correction before returning results.
+Without it, a verified saved checkpoint is immediately searchable as `Pending`,
+including entries deleted or renamed while stopped. Root/source/mount/scope identity
+is checked and a native root watch is installed before this return. Linux has no
+generic persistent event cursor: a loaded checkpoint is never assumed current.
+The subsequent correction watches each directory before enumeration, drains native
+events between bounded batches and publishes only a reliable complete candidate.
+
+```sh
+engine query /chosen/root /outside/root.loci 'report' --scale --null
+engine query /chosen/root /outside/root.loci 'report' --scale --fresh --null
+engine status /chosen/root /outside/root.loci --scale --fresh
+engine watch /chosen/root /outside/root.loci --scale --scan-batch 256 --null
+```
+
+Startup stderr reports `phase=stale,first_searchable_ms=...`, then
+`phase=correcting,scanned_entries=...`, and finally
+`phase=validated,full_correction_ms=...`. Both elapsed times start immediately before
+opening the Engine. The first measures opening/loading and obtaining a searchable
+snapshot; the second measures the total elapsed time until validated coverage.
+Cold starts can first become searchable already validated. Progress diagnostics are
+throttled to at most one per 100 ms after the initial correction marker. These are
+per-run measurements, not a demonstrated million-entry latency bound.
+`watch-ready` can precede correction completion, so queries can return saved paths
+with `ok=false`/Pending until corrected. `cancel` pauses correction while retaining
+those paths; `rebuild` resumes it. Failure or cancellation never permits saving
+unvalidated results over the checkpoint. Stopping while Pending preserves the saved
+database and reports the unsuccessful save through the existing nonzero exit code.
 
 Scale native monitoring allows an explicit watch budget (`EngineOptions.watch_limit`,
 default 32,768 including the selected root), with a hard shared process ceiling of

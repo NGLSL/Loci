@@ -468,17 +468,25 @@ impl Engine {
         let mut engine = Self::start_unpolled(root, database, identity, source)?;
         let source = engine.source.take().unwrap();
         let mut runtime = scale::Runtime::new(&engine.root, source, options)?;
+        let mut loaded = false;
         if let Some(path) = &engine.database {
             let parent = &engine.database_parent.as_ref().unwrap()._file;
             let name = path.file_name().unwrap();
             engine.writer_lock = Some(scale::checkpoint::WriterLock::acquire(parent, name)?);
-            runtime.restore_checkpoint(parent, name, engine.identity.as_ref().unwrap().id)?;
+            loaded =
+                runtime.restore_checkpoint(parent, name, engine.identity.as_ref().unwrap().id)?;
         }
         runtime.check_selected_mount(&engine.identity.as_ref().unwrap()._file)?;
+        engine.check_root()?;
         engine.scale = Some(runtime);
-        if let Err(error) = engine.poll() {
-            if engine.view().coverage_gaps.is_empty() {
-                return Err(error);
+        // A verified checkpoint is immediately searchable, but Linux has no
+        // durable offline event cursor. Keep it Pending until callers drive
+        // bounded correction; never delay this return with the first scan.
+        if !loaded {
+            if let Err(error) = engine.poll() {
+                if engine.view().coverage_gaps.is_empty() {
+                    return Err(error);
+                }
             }
         }
         Ok(engine)

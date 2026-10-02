@@ -1,4 +1,4 @@
-//! Real-directory CLI adapter over the public bounded Engine.
+//! Real-directory CLI adapter over the public Engine.
 use loci_experiment::engine::{
     Engine, EngineMode, EngineOptions, QueryHandle, Status, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
 };
@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 const HELP: &str = "Real directory commands (public Engine, not synthetic data):
   engine build ROOT DATABASE
-  engine query ROOT DATABASE QUERY [--null] [--all [--page-size N]]
-  engine status ROOT DATABASE
+  engine query ROOT DATABASE QUERY [--fresh] [--null] [--all [--page-size N]]
+  engine status ROOT DATABASE [--fresh]
   engine rebuild ROOT DATABASE
   engine watch ROOT DATABASE [--null]
 Watch reads query QUERY / export QUERY / status / rebuild / cancel / save / stop commands from stdin.
@@ -27,8 +27,9 @@ Exit codes: 0 success, 2 invalid arguments, 3 failure, 4 pending/incomplete resu
 All engine commands accept --scale [--exclude RELATIVE_PATH] (repeatable).
 Scale limits can be selected with --entries N --directories N --scan-batch N.
 Scale mode preserves raw names and lists symlinks without following targets; defaults to
-no configured exclusions and no descent across nested mount points. Scale checkpoints
-are currently unsupported; transient query/status work, saving reports Unsupported.
+no configured exclusions and no descent across nested mount points. Saved scale results
+are searchable immediately as Pending; --fresh waits for correction. Build/rebuild and
+--all wait for validation. Startup diagnostics separate first search from full correction.
 Existing build/bench/query/scan/live-check commands remain experiments.";
 
 pub fn entry(args: &[OsString]) {
@@ -59,13 +60,18 @@ fn run(args: &[OsString]) -> io::Result<()> {
     if args.len() < base {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, HELP));
     }
-    let (nul, all, page_size, options) = query_options(&args[base..], action)?;
+    let (nul, all, fresh, page_size, options) = query_options(&args[base..], action)?;
     let root = Path::new(&args[1]);
     let database = Path::new(&args[2]);
+    let mut startup = StartupTiming::new();
     let mut engine = Engine::open_with_options(root, Some(database), options.clone())?;
-    wait_for_snapshot(&mut engine, all || action == "build" || action == "rebuild")?;
+    wait_for_snapshot(&mut engine, false, &mut startup)?;
+    startup.searchable(&engine);
+    if fresh || all || action == "build" || action == "rebuild" {
+        wait_for_snapshot(&mut engine, true, &mut startup)?;
+    }
     if action == "watch" {
-        return watch(engine, root, database, nul, options);
+        return watch(engine, root, database, nul, options, startup);
     }
     let raw = if action == "query" {
         args[3].to_str().ok_or_else(|| {
@@ -93,9 +99,10 @@ fn run(args: &[OsString]) -> io::Result<()> {
 fn query_options(
     args: &[OsString],
     action: &str,
-) -> io::Result<(bool, bool, usize, EngineOptions)> {
+) -> io::Result<(bool, bool, bool, usize, EngineOptions)> {
     let mut nul = false;
     let mut all = false;
+    let mut fresh = false;
     let mut page_size = DEFAULT_PAGE_SIZE;
     let mut size_given = false;
     let mut scale = false;
@@ -106,6 +113,7 @@ fn query_options(
         match args[i].to_str().unwrap_or("") {
             "--null" if !nul && (action == "query" || action == "watch") => nul = true,
             "--all" if !all && action == "query" => all = true,
+            "--fresh" if !fresh && (action == "query" || action == "status") => fresh = true,
             "--scale" if !scale => {
                 scale = true;
                 options.mode = EngineMode::Scale;
@@ -198,10 +206,74 @@ fn query_options(
             "--exclude requires --scale",
         ));
     }
-    Ok((nul, all, page_size, options))
+    Ok((nul, all, fresh, page_size, options))
 }
 
-fn wait_for_snapshot(engine: &mut Engine, require_validated: bool) -> io::Result<()> {
+struct StartupTiming {
+    started: Instant,
+    correcting: bool,
+    validated: bool,
+    last_progress: Instant,
+}
+impl StartupTiming {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            correcting: false,
+            validated: false,
+            last_progress: Instant::now(),
+        }
+    }
+    fn searchable(&mut self, engine: &Engine) {
+        let phase = if engine.view().status == Status::Validated {
+            "validated"
+        } else {
+            "stale"
+        };
+        eprintln!(
+            "engine,phase={phase},first_searchable_ms={},version={},state={:?}",
+            self.started.elapsed().as_millis(),
+            engine.view().version,
+            engine.view().status
+        );
+        self.observe(engine);
+    }
+    fn before_poll(&mut self, engine: &Engine) {
+        if !self.validated && !self.correcting && engine.view().status != Status::Validated {
+            eprintln!(
+                "engine,phase=correcting,scanned_entries={}",
+                engine.metrics().scanned_entries
+            );
+            self.correcting = true;
+        }
+    }
+    fn observe(&mut self, engine: &Engine) {
+        if !self.validated && engine.view().status == Status::Validated {
+            eprintln!(
+                "engine,phase=validated,full_correction_ms={},scanned_entries={}",
+                self.started.elapsed().as_millis(),
+                engine.metrics().scanned_entries
+            );
+            self.validated = true;
+        } else if !self.validated
+            && self.correcting
+            && self.last_progress.elapsed() >= Duration::from_millis(100)
+        {
+            eprintln!(
+                "engine,phase=correcting,scanned_entries={},state={:?}",
+                engine.metrics().scanned_entries,
+                engine.view().status
+            );
+            self.last_progress = Instant::now();
+        }
+    }
+}
+
+fn wait_for_snapshot(
+    engine: &mut Engine,
+    require_validated: bool,
+    startup: &mut StartupTiming,
+) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(90);
     while engine.view().version == 0
         || (require_validated && engine.view().status != Status::Validated)
@@ -216,8 +288,16 @@ fn wait_for_snapshot(engine: &mut Engine, require_validated: bool) -> io::Result
                 "initial build is still pending",
             ));
         }
+        startup.before_poll(engine);
         engine.poll()?;
-        std::thread::sleep(Duration::from_millis(1));
+        if require_validated {
+            startup.observe(engine);
+        }
+        if engine.view().version == 0
+            || (require_validated && engine.view().status != Status::Validated)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     Ok(())
 }
@@ -357,6 +437,7 @@ fn watch(
     database: &Path,
     nul: bool,
     options: EngineOptions,
+    mut startup: StartupTiming,
 ) -> io::Result<()> {
     // A bounded command queue keeps monitoring independent from terminal input.
     let (sender, receiver) = mpsc::sync_channel(8);
@@ -392,10 +473,12 @@ fn watch(
     let mut failed = false;
     loop {
         if !failed {
+            startup.before_poll(&engine);
             if let Err(error) = engine.poll() {
                 eprintln!("engine,failed={error}");
                 failed = true;
             }
+            startup.observe(&engine);
         }
         let view = engine.view();
         if previous != (view.version, view.status.clone()) {
@@ -426,6 +509,7 @@ fn watch(
                 "save" => ("save", engine.save()),
                 "rebuild" if options.mode == EngineMode::Scale => {
                     let result = engine.request_rebuild();
+                    startup = StartupTiming::new();
                     failed = false;
                     ("rebuild", result)
                 }
@@ -437,8 +521,9 @@ fn watch(
                 "rebuild" => {
                     // Opening the public Engine performs a new root reconciliation.
                     engine.stop()?;
+                    startup = StartupTiming::new();
                     engine = Engine::open_with_options(root, Some(database), options.clone())?;
-                    wait_for_snapshot(&mut engine, true)?;
+                    wait_for_snapshot(&mut engine, true, &mut startup)?;
                     failed = false;
                     ("rebuild", status(&engine.query()))
                 }

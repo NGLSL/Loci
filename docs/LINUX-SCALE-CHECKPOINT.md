@@ -13,6 +13,13 @@ identity and live/tombstone flag. Observed inode identity is stale across offlin
 periods. Loaded results remain Pending until watch-before-enumeration correction
 finishes. Query pages retain immutable entry-ID ordering.
 
+A successful reopen returns the saved publication version as Pending before any
+correction scan runs. The public `poll`/`poll_with_cancel` APIs then drive bounded
+correction; `request_rebuild` resumes a cancelled or exhausted attempt. Query leases
+on the saved snapshot keep their original paths through correction, while new leases
+observe the validated publication after completion. Cancellation, a failed candidate
+or changed source identity never relabels the saved snapshot as current.
+
 The length and checksum protect record integrity; independent bounded checks
 validate lengths/counts, root/scope, basename bytes, kind/alive flags, parent
 references, directory parents, cycles/depth and duplicate live directory entries
