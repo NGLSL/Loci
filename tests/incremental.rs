@@ -532,3 +532,105 @@ fn cancellation_during_partitioned_query_keeps_one_snapshot_and_bounded_results(
         started.elapsed().as_secs_f64() * 1e6
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_stream_paths_are_rejected_before_io_and_recovery_preserves_directory_entries() {
+    let f = Fixture::new();
+    fs::write(f.root.join("a.rs"), "default").unwrap();
+    let mut p = initialize(&f);
+    let stream = f.root.join("a.rs:stream");
+    fs::write(&stream, "fixture stream").expect("NTFS fixture must support named streams");
+    assert!(fs::symlink_metadata(&stream).unwrap().is_file());
+    let disk: Vec<_> = fs::read_dir(&f.root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(disk, [std::ffi::OsString::from("a.rs")]);
+    let changes = [
+        Change::Refresh("a.rs:stream".into()),
+        Change::Refresh("a.rs::$DATA".into()),
+        Change::Refresh("a.rs:stream:$DATA".into()),
+        Change::Refresh("dir:stream/child.rs".into()),
+        Change::Remove("a.rs:stream".into()),
+        Change::Rename {
+            from: "a.rs:stream".into(),
+            to: "renamed.rs".into(),
+        },
+        Change::Rename {
+            from: "a.rs".into(),
+            to: "a.rs:stream".into(),
+        },
+    ];
+    for (i, change) in changes.into_iter().enumerate() {
+        let before_metadata = p.metrics.metadata_calls;
+        let before_version = p.store.handle().view().version;
+        p.enqueue(change);
+        let now = Duration::from_secs(2 * i as u64 + 1);
+        let error = p.tick(now).unwrap_err();
+        assert!(error.to_string().contains("Windows stream paths"));
+        assert_eq!(p.metrics.metadata_calls, before_metadata);
+        let out = result(&p.store.handle(), "", false);
+        assert_eq!(out.version, before_version);
+        assert_eq!(out.paths, [PathBuf::from("a.rs")]);
+        assert!(!out.validated_at_start_and_finish);
+        assert!(matches!(out.finished.status, Status::Failed(_)));
+        assert!(p.tick(now + Duration::from_secs(1)).unwrap());
+        assert_eq!(paths(&p, "stream").len(), 0);
+        assert_eq!(paths(&p, ""), [PathBuf::from("a.rs")]);
+        assert!(result(&p.store.handle(), "", false).validated_at_start_and_finish);
+    }
+    println!("PASS: actual NTFS ADS remains outside filename inventory; all Windows event variants reject before metadata I/O and recover");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_colon_filename_remains_a_valid_incremental_directory_entry() {
+    let f = Fixture::new();
+    let mut p = initialize(&f);
+    fs::write(f.root.join("a.rs:stream"), "ordinary Linux file").unwrap();
+    p.enqueue(Change::Refresh("a.rs:stream".into()));
+    assert!(p.tick(Duration::from_secs(1)).unwrap());
+    assert_eq!(paths(&p, "stream"), [PathBuf::from("a.rs:stream")]);
+    fs::rename(f.root.join("a.rs:stream"), f.root.join("b:stream.rs")).unwrap();
+    p.enqueue(Change::Rename {
+        from: "a.rs:stream".into(),
+        to: "b:stream.rs".into(),
+    });
+    assert!(p.tick(Duration::from_secs(2)).unwrap());
+    assert_eq!(paths(&p, "stream"), [PathBuf::from("b:stream.rs")]);
+    assert!(result(&p.store.handle(), "stream", false).validated_at_start_and_finish);
+    fs::remove_file(f.root.join("b:stream.rs")).unwrap();
+    p.enqueue(Change::Remove("b:stream.rs".into()));
+    assert!(p.tick(Duration::from_secs(3)).unwrap());
+    assert!(paths(&p, "").is_empty());
+    assert_eq!(p.metrics.full_scans, 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_ads_before_parent_rename_is_rejected_before_batch_precheck_io() {
+    let f = Fixture::new();
+    fs::create_dir(f.root.join("old")).unwrap();
+    fs::write(f.root.join("old/a.rs"), "default").unwrap();
+    let mut p = initialize(&f);
+    fs::write(f.root.join("old/a.rs:stream"), "fixture stream").unwrap();
+    p.enqueue(Change::Refresh("old/a.rs:stream".into()));
+    fs::rename(f.root.join("old"), f.root.join("new")).unwrap();
+    p.enqueue(Change::Rename {
+        from: "old".into(),
+        to: "new".into(),
+    });
+    let error = p.tick(Duration::from_secs(1)).unwrap_err();
+    assert!(error.to_string().contains("Windows stream paths"));
+    assert_eq!(p.metrics.metadata_calls, 0);
+    assert_eq!(p.metrics.full_scans, 1);
+    assert_eq!(p.store.handle().view().version, 1);
+    assert!(matches!(p.store.handle().view().status, Status::Failed(_)));
+    assert_eq!(paths(&p, "a.rs"), [PathBuf::from("old/a.rs")]);
+    assert!(p.tick(Duration::from_secs(2)).unwrap());
+    assert_eq!(paths(&p, "a.rs"), [PathBuf::from("new/a.rs")]);
+    assert!(paths(&p, "stream").is_empty());
+    assert!(result(&p.store.handle(), "a.rs", false).validated_at_start_and_finish);
+    assert_eq!(p.metrics.full_scans, 2);
+}

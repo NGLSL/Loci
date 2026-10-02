@@ -12,6 +12,42 @@ pub enum Change {
     Remove(PathBuf),
     Rename { from: PathBuf, to: PathBuf },
 }
+// Event paths name objects at event time, but apply() inspects the final disk.
+// An earlier operation overlapping a later rename source can therefore observe
+// a missing path or a replacement inode/subtree. Do not publish a guess.
+// Independent changes and standalone renames keep the incremental fast path.
+pub(crate) fn requires_reconcile(
+    root: &Path,
+    changes: &[Change],
+    metrics: &mut Metrics,
+) -> io::Result<bool> {
+    // Validate the entire batch before any final-state inspection can return early.
+    for change in changes {
+        match change {
+            Change::Refresh(path) | Change::Remove(path) => valid(path)?,
+            Change::Rename { from, to } => {
+                valid(from)?;
+                valid(to)?;
+            }
+        }
+    }
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    for (i, change) in changes.iter().enumerate() {
+        let Change::Rename { from, to } = change else {
+            continue;
+        };
+        let dependent = changes[..i].iter().any(|earlier| match earlier {
+            Change::Refresh(path) | Change::Remove(path) => overlaps(path, from),
+            Change::Rename { from: old, to } => overlaps(old, from) || overlaps(to, from),
+        });
+        // Only a live directory destination can copy stale descendants. File
+        // renames and already-removed transient targets keep their fast path.
+        if dependent && inspect(root, to, metrics)? == Some(Kind::Directory) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 #[derive(Clone, Debug)]
 pub(crate) enum Topology {
     Add(PathBuf),
@@ -48,6 +84,14 @@ fn valid(path: &Path) -> io::Result<()> {
     if path.as_os_str().is_empty() || !path.components().all(|c| matches!(c, Component::Normal(_)))
     {
         return Err(io::Error::other("unsafe relative event path"));
+    }
+    // NTFS stream paths are not directory entries. Reject before filesystem I/O.
+    // Unix colons are ordinary filename bytes and must remain accepted.
+    #[cfg(windows)]
+    if path.as_os_str().as_encoded_bytes().contains(&b':') {
+        return Err(io::Error::other(
+            "Windows stream paths are not filename entries",
+        ));
     }
     if path.as_os_str().len() > 4096 {
         return Err(io::Error::other("event path byte budget"));
@@ -381,6 +425,10 @@ impl Portable {
             } else {
                 let ticket = self.state.ticket();
                 let changes = std::mem::take(&mut self.pending);
+                if requires_reconcile(&self.root, &changes, &mut self.metrics)? {
+                    self.invalidate(Signal::GenerationRace);
+                    return Ok(false);
+                }
                 let next = apply(
                     &self.root,
                     &self.state.inventory,

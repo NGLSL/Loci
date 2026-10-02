@@ -29,6 +29,6 @@ python scripts/measure-live-windows.py
 
 Windows的 linux-ffi-check 只能用于 cargo check；不要在Windows用该feature运行测试或构建来冒充Linux执行。
 
-基础提交7415280验收：Windows debug/release各32项；x86_64 Linux overlayfs各53项及另行真实overflow/原生测量通过。当前增量分支Windows各45项通过；新增Linux原生用例尚未执行。成对测量、复验入口与实现边界见 [docs/INCREMENTAL.md](docs/INCREMENTAL.md)。生产规模、其它文件系统和架构尚未验证。
+基础提交7415280验收：Windows debug/release各32项；x86_64 Linux overlayfs各53项及另行真实overflow/原生测量通过。联合P1/P2修复Windows各51项通过；云端P1单独补丁Linux各79项通过，精确联合提交仍待复验。成对测量、复验入口与实现边界见 [docs/INCREMENTAL.md](docs/INCREMENTAL.md)。生产规模、其它文件系统和架构尚未验证。
 
 验证方法与当前通过范围见 [docs/VALIDATION.md](docs/VALIDATION.md)；合成数据、硬件与性能局限见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)；实现归属见 [THIRD_PARTY.md](THIRD_PARTY.md)。

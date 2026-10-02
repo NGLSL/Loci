@@ -1,4 +1,4 @@
-> 本文记录基础提交7415280的验收。增量分支的新增范围、Windows45项结果及Linux待复验入口见[INCREMENTAL.md](INCREMENTAL.md)。
+> 本文记录基础提交7415280的验收。增量分支的新增范围、Windows联合51项结果及Linux待复验入口见[INCREMENTAL.md](INCREMENTAL.md)。
 
 # 验证范围
 

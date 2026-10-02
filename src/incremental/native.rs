@@ -169,6 +169,14 @@ impl Native {
                         return Ok(false);
                     }
                 };
+                if super::requires_reconcile(
+                    &self.watch.root,
+                    &translated.changes,
+                    &mut self.metrics,
+                )? {
+                    self.invalidate(Signal::GenerationRace);
+                    return Ok(false);
+                }
                 let ticket = self.watch.state.ticket();
                 let next = apply(
                     &self.watch.root,

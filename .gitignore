@@ -48,3 +48,4 @@
 !/tests/linux_incremental.rs
 !/scripts/measure-incremental.py
 !/docs/INCREMENTAL.md
+!/tests/incremental_rename_regressions.rs
