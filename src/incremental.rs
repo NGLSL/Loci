@@ -62,6 +62,11 @@ pub struct Metrics {
     pub metadata_calls: usize,
     pub transactions: usize,
     pub changed_paths: usize,
+    /// Scale inventory work in the last local transaction, excluding derived
+    /// path/query cache and native watch topology work.
+    pub last_touched_entries: usize,
+    pub last_copied_entries: usize,
+    pub last_copied_segments: usize,
 }
 pub(crate) fn validate_limits(limits: Limits) -> io::Result<()> {
     if limits.entries == 0

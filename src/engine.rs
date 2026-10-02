@@ -13,6 +13,40 @@ use std::time::Instant;
 
 pub use crate::live::Status;
 
+#[cfg(target_os = "linux")]
+mod scale;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EngineMode {
+    #[default]
+    Bounded,
+    Scale,
+}
+/// Explicit opt-in. Bounded behavior and format remain the default on both OSes.
+#[derive(Clone, Copy, Debug)]
+pub struct EngineOptions {
+    pub mode: EngineMode,
+    pub limits: Limits,
+    pub scan_batch: usize,
+}
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            mode: EngineMode::Bounded,
+            limits: Limits::default(),
+            scan_batch: 256,
+        }
+    }
+}
+impl EngineOptions {
+    pub fn scale() -> Self {
+        Self {
+            mode: EngineMode::Scale,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct View {
     pub version: u64,
@@ -31,11 +65,22 @@ impl From<live::View> for View {
 #[derive(Clone)]
 pub struct QueryHandle {
     root: Arc<PathBuf>,
-    handle: live::QueryHandle,
+    handle: HandleBackend,
+}
+#[derive(Clone)]
+enum HandleBackend {
+    Bounded(live::QueryHandle),
+    #[cfg(target_os = "linux")]
+    Scale(scale::query::Handle),
 }
 pub struct QueryLease {
     root: Arc<PathBuf>,
-    lease: live::QueryLease,
+    lease: LeaseBackend,
+}
+enum LeaseBackend {
+    Bounded(live::QueryLease),
+    #[cfg(target_os = "linux")]
+    Scale(scale::query::Lease),
 }
 pub struct QueryResult {
     pub version: u64,
@@ -50,7 +95,13 @@ pub struct QueryResult {
 /// Opaque continuation bound to one leased snapshot and exact query text.
 #[derive(Clone)]
 pub struct PageCursor {
-    cursor: live::PageCursor,
+    cursor: CursorBackend,
+}
+#[derive(Clone)]
+enum CursorBackend {
+    Bounded(live::PageCursor),
+    #[cfg(target_os = "linux")]
+    Scale(scale::query::Cursor),
 }
 pub use crate::live::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 pub struct QueryPage {
@@ -65,12 +116,20 @@ pub struct QueryPage {
 }
 impl QueryHandle {
     pub fn view(&self) -> View {
-        self.handle.view().into()
+        match &self.handle {
+            HandleBackend::Bounded(handle) => handle.view().into(),
+            #[cfg(target_os = "linux")]
+            HandleBackend::Scale(handle) => handle.view(),
+        }
     }
     pub fn lease(&self) -> io::Result<QueryLease> {
         Ok(QueryLease {
             root: self.root.clone(),
-            lease: self.handle.lease()?,
+            lease: match &self.handle {
+                HandleBackend::Bounded(handle) => LeaseBackend::Bounded(handle.lease()?),
+                #[cfg(target_os = "linux")]
+                HandleBackend::Scale(handle) => LeaseBackend::Scale(handle.lease()?),
+            },
         })
     }
 }
@@ -85,9 +144,43 @@ impl QueryLease {
         cancel: &AtomicBool,
         progress: &AtomicUsize,
     ) -> io::Result<QueryPage> {
-        let out = self
-            .lease
-            .page(raw, cursor.map(|c| &c.cursor), page_size, cancel, progress)?;
+        #[cfg(target_os = "linux")]
+        if let LeaseBackend::Scale(lease) = &self.lease {
+            let cursor = match cursor.map(|cursor| &cursor.cursor) {
+                Some(CursorBackend::Scale(cursor)) => Some(cursor),
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cursor backend mismatch",
+                    ))
+                }
+                None => None,
+            };
+            let mut page = lease.page(raw, cursor, page_size, cancel, progress)?;
+            page.paths = page
+                .paths
+                .into_iter()
+                .map(|path| self.root.join(path))
+                .collect();
+            return Ok(page);
+        }
+        let lease = match &self.lease {
+            LeaseBackend::Bounded(lease) => lease,
+            #[cfg(target_os = "linux")]
+            LeaseBackend::Scale(_) => unreachable!(),
+        };
+        let cursor = match cursor.map(|cursor| &cursor.cursor) {
+            Some(CursorBackend::Bounded(cursor)) => Some(cursor),
+            #[cfg(target_os = "linux")]
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cursor backend mismatch",
+                ))
+            }
+            None => None,
+        };
+        let out = lease.page(raw, cursor, page_size, cancel, progress)?;
         Ok(QueryPage {
             version: out.version,
             started: out.started.into(),
@@ -96,7 +189,9 @@ impl QueryLease {
             paths: out.paths.into_iter().map(|p| self.root.join(p)).collect(),
             cancelled: out.cancelled,
             complete: out.complete,
-            next: out.next.map(|cursor| PageCursor { cursor }),
+            next: out.next.map(|cursor| PageCursor {
+                cursor: CursorBackend::Bounded(cursor),
+            }),
         })
     }
 
@@ -107,7 +202,22 @@ impl QueryLease {
         cancel: &AtomicBool,
         progress: &AtomicUsize,
     ) -> io::Result<QueryResult> {
-        let out = self.lease.search(raw, first50, cancel, progress)?;
+        #[cfg(target_os = "linux")]
+        if let LeaseBackend::Scale(lease) = &self.lease {
+            let mut result = lease.search(raw, first50, cancel, progress)?;
+            result.paths = result
+                .paths
+                .into_iter()
+                .map(|path| self.root.join(path))
+                .collect();
+            return Ok(result);
+        }
+        let lease = match &self.lease {
+            LeaseBackend::Bounded(lease) => lease,
+            #[cfg(target_os = "linux")]
+            LeaseBackend::Scale(_) => unreachable!(),
+        };
+        let out = lease.search(raw, first50, cancel, progress)?;
         Ok(QueryResult {
             version: out.version,
             started: out.started.into(),
@@ -122,6 +232,8 @@ impl QueryLease {
 }
 
 pub struct Engine {
+    #[cfg(target_os = "linux")]
+    scale: Option<scale::Runtime>,
     root: Arc<PathBuf>,
     database: Option<PathBuf>,
     #[cfg(target_os = "linux")]
@@ -189,6 +301,44 @@ impl Source {
     }
 }
 impl Engine {
+    pub fn open_with_options(
+        root: &Path,
+        database: Option<&Path>,
+        options: EngineOptions,
+    ) -> io::Result<Self> {
+        if options.mode == EngineMode::Bounded {
+            return Self::open(root, database);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(database) = database {
+                match fs::symlink_metadata(database) {
+                    Ok(_) => return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "scale checkpoint loading is not implemented; existing database preserved",
+                    )),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let root = fs::canonicalize(root)?;
+            let identity = RootIdentity::open(&root)?;
+            let source = crate::linux_events::LinuxEvents::open(&root, EventLimits::default())?;
+            let mut engine = Self::start_unpolled(root, database, identity, Source::Linux(source))?;
+            let source = engine.source.take().unwrap();
+            engine.scale = Some(scale::Runtime::new(&engine.root, source, options)?);
+            engine.poll()?;
+            Ok(engine)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root, database, options);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "scale mode currently requires native Linux",
+            ))
+        }
+    }
     /// Native Windows or x86_64 Linux source for the explicitly selected root.
     pub fn open(root: &Path, database: Option<&Path>) -> io::Result<Self> {
         #[cfg(windows)]
@@ -231,42 +381,10 @@ impl Engine {
         identity: RootIdentity,
         source: Source,
     ) -> io::Result<Self> {
-        let database = database
-            .map(|path| database_path(path, &root))
-            .transpose()?;
-        #[cfg(target_os = "linux")]
-        let database_parent = database
-            .as_ref()
-            .map(|path| {
-                RootIdentity::open(
-                    path.parent()
-                        .ok_or_else(|| io::Error::other("database parent missing"))?,
-                )
-            })
-            .transpose()?;
-        let mut engine = Self {
-            root: Arc::new(root),
-            database,
-            #[cfg(target_os = "linux")]
-            database_parent,
-            identity: Some(identity),
-            source: Some(source),
-            state: Recovery::new(EventLimits::default().max_events()),
-            store: Store::new(),
-            pending: vec![],
-            correction: true,
-            stopped: false,
-            gate: Gate::default(),
-            epoch: Instant::now(),
-            last_audit: Instant::now(),
-            metrics: Metrics::default(),
-        };
-        engine.check_root()?;
+        let mut engine = Self::start_unpolled(root, database, identity, source)?;
         if let Some(path) = &engine.database {
             match Snapshot::load(path, &engine.root) {
                 Ok(snapshot) => {
-                    // Seed an offline version before observing Startup/Restart.
-                    // It is never exposed as Validated before root reconciliation.
                     let mut offline = Recovery::new(Limits::default().queue);
                     offline.inventory = snapshot.inventory.clone();
                     offline.dirty = false;
@@ -284,16 +402,68 @@ impl Engine {
         engine.poll()?;
         Ok(engine)
     }
+    fn start_unpolled(
+        root: PathBuf,
+        database: Option<&Path>,
+        identity: RootIdentity,
+        source: Source,
+    ) -> io::Result<Self> {
+        let database = database
+            .map(|path| database_path(path, &root))
+            .transpose()?;
+        #[cfg(target_os = "linux")]
+        let database_parent = database
+            .as_ref()
+            .map(|path| {
+                RootIdentity::open(
+                    path.parent()
+                        .ok_or_else(|| io::Error::other("database parent missing"))?,
+                )
+            })
+            .transpose()?;
+        let engine = Self {
+            #[cfg(target_os = "linux")]
+            scale: None,
+            root: Arc::new(root),
+            database,
+            #[cfg(target_os = "linux")]
+            database_parent,
+            identity: Some(identity),
+            source: Some(source),
+            state: Recovery::new(EventLimits::default().max_events()),
+            store: Store::new(),
+            pending: vec![],
+            correction: true,
+            stopped: false,
+            gate: Gate::default(),
+            epoch: Instant::now(),
+            last_audit: Instant::now(),
+            metrics: Metrics::default(),
+        };
+        engine.check_root()?;
+        Ok(engine)
+    }
     pub fn query(&self) -> QueryHandle {
+        #[cfg(target_os = "linux")]
+        if let Some(scale) = &self.scale {
+            return QueryHandle {
+                root: self.root.clone(),
+                handle: HandleBackend::Scale(scale.store.handle.clone()),
+            };
+        }
         QueryHandle {
             root: self.root.clone(),
-            handle: self.store.handle(),
+            handle: HandleBackend::Bounded(self.store.handle()),
         }
     }
     pub fn view(&self) -> View {
-        self.store.handle().view().into()
+        self.query().view()
     }
     pub fn metrics(&self) -> &Metrics {
+        #[cfg(target_os = "linux")]
+        if let Some(scale) = &self.scale {
+            return &scale.metrics;
+        }
         &self.metrics
     }
     fn check_root(&self) -> io::Result<()> {
@@ -389,6 +559,24 @@ impl Engine {
     /// Nonblocking event drain; true only for a published, validated observation.
     /// Scan/build attempts are bounded and throttled; false means Pending/readers/Stopped.
     pub fn poll(&mut self) -> io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        if self.scale.is_some() {
+            if self.stopped {
+                return Ok(false);
+            }
+            if let Err(error) = self.check_root() {
+                let scale = self.scale.as_mut().unwrap();
+                let _ = scale.stop();
+                scale.fail(&error);
+                return Err(error);
+            }
+            let scale = self.scale.as_mut().unwrap();
+            let result = scale.poll();
+            if let Err(error) = &result {
+                scale.fail(error);
+            }
+            return result;
+        }
         if self.stopped {
             return Ok(false);
         }
@@ -519,6 +707,13 @@ impl Engine {
     }
     /// Save only a currently validated observation; never persist partial inventory.
     pub fn save(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.scale.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "scale checkpoint format is not implemented yet",
+            ));
+        }
         if !self.poll()? || self.view().status != Status::Validated {
             return Err(io::Error::other(
                 "save requires a validated engine observation",
@@ -555,6 +750,10 @@ impl Engine {
         self.stopped = true;
         self.pending.clear();
         self.store.stop();
+        #[cfg(target_os = "linux")]
+        if let Some(scale) = &mut self.scale {
+            scale.stop()?;
+        }
         let result = self
             .source
             .take()
