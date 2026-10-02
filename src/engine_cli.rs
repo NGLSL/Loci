@@ -15,7 +15,7 @@ const HELP: &str = "Real directory commands (public Engine, not synthetic data):
   engine status ROOT DATABASE
   engine rebuild ROOT DATABASE
   engine watch ROOT DATABASE [--null]
-Watch reads query QUERY / export QUERY / status / rebuild / save / stop commands from stdin.
+Watch reads query QUERY / export QUERY / status / rebuild / cancel / save / stop commands from stdin.
 Stop or stdin EOF saves the last validated snapshot and releases monitoring.
 DATABASE and temporary saves must be outside ROOT. Current limits: 4096 entries,
 128 directories, 1 MiB UTF-8 paths. Default query retains at most 50 paths;
@@ -255,6 +255,9 @@ fn export(handle: &QueryHandle, raw: &str, nul: bool, page_size: usize) -> io::R
 
 fn coverage(handle: &QueryHandle) {
     let view = handle.view();
+    if !view.observed_losses.is_empty() {
+        eprintln!("engine,observed_losses={:?}", view.observed_losses);
+    }
     let resources = &view.resources;
     if resources.observed {
         eprintln!("engine,version={},state={:?},watches={}/{},process_watches={}/{},inotify_fds={},process_inotify_fds={}/{},queued_events={}/{},queued_event_bytes={}/{},event_buffer_bytes={}",
@@ -421,6 +424,16 @@ fn watch(
                 "query" => ("query", query(&engine.query(), "", nul)),
                 "status" => ("status", status(&engine.query())),
                 "save" => ("save", engine.save()),
+                "rebuild" if options.mode == EngineMode::Scale => {
+                    let result = engine.request_rebuild();
+                    failed = false;
+                    ("rebuild", result)
+                }
+                "cancel" if options.mode == EngineMode::Scale => {
+                    let result = engine.poll_with_cancel(&AtomicBool::new(true)).map(|_| ());
+                    coverage(&engine.query());
+                    ("cancel", result)
+                }
                 "rebuild" => {
                     // Opening the public Engine performs a new root reconciliation.
                     engine.stop()?;
@@ -433,7 +446,7 @@ fn watch(
                     "invalid",
                     Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "watch commands: query QUERY | export QUERY | status | rebuild | save | stop",
+                        "watch commands: query QUERY | export QUERY | status | rebuild | cancel | save | stop",
                     )),
                 ),
             }

@@ -42,6 +42,7 @@ pub(crate) struct Captured {
     pub events: Vec<watch::RawEvent>,
     pub truncated: bool,
     pub kernel_overflow: bool,
+    pub drained: bool,
 }
 pub struct Session {
     fd: c_int,
@@ -224,6 +225,7 @@ impl Session {
             events: vec![],
             truncated: false,
             kernel_overflow: false,
+            drained: false,
         };
         for _ in 0..8 {
             let mut buffer = [0u8; 65536];
@@ -231,6 +233,7 @@ impl Session {
             if n < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::WouldBlock {
+                    captured.drained = true;
                     return Ok(captured);
                 }
                 if error.kind() == io::ErrorKind::Interrupted {

@@ -49,6 +49,7 @@ impl Store {
                         leases: 0,
                         coverage_gaps: vec![],
                         resources: crate::engine::Resources::default(),
+                        observed_losses: Default::default(),
                     },
                 })),
             },
@@ -109,6 +110,15 @@ impl Store {
             .checked_sub(bytes)
             .ok_or_else(|| io::Error::other("retained snapshot byte budget exhausted"))
     }
+    pub fn losses(&self, losses: &std::collections::BTreeSet<crate::events::Loss>) {
+        self.handle
+            .shared
+            .lock()
+            .unwrap()
+            .view
+            .observed_losses
+            .extend(losses);
+    }
     pub fn status(&self, status: Status) {
         self.handle.shared.lock().unwrap().view.status = status;
     }
@@ -117,7 +127,13 @@ impl Store {
     }
     pub fn gap(&self, gap: crate::engine::CoverageGap) {
         let mut shared = self.handle.shared.lock().unwrap();
-        if shared.view.coverage_gaps.len() < 256 {
+        if shared.view.coverage_gaps.len() < 256
+            && !shared
+                .view
+                .coverage_gaps
+                .iter()
+                .any(|old| old.path == gap.path && old.kind == gap.kind)
+        {
             shared.view.coverage_gaps.push(gap);
         }
     }

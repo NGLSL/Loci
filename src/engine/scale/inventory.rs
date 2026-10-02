@@ -90,6 +90,7 @@ pub(super) struct Inventory {
     collisions: HashMap<(EntryId, u64), Vec<EntryId>>,
     pub entries: usize,
     pub directories: usize,
+    pub directory_ids: std::collections::BTreeSet<EntryId>,
     pub touched: usize,
     pub copied_entries: usize,
     pub copied_segments: usize,
@@ -121,6 +122,7 @@ impl Inventory {
             collisions: HashMap::new(),
             entries: 0,
             directories: 0,
+            directory_ids: Default::default(),
             touched: 0,
             copied_entries: 0,
             copied_segments: 0,
@@ -161,6 +163,7 @@ impl Inventory {
             self.entries -= 1;
             if kind == Kind::Directory {
                 self.directories -= 1;
+                self.directory_ids.remove(&id);
             }
         }
         Ok(id)
@@ -277,6 +280,7 @@ impl Inventory {
             self.positions.push(0);
         }
         if kind == Kind::Directory {
+            self.directory_ids.insert(id);
             self.directories += 1;
         }
         Ok(id)
@@ -354,6 +358,7 @@ impl Inventory {
             }
             self.children.remove(&id);
             self.directories -= 1;
+            self.directory_ids.remove(&id);
         }
         self.detach_child(self.data.entry(id).parent, id);
         self.remove_lookup(id);

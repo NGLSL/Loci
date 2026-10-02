@@ -15,6 +15,7 @@ pub(crate) struct LinuxEvents {
     stopped: bool,
     watch_limit: usize,
     scale: bool,
+    draining_loss: bool,
     logical: BTreeMap<i32, PathBuf>,
     retired: BTreeSet<i32>,
     consumed_ignored: BTreeSet<i32>,
@@ -23,6 +24,9 @@ pub(crate) struct LinuxEvents {
 }
 
 impl LinuxEvents {
+    pub(crate) fn recovery_ready(&self) -> bool {
+        !self.scale || !self.draining_loss
+    }
     pub(crate) fn resources(&self) -> crate::engine::Resources {
         let (process_watches, process_inotify_fds) = crate::linux_inotify::process_usage();
         crate::engine::Resources {
@@ -72,6 +76,7 @@ impl LinuxEvents {
             stopped: false,
             watch_limit,
             scale,
+            draining_loss: false,
             logical,
             retired: BTreeSet::new(),
             consumed_ignored: BTreeSet::new(),
@@ -102,6 +107,7 @@ impl LinuxEvents {
         }
         // Release both process budgets before allocating the replacement.
         self.session.take();
+        self.draining_loss = false;
         self.pending.clear();
         self.pending_since = None;
         self.logical.clear();
@@ -207,6 +213,9 @@ impl EventSource for LinuxEvents {
                 return Err(error);
             }
         };
+        if self.scale {
+            self.draining_loss = !captured.drained && (captured.truncated || self.draining_loss);
+        }
         let mut losses = BTreeSet::new();
         if captured.kernel_overflow {
             losses.insert(Loss::KernelOverflow);

@@ -44,6 +44,27 @@ impl Default for ScaleBudgets {
         }
     }
 }
+/// Scale correction and coverage audit budgets. Zero audit interval permits explicit
+/// caller-driven checks; ordinary owners should retain the conservative default.
+#[derive(Clone, Copy, Debug)]
+pub struct RecoveryOptions {
+    pub retry_limit: usize,
+    pub retry_delay: std::time::Duration,
+    pub audit_interval: std::time::Duration,
+    pub audit_batch: usize,
+    pub max_drain_polls: usize,
+}
+impl Default for RecoveryOptions {
+    fn default() -> Self {
+        Self {
+            retry_limit: 4,
+            retry_delay: std::time::Duration::from_millis(250),
+            audit_interval: std::time::Duration::from_secs(5),
+            audit_batch: 16,
+            max_drain_polls: 512,
+        }
+    }
+}
 /// Explicit opt-in. Bounded behavior and format remain the default on both OSes.
 #[derive(Clone, Debug)]
 pub struct EngineOptions {
@@ -56,6 +77,7 @@ pub struct EngineOptions {
     pub watch_limit: usize,
     pub event_limits: EventLimits,
     pub scale_budgets: ScaleBudgets,
+    pub recovery: RecoveryOptions,
 }
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -67,6 +89,7 @@ impl Default for EngineOptions {
             watch_limit: 32768,
             event_limits: EventLimits::default(),
             scale_budgets: ScaleBudgets::default(),
+            recovery: RecoveryOptions::default(),
         }
     }
 }
@@ -92,6 +115,15 @@ pub enum CoverageGapKind {
     Permission,
     Scan,
     Source,
+    Cancelled,
+    KernelOverflow,
+    UserOverflow,
+    WatchLost,
+    UnknownWatch,
+    MountChanged,
+    ScopeUnknown,
+    SourceIdentity,
+    RetryLimit,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverageGap {
@@ -132,6 +164,8 @@ pub struct View {
     pub leases: usize,
     pub coverage_gaps: Vec<CoverageGap>,
     pub resources: Resources,
+    /// Bounded cumulative loss history; not a claim of current incomplete coverage.
+    pub observed_losses: std::collections::BTreeSet<Loss>,
 }
 impl From<live::View> for View {
     fn from(view: live::View) -> Self {
@@ -141,6 +175,7 @@ impl From<live::View> for View {
             leases: view.leases,
             coverage_gaps: vec![],
             resources: Resources::default(),
+            observed_losses: Default::default(),
         }
     }
 }
@@ -382,6 +417,13 @@ impl EventSource for Source {
     }
 }
 impl Source {
+    fn recovery_ready(&self) -> bool {
+        match self {
+            Self::External(_) => true,
+            #[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
+            Self::Linux(source) => source.recovery_ready(),
+        }
+    }
     fn resources(&self) -> Resources {
         match self {
             Self::External(_) => Resources::default(),
@@ -487,6 +529,51 @@ impl Engine {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "native Engine requires Windows or x86_64 Linux",
+            ))
+        }
+    }
+    /// External-source counterpart of `open_with_options`; caller owns platform observation.
+    /// Scale recovery tests using this seam are explicitly simulated event evidence.
+    pub fn with_source_and_options(
+        root: &Path,
+        database: Option<&Path>,
+        source: impl EventSource + 'static,
+        options: EngineOptions,
+    ) -> io::Result<Self> {
+        if options.mode == EngineMode::Bounded {
+            if !options.exclusions.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "explicit exclusions require scale mode",
+                ));
+            }
+            return Self::with_source(root, database, source);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if database.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "external scale source currently requires an in-memory session",
+                ));
+            }
+            let root = fs::canonicalize(root)?;
+            let identity = RootIdentity::open(&root)?;
+            let mut engine =
+                Self::start_unpolled(root, None, identity, Source::External(Box::new(source)))?;
+            let source = engine.source.take().unwrap();
+            let runtime = scale::Runtime::new(&engine.root, source, options)?;
+            runtime.check_selected_mount(&engine.identity.as_ref().unwrap()._file)?;
+            engine.scale = Some(runtime);
+            let _ = engine.poll();
+            Ok(engine)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root, database, source, options);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "scale mode requires native Linux",
             ))
         }
     }
@@ -684,9 +771,26 @@ impl Engine {
         }
         Ok(())
     }
+    /// Schedule a fresh correction while retaining the previous immutable query.
+    /// Explicit retry resets the finite failure budget. A stopped/replaced root must be reopened.
+    pub fn request_rebuild(&mut self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(scale) = &mut self.scale {
+            return scale.request_rebuild();
+        }
+        if self.stopped {
+            return Err(io::Error::other("engine stopped; reopen explicitly"));
+        }
+        self.invalidate(Signal::Periodic);
+        self.gate = Gate::default();
+        Ok(())
+    }
+    pub fn poll(&mut self) -> io::Result<bool> {
+        self.poll_with_cancel(&AtomicBool::new(false))
+    }
     /// Nonblocking event drain; true only for a published, validated observation.
     /// Scan/build attempts are bounded and throttled; false means Pending/readers/Stopped.
-    pub fn poll(&mut self) -> io::Result<bool> {
+    pub fn poll_with_cancel(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
         #[cfg(target_os = "linux")]
         if self.scale.is_some() {
             if self.stopped {
@@ -699,13 +803,13 @@ impl Engine {
                 return Err(error);
             }
             let scale = self.scale.as_mut().unwrap();
-            let result = scale.poll();
+            let result = scale.poll_with_cancel(cancel);
             if let Err(error) = &result {
                 scale.fail(error);
             }
             return result;
         }
-        if self.stopped {
+        if self.stopped || cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(false);
         }
         if let Err(error) = self.capture() {

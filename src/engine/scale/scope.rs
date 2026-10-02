@@ -61,6 +61,17 @@ impl Scope {
         }
         Ok(Self { root_mount, nested })
     }
+    pub fn changed_boundaries(&self, other: &Self) -> Vec<PathBuf> {
+        self.nested
+            .keys()
+            .chain(other.nested.keys())
+            .filter(|path| self.nested.get(*path) != other.nested.get(*path))
+            .take(256)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
     pub fn boundary(&self, absolute: &Path) -> bool {
         self.nested.contains_key(absolute)
     }
