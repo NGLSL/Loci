@@ -145,7 +145,8 @@ not duplicate the production worker, fixture/oracle implementation or query
 benchmarks. `--queries` takes UTF-8 plain text with one literal query per line,
 not a JSON array. Use the final driver's complete query suite rather than a
 smaller baseline; retain its digest with the driver results. Check that example's
-final interface before native execution.
+final interface before native execution. The current [repository suite](../linux-million-acceptance/queries.txt)
+contains 52 lines, including an empty first query; preserve that line.
 
 ```sh
 python3 tools/linux-native-acceptance/runner.py run \
