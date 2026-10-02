@@ -1,4 +1,5 @@
 //! Disposable filename/path index experiment. No Kite or third-party code.
+mod engine_cli;
 #[cfg(test)]
 use loci_experiment::index::normalize;
 use loci_experiment::index::{Index, Query};
@@ -386,6 +387,7 @@ fn live_check(_args: &[String]) -> io::Result<()> {
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("engine") => engine_cli::entry(&args[2..]),
         Some("live-check") => live_check(&args[2..])?,
         Some("build") => {
             let n: usize = args[2].parse().unwrap();
