@@ -7,7 +7,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(test)]
 const MAGIC: &[u8; 8] = b"LCUSNCP\0";
+#[cfg(test)]
 const SIZE: usize = 48;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -24,6 +26,7 @@ fn rebuild(message: &str) -> io::Error {
         format!("checkpoint requires rebuild: {message}"),
     )
 }
+#[cfg(test)]
 fn checksum(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
@@ -53,6 +56,7 @@ impl Checkpoint {
         Ok(())
     }
 
+    #[cfg(test)]
     fn encode(&self) -> [u8; SIZE] {
         let mut b = [0; SIZE];
         b[..8].copy_from_slice(MAGIC);
@@ -65,6 +69,7 @@ impl Checkpoint {
         b
     }
 
+    #[cfg(test)]
     pub fn load(path: &Path) -> io::Result<Self> {
         use std::io::Read;
         let file = fs::File::open(path)?;
@@ -89,38 +94,54 @@ impl Checkpoint {
 
     /// Same-directory create_new temporary, flush, atomic replacement. On any
     /// pre-replacement failure the previous checkpoint remains intact.
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let filename = path.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "checkpoint needs a filename")
-        })?;
-        let mut name = filename.to_os_string();
-        name.push(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let temp = path.with_file_name(name);
-        let mut created = false;
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            created = true;
-            file.write_all(&self.encode())?;
-            file.sync_all()?;
-            drop(file);
-            replace(&temp, path)
-        })();
-        if result.is_err() && created {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        atomic_save(path, &self.encode())
     }
 }
 
+/// One durable file carries inventory and cursor together; callers never
+/// advance a separate cursor file ahead of the last committed namespace.
+pub(crate) fn atomic_save(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write(path, bytes, true)
+}
+
+/// Bootstrap cannot replace a snapshot created concurrently by another run.
+pub(crate) fn atomic_create(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write(path, bytes, false)
+}
+
+fn atomic_write(path: &Path, bytes: &[u8], replace_existing: bool) -> io::Result<()> {
+    let filename = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "checkpoint needs a filename")
+    })?;
+    let mut name = filename.to_os_string();
+    name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = path.with_file_name(name);
+    let mut created = false;
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        created = true;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace(&temp, path, replace_existing)
+    })();
+    if result.is_err() && created {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 #[cfg(windows)]
-fn replace(from: &Path, to: &Path) -> io::Result<()> {
+fn replace(from: &Path, to: &Path, replace_existing: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -139,14 +160,20 @@ fn replace(from: &Path, to: &Path) -> io::Result<()> {
     }
     let from = wide(from)?;
     let to = wide(to)?;
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) } == 0 {
+    let flags = 8 | u32::from(replace_existing);
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 #[cfg(not(windows))]
-fn replace(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
+fn replace(from: &Path, to: &Path, replace_existing: bool) -> io::Result<()> {
+    if replace_existing {
+        fs::rename(from, to)
+    } else {
+        fs::hard_link(from, to)?;
+        fs::remove_file(from)
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +250,9 @@ mod tests {
             ..c.clone()
         };
         next.save(&path).unwrap();
+        assert_eq!(Checkpoint::load(&path).unwrap(), next);
+        let creation_failure = atomic_create(&path, &c.encode()).unwrap_err();
+        assert!(creation_failure.raw_os_error().is_some());
         assert_eq!(Checkpoint::load(&path).unwrap(), next);
         #[cfg(windows)]
         {

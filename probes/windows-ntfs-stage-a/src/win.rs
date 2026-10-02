@@ -149,6 +149,57 @@ impl Drop for Handle {
         }
     }
 }
+/// Pin the directory and every pathname ancestor without DELETE sharing.
+/// A scoped elevated writer must not resolve its checkpoint through a swapped
+/// parent/junction after the initial range check.
+pub struct DirectoryPins {
+    _handles: Vec<Handle>,
+}
+impl DirectoryPins {
+    pub fn hold(path: &Path) -> io::Result<Self> {
+        let mut handles = Vec::new();
+        let ancestors: Vec<_> = path.ancestors().collect();
+        for ancestor in ancestors.into_iter().rev() {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            let p = wide(ancestor);
+            let h = unsafe {
+                CreateFileW(
+                    p.as_ptr(),
+                    1,
+                    1 | 2,
+                    ptr::null(),
+                    3,
+                    0x02000000 | 0x00200000,
+                    ptr::null_mut(),
+                )
+            };
+            if h == INVALID {
+                return Err(io::Error::last_os_error());
+            }
+            let h = Handle(h);
+            let mut info: FileInfo = unsafe { mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(h.0, &mut info) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if info.attributes & (0x10 | 0x400) != 0x10 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory pin requires ordinary directories; reparse ancestor refused",
+                ));
+            }
+            handles.push(h);
+        }
+        if handles.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory pin requires an absolute directory",
+            ));
+        }
+        Ok(Self { _handles: handles })
+    }
+}
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }

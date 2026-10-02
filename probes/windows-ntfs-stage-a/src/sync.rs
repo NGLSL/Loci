@@ -3,6 +3,7 @@
 use crate::{
     checkpoint::Checkpoint,
     model::{EntryId, Record},
+    snapshot::Snapshot,
     win::{self, Volume},
 };
 use std::{
@@ -31,7 +32,7 @@ fn raw(p: &Path) -> Vec<u16> {
 // Candidate namespace builder is distinct from the path-only oracle. Each
 // directory entry has parent/object/raw-name identity, including hardlinks
 // whose MFT representative name is outside the selected subtree.
-fn reconcile(root: &Path) -> io::Result<Paths> {
+fn inventory(root: &Path) -> io::Result<(u128, BTreeMap<EntryId, u32>)> {
     fn collect(
         dir: &Path,
         parent: u128,
@@ -72,6 +73,27 @@ fn reconcile(root: &Path) -> io::Result<Paths> {
     let mut entries = BTreeMap::new();
     let mut dirs = BTreeMap::new();
     collect(root, root_id, &mut entries, &mut dirs, 0)?;
+    Ok((root_id, entries))
+}
+fn entry_paths(root_id: u128, entries: &BTreeMap<EntryId, u32>) -> io::Result<Paths> {
+    let dirs: BTreeMap<_, _> = entries
+        .iter()
+        .filter(|(_, a)| **a & 0x10 != 0 && **a & 0x400 == 0)
+        .map(|(e, a)| {
+            (
+                e.object,
+                Record {
+                    object: e.object,
+                    parent: e.parent,
+                    name: e.name.clone(),
+                    attributes: *a,
+                    major: 2,
+                    usn: 0,
+                    reason: 0,
+                },
+            )
+        })
+        .collect();
     let mut paths = Paths::new();
     for entry in entries.keys() {
         let parent = relative(entry.parent, root_id, &dirs)?
@@ -84,6 +106,20 @@ fn reconcile(root: &Path) -> io::Result<Paths> {
         return Err(invalid("namespace path collision; incomplete"));
     }
     Ok(paths)
+}
+fn reconcile(root: &Path) -> io::Result<Paths> {
+    let (root_id, entries) = inventory(root)?;
+    entry_paths(root_id, &entries)
+}
+
+fn scoped_snapshot(root: &Path, checkpoint: Checkpoint) -> io::Result<Snapshot> {
+    let (root_id, entries) = inventory(root)?;
+    Ok(Snapshot {
+        root: root_id,
+        scope: raw(root),
+        entries,
+        checkpoint,
+    })
 }
 
 // Separate directory traversal oracle; it never consults USN or the MFT map.
@@ -226,134 +262,387 @@ fn bootstrap(root: &Path, volume: &Volume) -> io::Result<(Paths, usize, usize)> 
     println!("MFT bootstrap read entire selected volume into bounded transient memory: objects={} batches={} raw_name_bytes={}; no external names logged",map.len(),batches,bytes);
     Ok((paths, map.len(), batches))
 }
-fn replay(
-    root: &Path,
-    volume: &Volume,
-    checkpoint: &Checkpoint,
-    mut paths: Paths,
-) -> io::Result<(Paths, Checkpoint, usize)> {
-    let mut cursor = checkpoint.cursor;
-    let start = Instant::now();
-    let mut consumed = 0;
-    loop {
-        let journal = volume.query()?;
-        Checkpoint {
-            cursor,
-            ..*checkpoint
-        }
-        .validate(volume.serial, &journal)?;
-        let cutoff = journal.next;
-        if cursor == cutoff {
-            return Ok((
-                paths,
-                Checkpoint {
-                    cursor,
-                    ..*checkpoint
-                },
-                consumed,
-            ));
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            return Err(invalid("journal replay time budget; incomplete"));
-        }
-        let (next, records) = volume.read(journal.id, cursor)?;
-        if next == cursor {
-            return Err(invalid(
-                "journal made no progress before cutoff; incomplete",
-            ));
-        }
-        if records.iter().any(|r| r.usn < cursor) {
-            return Err(invalid("journal record behind cursor"));
-        }
-        consumed += records.len();
-        if consumed > 100_000 {
-            return Err(invalid("replay record budget; incomplete"));
-        }
-        // Deliberately conservative: reconcile the ENTIRE small scoped root on
-        // any volume event. This tests continuity, not O(delta) performance.
-        paths = reconcile(root)?;
-        // The cursor is from before the scan. Repeat through the post-scan
-        // boundary until the final scan has no new journal records.
-        cursor = next;
-    }
-}
-pub fn verify(selected: &Path) -> io::Result<()> {
+fn persisted_paths(selected: &Path, storage: &Path) -> io::Result<(PathBuf, PathBuf, String)> {
     let root = fs::canonicalize(selected)?;
+    let storage = fs::canonicalize(storage)?;
     let prefix = fs::canonicalize(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/windows-ntfs-stage-a/run"),
     )?;
     if !root.starts_with(&prefix)
+        || !storage.starts_with(&prefix)
+        || storage.starts_with(&root)
         || !root
             .file_name()
             .is_some_and(|n| n.to_string_lossy().starts_with("fixture-"))
     {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied,"ntfs writes are permitted only in retained fixture-* roots under this probe's engineering run directory"));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,"native persistence requires engineering fixture-* scope and a checkpoint directory outside that scope"));
     }
     let units = raw(&root);
-    let letter = char::from_u32(units[4] as u32).ok_or_else(|| invalid("invalid drive"))?;
-    println!("EXPLICIT OPT-IN: read-only MFT enumeration of volume {letter}:; no user filenames logged; write scope=selected synthetic fixture only");
+    if units.len() < 7
+        || units[..4] != [92, 92, 63, 92]
+        || units[5] != 58
+        || units[6] != 92
+        || units[4] > 127
+        || !(units[4] as u8).is_ascii_alphabetic()
+    {
+        return Err(invalid("drive-backed extended root required"));
+    }
+    let volume = format!("{}:", units[4] as u8 as char);
+    Ok((root, storage.join("inventory.lcusn"), volume))
+}
+fn snapshot_scope(root: &Path, volume: &Volume, snapshot: &Snapshot) -> io::Result<()> {
+    let current = win::identity(root)?;
+    if current.object != snapshot.root
+        || current.volume_serial != snapshot.checkpoint.volume_serial
+        || raw(root) != snapshot.scope
+    {
+        return Err(invalid(
+            "snapshot requires rebuild: scope/root identity changed",
+        ));
+    }
+    snapshot
+        .checkpoint
+        .validate(volume.serial, &volume.query()?)
+}
+fn fixed_scope(expected: &Snapshot, candidate: &Snapshot) -> io::Result<()> {
+    if expected.root != candidate.root
+        || expected.scope != candidate.scope
+        || expected.checkpoint.volume_serial != candidate.checkpoint.volume_serial
+        || expected.checkpoint.journal_id != candidate.checkpoint.journal_id
+    {
+        return Err(invalid(
+            "snapshot requires rebuild: reconciliation changed fixed source identity",
+        ));
+    }
+    Ok(())
+}
+fn replay_snapshot(
+    root: &Path,
+    volume: &Volume,
+    mut snapshot: Snapshot,
+) -> io::Result<(Snapshot, usize)> {
+    let start = Instant::now();
+    let mut consumed = 0;
+    loop {
+        snapshot_scope(root, volume, &snapshot)?;
+        let journal = volume.query()?;
+        snapshot.checkpoint.validate(volume.serial, &journal)?;
+        if snapshot.checkpoint.cursor == journal.next {
+            return Ok((snapshot, consumed));
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            return Err(invalid(
+                "persistent replay budget exceeded; last snapshot preserved",
+            ));
+        }
+        let (next, records) = volume.read(journal.id, snapshot.checkpoint.cursor)?;
+        if next <= snapshot.checkpoint.cursor
+            || records
+                .iter()
+                .any(|r| r.usn < snapshot.checkpoint.cursor || r.usn >= next)
+        {
+            return Err(invalid(
+                "non-progressing/invalid journal batch; requires rebuild",
+            ));
+        }
+        consumed += records.len();
+        if consumed > 100_000 {
+            return Err(invalid(
+                "persistent replay record budget; last snapshot preserved",
+            ));
+        }
+        let checkpoint = Checkpoint {
+            cursor: next,
+            ..snapshot.checkpoint.clone()
+        };
+        let next_snapshot = scoped_snapshot(root, checkpoint)?;
+        fixed_scope(&snapshot, &next_snapshot)?;
+        snapshot_scope(root, volume, &next_snapshot)?;
+        snapshot = next_snapshot;
+    }
+}
+fn stable_snapshot(root: &Path, volume: &Volume, snapshot: &Snapshot) -> io::Result<Paths> {
+    let candidate = entry_paths(snapshot.root, &snapshot.entries)?;
+    let independent = oracle(root)?;
+    snapshot_scope(root, volume, snapshot)?;
+    let journal = volume.query()?;
+    snapshot.checkpoint.validate(volume.serial, &journal)?;
+    if candidate != independent || snapshot.checkpoint.cursor != journal.next {
+        return Err(invalid(
+            "namespace/oracle/cutoff differs; snapshot not published",
+        ));
+    }
+    Ok(candidate)
+}
+pub fn persist_bootstrap(selected: &Path, storage: &Path) -> io::Result<()> {
+    win::diagnostics()?;
     let start = Instant::now();
     let before = win::metrics()?;
-    let volume = Volume::open(&format!("{letter}:"), 0x80000000)?;
+    let run = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| invalid("probe worktree parent missing"))?
+        .join(".scratch/windows-ntfs-stage-a/run");
+    let run_pins = win::DirectoryPins::hold(&run)?;
+    let (root, disk, spec) = persisted_paths(selected, storage)?;
+    let root_pins = win::DirectoryPins::hold(&root)?;
+    let storage_pins = win::DirectoryPins::hold(
+        disk.parent()
+            .ok_or_else(|| invalid("storage parent missing"))?,
+    )?;
+    if disk.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "bootstrap refuses to replace a pre-existing snapshot",
+        ));
+    }
+    println!("bounded_volume_enumeration_requested={spec}; personal_names_not_logged=true");
+    let volume = Volume::open(&spec, 0x80000000)?;
     let journal = volume.query()?;
-    let initial = Checkpoint {
+    let checkpoint = Checkpoint {
         volume_serial: volume.serial,
         journal_id: journal.id,
         cursor: journal.next,
     };
-    let scope = root.join(format!("ntfs-concurrent-{}", std::process::id()));
+    let starting_root = win::identity(&root)?;
+    let scope = root.join(format!("native-building-{}", std::process::id()));
     fs::create_dir(&scope)?;
     fs::write(scope.join("delete.txt"), b"delete")?;
     fs::write(scope.join("old.txt"), b"rename")?;
     fs::create_dir(scope.join("old-dir"))?;
     fs::write(scope.join("old-dir/child.txt"), b"child")?;
+    fs::write(scope.join("link-outer.txt"), b"linked")?;
+    fs::hard_link(
+        scope.join("link-outer.txt"),
+        scope.join("old-dir/link-inner.txt"),
+    )?;
+    fs::write(scope.join("中文-é-😀.txt"), b"unicode")?;
+    fs::write(
+        scope.join(PathBuf::from(OsString::from_wide(&[
+            114, 97, 119, 45, 0xd800, 46, 116, 120, 116,
+        ]))),
+        b"raw",
+    )?;
+    let mut long = scope.clone();
+    while raw(&long).len() < 280 {
+        long.push("long-component-0123456789");
+        fs::create_dir(&long)?;
+    }
+    fs::write(long.join("long.txt"), b"long")?;
+    fs::write(scope.join("stream.txt"), b"base")?;
+    fs::write(scope.join("stream.txt:native-probe"), b"ads")?;
     let changing = scope.clone();
     let worker = thread::spawn(move || -> io::Result<()> {
         thread::sleep(Duration::from_millis(5));
-        fs::write(changing.join("added.txt"), b"add")?;
+        fs::write(changing.join("added.txt"), b"added")?;
         fs::remove_file(changing.join("delete.txt"))?;
         fs::rename(changing.join("old.txt"), changing.join("new.txt"))?;
         fs::rename(changing.join("old-dir"), changing.join("new-dir"))?;
         Ok(())
     });
-    let bootstrap_result = bootstrap(&root, &volume);
-    worker.join().map_err(|_| invalid("mutator panic"))??;
-    let (mft_candidate, _, _) = bootstrap_result?;
-    let candidate = reconcile(&root)?;
-    println!("MFT projection vs complete identity namespace: missing_paths={} extra_paths={}; scoped namespace supplementation is required for general hardlink coverage, not claimed as pure MFT enumeration correctness",candidate.difference(&mft_candidate).count(),mft_candidate.difference(&candidate).count());
-    let (candidate, saved, records) = replay(&root, &volume, &initial, candidate)?;
-    if candidate != oracle(&root)? {
-        return Err(invalid(
-            "MFT/replayed inventory differs from independent complete path set; no checkpoint",
-        ));
+    let result = bootstrap(&root, &volume);
+    worker
+        .join()
+        .map_err(|_| invalid("bootstrap writer panicked"))??;
+    let (mft, objects, batches) = result?;
+    let snapshot = scoped_snapshot(&root, checkpoint)?;
+    if snapshot.root != starting_root.object
+        || snapshot.checkpoint.volume_serial != starting_root.volume_serial
+    {
+        return Err(invalid("bootstrap source identity changed; no publication"));
     }
-    let after_check = volume.query()?;
-    saved.validate(volume.serial, &after_check)?;
-    if after_check.next != saved.cursor {
-        return Err(invalid(
-            "journal advanced across independent oracle; retry required, no complete state",
-        ));
+    let scoped = entry_paths(snapshot.root, &snapshot.entries)?;
+    let projection_complete = scoped == mft;
+    println!(
+        "MFT_projection_missing={} MFT_projection_extra={} mft_projection_complete={projection_complete} namespace_supplementation=true",
+        scoped.difference(&mft).count(),
+        mft.difference(&scoped).count()
+    );
+    let (snapshot, records) = replay_snapshot(&root, &volume, snapshot)?;
+    let paths = stable_snapshot(&root, &volume, &snapshot)?;
+    let links = win::hardlink_names(&scope.join("link-outer.txt"))?;
+    if links.len() != 2
+        || !paths.contains(&raw(&PathBuf::from(format!(
+            "native-building-{}",
+            std::process::id()
+        ))
+        .join("new-dir")
+        .join("link-inner.txt")))
+    {
+        return Err(invalid("hardlink completeness check failed"));
     }
-    // Checkpoint is outside the monitored fixture, to avoid self-generated USN.
-    let disk = prefix.join(format!("native-{}-checkpoint.bin", std::process::id()));
-    saved.save(&disk)?;
+    snapshot.save_new(&disk)?;
     drop(volume);
-    fs::write(scope.join("offline-add.txt"), b"offline")?;
-    fs::remove_file(scope.join("added.txt"))?;
-    fs::rename(scope.join("new.txt"), scope.join("offline-renamed.txt"))?;
-    let loaded = Checkpoint::load(&disk)?;
-    let volume = Volume::open(&format!("{letter}:"), 0x80000000)?;
-    let (recovered, final_checkpoint, offline) = replay(&root, &volume, &loaded, candidate)?;
-    let recovery_oracle = oracle(&root)?;
-    let after_recovery = volume.query()?;
-    final_checkpoint.validate(volume.serial, &after_recovery)?;
-    if recovered != recovery_oracle || after_recovery.next != final_checkpoint.cursor {
-        return Err(invalid(
-            "offline recovery differs at complete stable cutoff",
-        ));
-    }
-    drop(volume);
+    drop((storage_pins, root_pins, run_pins));
     let after = win::metrics()?;
-    println!("NTFS hybrid_correctness=PASS complete_path_set=true entries={} replay_records={} offline_records={} cursor={} elapsed_ms={} handles_before={} handles_after={} total_working_set_bytes={} private_commit_bytes={}; kernel_bytes=UNMEASURED",recovered.len(),records,offline,final_checkpoint.cursor,start.elapsed().as_millis(),before.handles,after.handles,after.working_set,after.private_usage);
+    println!("native_complete=true backend=hybrid phase=bootstrap mft_projection_complete={projection_complete} inventory_and_cursor_atomic=true entries={} objects={} batches={} replay_records={} journal_id={:#x} cursor={} elapsed_ms={} handles_before={} handles_after={} total_working_set_bytes={} private_commit_bytes={} kernel_bytes=unmeasured",paths.len(),objects,batches,records,snapshot.checkpoint.journal_id,snapshot.checkpoint.cursor,start.elapsed().as_millis(),before.handles,after.handles,after.working_set,after.private_usage);
     Ok(())
+}
+pub fn persist_recover(selected: &Path, storage: &Path) -> io::Result<()> {
+    win::diagnostics()?;
+    let start = Instant::now();
+    let before = win::metrics()?;
+    let run = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| invalid("probe worktree parent missing"))?
+        .join(".scratch/windows-ntfs-stage-a/run");
+    let run_pins = win::DirectoryPins::hold(&run)?;
+    let (root, disk, spec) = persisted_paths(selected, storage)?;
+    let root_pins = win::DirectoryPins::hold(&root)?;
+    let storage_pins = win::DirectoryPins::hold(
+        disk.parent()
+            .ok_or_else(|| invalid("storage parent missing"))?,
+    )?;
+    let saved = Snapshot::load(&disk)?;
+    // No MFT enumeration on resume. Journal/provenance failure leaves disk intact.
+    let volume = Volume::open(&spec, 0x80000000)?;
+    snapshot_scope(&root, &volume, &saved)?;
+    let previous = saved.checkpoint.cursor;
+    let (snapshot, records) = replay_snapshot(&root, &volume, saved)?;
+    let paths = stable_snapshot(&root, &volume, &snapshot)?;
+    snapshot.save(&disk)?;
+    drop(volume);
+    drop((storage_pins, root_pins, run_pins));
+    let after = win::metrics()?;
+    println!("native_complete=true backend=hybrid phase=recover separate_process_inventory=true entries={} replay_records={} previous_cursor={} cursor={} elapsed_ms={} handles_before={} handles_after={} total_working_set_bytes={} private_commit_bytes={} kernel_bytes=unmeasured",paths.len(),records,previous,snapshot.checkpoint.cursor,start.elapsed().as_millis(),before.handles,after.handles,after.working_set,after.private_usage);
+    Ok(())
+}
+
+#[cfg(test)]
+mod persistent_tests {
+    use super::*;
+    #[test]
+    fn child_snapshot_reader() {
+        let Some(path) = std::env::var_os("LOCI_SNAPSHOT_TEST_INPUT") else {
+            return;
+        };
+        let disk = fs::canonicalize(PathBuf::from(path)).unwrap();
+        let engineering = fs::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/windows-ntfs-stage-a/run"),
+        )
+        .unwrap();
+        assert!(disk.starts_with(engineering));
+        let saved = Snapshot::load(&disk).unwrap();
+        let root = PathBuf::from(OsString::from_wide(&saved.scope));
+        assert_eq!(saved.root, win::identity(&root).unwrap().object);
+        assert_eq!(
+            entry_paths(saved.root, &saved.entries).unwrap(),
+            oracle(&root).unwrap()
+        );
+    }
+    #[test]
+    fn real_inventory_file_survives_process_exit_and_failed_recovery() {
+        let run =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/windows-ntfs-stage-a/run");
+        fs::create_dir_all(&run).unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = run.join(format!("persistent-unit-{}-{nonce}", std::process::id()));
+        fs::create_dir(&base).unwrap();
+        let root = base.join("fixture-snapshot");
+        let store = base.join("store");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&store).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        fs::create_dir(root.join("child")).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::hard_link(root.join("a.txt"), root.join("child/link.txt")).unwrap();
+        fs::write(
+            root.join(OsString::from_wide(&[114, 0xd800, 46, 116, 120, 116])),
+            b"raw",
+        )
+        .unwrap();
+        // Real file/process I/O, explicitly injected journal provenance. This
+        // does NOT demonstrate native USN continuity or offline journal replay.
+        let snapshot = scoped_snapshot(
+            &root,
+            Checkpoint {
+                volume_serial: win::identity(&root).unwrap().volume_serial,
+                journal_id: u64::MAX,
+                cursor: 0,
+            },
+        )
+        .unwrap();
+        let disk = store.join("inventory.lcusn");
+        snapshot.save_new(&disk).unwrap();
+        let original = fs::read(&disk).unwrap();
+        let overwrite_error = snapshot.save_new(&disk).unwrap_err();
+        assert!(overwrite_error.raw_os_error().is_some());
+        println!(
+            "real_bootstrap_overwrite_refused=true os_code={:?}",
+            overwrite_error.raw_os_error()
+        );
+        assert_eq!(fs::read(&disk).unwrap(), original);
+        {
+            let storage_pins = win::DirectoryPins::hold(&store).unwrap();
+            let root_pins = win::DirectoryPins::hold(&root).unwrap();
+            let store_error = fs::rename(&store, base.join("store-moved")).unwrap_err();
+            let root_error = fs::rename(&root, base.join("fixture-moved")).unwrap_err();
+            assert!(store_error.raw_os_error().is_some() && root_error.raw_os_error().is_some());
+            snapshot.save(&disk).unwrap();
+            assert_eq!(fs::read(&disk).unwrap(), original);
+            println!("real_directory_swap_refused=true storage_os_code={:?} root_os_code={:?} child_file_atomic_replace=true",store_error.raw_os_error(),root_error.raw_os_error());
+            drop((storage_pins, root_pins));
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sync::persistent_tests::child_snapshot_reader",
+                "--nocapture",
+            ])
+            .env("LOCI_SNAPSHOT_TEST_INPUT", &disk)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(Snapshot::load(&disk).unwrap(), snapshot);
+        fs::write(root.join("offline-added.txt"), b"offline").unwrap();
+        assert_ne!(
+            entry_paths(snapshot.root, &snapshot.entries).unwrap(),
+            oracle(&root).unwrap()
+        );
+        let recovery_error = persist_recover(&root, &store).unwrap_err();
+        println!(
+            "failed_recovery_kind={:?} failed_recovery_os_code={:?}",
+            recovery_error.kind(),
+            recovery_error.raw_os_error()
+        );
+        assert_eq!(
+            fs::read(&disk).unwrap(),
+            original,
+            "unreadable or incompatible journal must preserve the last inventory+cursor"
+        );
+        println!("real_snapshot_cross_process=true journal_provenance=injected native_usn_replay=unverified");
+        // Keep this uniquely owned small test case in the ignored engineering root.
+    }
+    #[test]
+    fn injected_reconciliation_cannot_adopt_replaced_source_identity() {
+        let original = Snapshot {
+            root: 10,
+            scope: vec![68, 58, 92, 116],
+            entries: BTreeMap::new(),
+            checkpoint: Checkpoint {
+                volume_serial: 1,
+                journal_id: 2,
+                cursor: 3,
+            },
+        };
+        let mut candidate = original.clone();
+        candidate.root = 11;
+        assert!(fixed_scope(&original, &candidate).is_err());
+        candidate = original.clone();
+        candidate.scope.push(120);
+        assert!(fixed_scope(&original, &candidate).is_err());
+        candidate = original.clone();
+        candidate.checkpoint.volume_serial += 1;
+        assert!(fixed_scope(&original, &candidate).is_err());
+        candidate = original.clone();
+        candidate.checkpoint.journal_id += 1;
+        assert!(fixed_scope(&original, &candidate).is_err());
+        candidate = original.clone();
+        candidate.checkpoint.cursor += 1;
+        assert!(fixed_scope(&original, &candidate).is_ok());
+    }
 }
