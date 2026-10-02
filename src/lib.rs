@@ -12,3 +12,6 @@ mod signatures;
 
 pub mod incremental;
 mod partitioned;
+
+/// Stable event-source seam under v0.1 development.
+pub mod events;

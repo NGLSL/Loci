@@ -49,3 +49,5 @@
 !/scripts/measure-incremental.py
 !/docs/INCREMENTAL.md
 !/tests/incremental_rename_regressions.rs
+!/src/events.rs
+!/docs/V0.1-INTERFACES.md
