@@ -74,6 +74,29 @@ impl SearchIndex {
     pub fn allocated_bytes(&self) -> usize {
         self.allocated
     }
+    pub(super) fn uniquely_owned_bytes(&self) -> usize {
+        let mut bytes = self.filters.capacity() * std::mem::size_of::<Arc<Filters>>();
+        bytes += self
+            .filters
+            .iter()
+            .filter(|filter| Arc::strong_count(filter) == 1)
+            .count()
+            * (std::mem::size_of::<Filters>() + 2 * std::mem::size_of::<usize>());
+        if Arc::strong_count(&self.directories) == 1 {
+            // Capacity times entry payload is a lower bound on the real map
+            // allocation; no conservative 64-byte accounting estimate here.
+            bytes += std::mem::size_of::<HashMap<EntryId, Arc<Vec<u8>>>>()
+                + 16
+                + self.directories.capacity() * std::mem::size_of::<(EntryId, Arc<Vec<u8>>)>();
+            bytes += self
+                .directories
+                .values()
+                .filter(|prefix| Arc::strong_count(prefix) == 1)
+                .map(|prefix| std::mem::size_of::<Vec<u8>>() + 16 + prefix.capacity())
+                .sum::<usize>();
+        }
+        bytes
+    }
     pub fn accounted_bytes(&self, seen: &mut HashSet<usize>) -> usize {
         let mut bytes = self.filters.capacity() * std::mem::size_of::<Arc<Filters>>();
         for filter in &self.filters {

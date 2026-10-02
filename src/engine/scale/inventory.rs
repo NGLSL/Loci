@@ -65,7 +65,8 @@ impl Drop for Data {
             .filter(|segment| Arc::strong_count(segment) == 1)
             .map(|segment| segment.allocated_bytes())
             .fold(0usize, usize::saturating_add);
-        self.reclaim.arm(unique_raw_bytes);
+        self.reclaim
+            .arm(unique_raw_bytes.saturating_add(self.search.uniquely_owned_bytes()));
     }
 }
 impl Data {
