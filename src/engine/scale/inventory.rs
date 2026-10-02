@@ -28,23 +28,18 @@ pub(super) struct Entry {
 }
 #[derive(Default)]
 struct Segment {
-    entries: Vec<Entry>,
-    names: Vec<u8>,
-}
-impl Clone for Segment {
-    fn clone(&self) -> Self {
-        let mut entries = Vec::with_capacity(self.entries.capacity());
-        entries.extend_from_slice(&self.entries);
-        let mut names = Vec::with_capacity(self.names.capacity());
-        names.extend_from_slice(&self.names);
-        Self { entries, names }
-    }
+    entries: super::mapped::Buffer<Entry>,
+    names: super::mapped::Buffer<u8>,
 }
 impl Segment {
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            entries: self.entries.try_clone()?,
+            names: self.names.try_clone()?,
+        })
+    }
     fn allocated_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.entries.capacity() * std::mem::size_of::<Entry>()
-            + self.names.capacity()
+        std::mem::size_of::<Self>() + self.entries.allocated_bytes() + self.names.allocated_bytes()
     }
 }
 #[derive(Clone)]
@@ -278,10 +273,12 @@ impl Inventory {
                     .segments
                     .reserve_exact(target - self.data.segments.len());
             }
-            self.allocation(BLOCK * std::mem::size_of::<Entry>() + std::mem::size_of::<Segment>())?;
+            self.allocation(
+                super::mapped::allocation_bytes::<Entry>(BLOCK)? + std::mem::size_of::<Segment>(),
+            )?;
             self.data.segments.push(Arc::new(Segment {
-                entries: Vec::with_capacity(BLOCK),
-                names: vec![],
+                entries: super::mapped::Buffer::with_capacity(BLOCK)?,
+                names: super::mapped::Buffer::default(),
             }));
         }
         let block = self.data.segments.len() - 1;
@@ -340,7 +337,7 @@ impl Inventory {
             self.credit(bytes)?;
         }
         let name = self.data.name(id).to_vec();
-        self.data.search.set(id, parent, kind, &name);
+        self.data.search.set(id, parent, kind, &name)?;
         Ok(())
     }
     /// Compaction inserts parent-first and has already derived every entry.
@@ -402,8 +399,9 @@ impl Inventory {
             self.credit(self.data.segments[block].allocated_bytes())?;
             self.copied_segments += 1;
             self.copied_entries += self.data.segments[block].entries.len();
+            self.data.segments[block] = Arc::new(self.data.segments[block].try_clone()?);
         }
-        Ok(Arc::make_mut(&mut self.data.segments[block]))
+        Ok(Arc::get_mut(&mut self.data.segments[block]).expect("exclusive writer segment"))
     }
     fn reserve_names(&mut self, block: usize, extra: usize) -> io::Result<()> {
         let segment = &self.data.segments[block];
@@ -413,10 +411,15 @@ impl Inventory {
             .checked_add(extra)
             .ok_or_else(|| io::Error::other("name arena overflow"))?;
         if required > segment.names.capacity() {
-            let target = (segment.names.capacity() * 2).max(required).max(64);
-            self.allocation(target - segment.names.capacity())?;
+            let target = super::mapped::allocation_bytes::<u8>(
+                (segment.names.capacity() * 2).max(required).max(64),
+            )?;
+            let previous = segment.names.allocated_bytes();
+            self.allocation(target - previous)?;
+            // Growth temporarily holds both mappings, in addition to any COW copy.
+            self.credit(previous)?;
             let segment = self.segment_mut(block)?;
-            segment.names.reserve_exact(target - segment.names.len());
+            segment.names.reserve_capacity(target)?;
         }
         Ok(())
     }

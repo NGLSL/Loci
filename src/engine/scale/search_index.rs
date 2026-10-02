@@ -24,9 +24,12 @@ impl Default for Filters {
         }
     }
 }
+fn filter_bytes() -> usize {
+    super::mapped::allocation_bytes::<Filters>(1).expect("fixed filter capacity")
+}
 #[derive(Clone)]
 pub(super) struct SearchIndex {
-    filters: Vec<Arc<Filters>>,
+    filters: Vec<Arc<super::mapped::Buffer<Filters>>>,
     directories: Arc<HashMap<EntryId, Arc<Vec<u8>>>>,
     pub derived: usize,
     allocated: usize,
@@ -75,13 +78,14 @@ impl SearchIndex {
         self.allocated
     }
     pub(super) fn uniquely_owned_bytes(&self) -> usize {
-        let mut bytes = self.filters.capacity() * std::mem::size_of::<Arc<Filters>>();
+        let mut bytes =
+            self.filters.capacity() * std::mem::size_of::<Arc<super::mapped::Buffer<Filters>>>();
         bytes += self
             .filters
             .iter()
             .filter(|filter| Arc::strong_count(filter) == 1)
             .count()
-            * (std::mem::size_of::<Filters>() + 2 * std::mem::size_of::<usize>());
+            * (filter_bytes() + std::mem::size_of::<super::mapped::Buffer<Filters>>() + 16);
         if Arc::strong_count(&self.directories) == 1 {
             // Capacity times entry payload is a lower bound on the real map
             // allocation; no conservative 64-byte accounting estimate here.
@@ -98,10 +102,12 @@ impl SearchIndex {
         bytes
     }
     pub fn accounted_bytes(&self, seen: &mut HashSet<usize>) -> usize {
-        let mut bytes = self.filters.capacity() * std::mem::size_of::<Arc<Filters>>();
+        let mut bytes =
+            self.filters.capacity() * std::mem::size_of::<Arc<super::mapped::Buffer<Filters>>>();
         for filter in &self.filters {
             if seen.insert(Arc::as_ptr(filter) as usize) {
-                bytes += std::mem::size_of::<Filters>() + 2 * std::mem::size_of::<usize>();
+                bytes +=
+                    filter_bytes() + std::mem::size_of::<super::mapped::Buffer<Filters>>() + 16;
             }
         }
         if seen.insert(Arc::as_ptr(&self.directories) as usize) {
@@ -125,12 +131,13 @@ impl SearchIndex {
         let block = id as usize / SEGMENT;
         let mut bytes = 0;
         if block >= self.filters.len() {
-            bytes += std::mem::size_of::<Filters>() + 16;
+            bytes += filter_bytes() + std::mem::size_of::<super::mapped::Buffer<Filters>>() + 16;
             if self.filters.len() == self.filters.capacity() {
-                bytes += self.filters.capacity().max(4) * std::mem::size_of::<Arc<Filters>>();
+                bytes += self.filters.capacity().max(4)
+                    * std::mem::size_of::<Arc<super::mapped::Buffer<Filters>>>();
             }
         } else if Arc::strong_count(&self.filters[block]) > 1 {
-            bytes += std::mem::size_of::<Filters>() + 16;
+            bytes += filter_bytes() + std::mem::size_of::<super::mapped::Buffer<Filters>>() + 16;
         }
         if kind == Kind::Directory {
             if Arc::strong_count(&self.directories) > 1 {
@@ -145,17 +152,30 @@ impl SearchIndex {
         }
         bytes
     }
-    pub fn set(&mut self, id: EntryId, parent: EntryId, kind: Kind, name: &[u8]) {
+    pub fn set(
+        &mut self,
+        id: EntryId,
+        parent: EntryId,
+        kind: Kind,
+        name: &[u8],
+    ) -> std::io::Result<()> {
         let mut path = self.normalized_path(parent, name);
         let block = id as usize / SEGMENT;
         let old_capacity = self.filters.capacity();
         while self.filters.len() <= block {
-            self.filters.push(Arc::new(Filters::default()));
-            self.allocated += std::mem::size_of::<Filters>() + 16;
+            let mut storage = super::mapped::Buffer::with_capacity(1)?;
+            storage.push(Filters::default());
+            self.filters.push(Arc::new(storage));
+            self.allocated +=
+                filter_bytes() + std::mem::size_of::<super::mapped::Buffer<Filters>>() + 16;
         }
-        self.allocated +=
-            (self.filters.capacity() - old_capacity) * std::mem::size_of::<Arc<Filters>>();
-        let filter = Arc::make_mut(&mut self.filters[block]);
+        self.allocated += (self.filters.capacity() - old_capacity)
+            * std::mem::size_of::<Arc<super::mapped::Buffer<Filters>>>();
+        if Arc::strong_count(&self.filters[block]) > 1 {
+            self.filters[block] = Arc::new(self.filters[block].try_clone()?);
+        }
+        let filter =
+            &mut Arc::get_mut(&mut self.filters[block]).expect("exclusive filter segment")[0];
         let word = id as usize % SEGMENT / 64;
         let bit = 1u64 << (id as usize % 64);
         if filter.ready[word] & bit == 0 {
@@ -193,6 +213,7 @@ impl SearchIndex {
                     std::mem::size_of::<Vec<u8>>() + prefix.capacity() + 16
                 });
         }
+        Ok(())
     }
     pub fn normalized_path(&self, parent: EntryId, name: &[u8]) -> Vec<u8> {
         let mut path = Vec::new();
@@ -215,7 +236,7 @@ impl SearchIndex {
         short: &ShortSignature,
         pairs: &PairSignature,
     ) -> bool {
-        let filter = &self.filters[id as usize / SEGMENT];
+        let filter = &self.filters[id as usize / SEGMENT][0];
         filter.grams[id as usize % SEGMENT] & grams == grams
             && filter.pairs[id as usize % SEGMENT].contains(pairs)
             && filter.short[id as usize % SEGMENT / SHORT_BLOCK].contains(short)

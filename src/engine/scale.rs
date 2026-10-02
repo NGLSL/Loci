@@ -2,6 +2,7 @@
 //! native mode; persistence and increased scale budgets are separate milestones.
 pub(super) mod checkpoint;
 mod inventory;
+mod mapped;
 pub(crate) mod memory;
 pub(super) mod query;
 mod scope;
