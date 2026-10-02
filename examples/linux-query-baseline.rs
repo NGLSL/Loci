@@ -134,6 +134,7 @@ fn main() -> std::io::Result<()> {
         assert_eq!(count.state(), QueryJobState::Complete);
         assert_eq!(count.count(), Some(expected.len()));
         drop(count);
+        writeln!(log, "{{\"type\":\"case\",\"case\":{case},\"query\":{query:?},\"exact_matches\":{},\"oracle_equal\":true,\"count_equal\":true}}", expected.len())?;
         let mut timings = Vec::new();
         for repetition in 0..200 {
             let started = Instant::now();
@@ -185,9 +186,26 @@ fn main() -> std::io::Result<()> {
     }
     assert_eq!(actual, oracle);
     drop(sorted);
+    let first_job = handle.start_sort("")?;
+    let second_job = handle.start_sort("")?;
+    assert!(
+        matches!(handle.start_sort(""), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    first_job.cancel();
+    second_job.cancel();
+    drop(first_job);
+    drop(second_job);
+    writeln!(log, "{{\"type\":\"jobs\",\"sorted_oracle_equal\":true,\"third_worker_rejected\":true,\"cancelled_workers_joined\":true}}")?;
     all_ns.sort_unstable();
     eprintln!("aggregate_queries={},build_ms={build_ms:.6},p50_ms={:.6},p95_ms={:.6},p99_ms={:.6},resources={:?}", all_ns.len(), all_ns[all_ns.len()/2-1] as f64 / 1e6, all_ns[all_ns.len()*95/100-1] as f64 / 1e6, all_ns[all_ns.len()*99/100-1] as f64 / 1e6, engine.view().resources);
     log.flush()?;
+    eprintln!(
+        "harness_memory={:?}",
+        fs::read_to_string("/proc/self/status")?
+            .lines()
+            .filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+            .collect::<Vec<_>>()
+    );
     engine.stop()
 }
 #[cfg(not(target_os = "linux"))]
