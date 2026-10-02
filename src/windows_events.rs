@@ -261,6 +261,10 @@ pub struct WindowsEvents {
     request: Option<Request>,
     limits: EventLimits,
     old_name: Option<(PathBuf, Instant)>,
+    #[cfg(test)]
+    test_completion: Option<Vec<u8>>,
+    #[cfg(test)]
+    test_now: Option<Instant>,
 }
 impl WindowsEvents {
     pub fn open(root: &Path, limits: EventLimits) -> io::Result<Self> {
@@ -311,7 +315,38 @@ impl WindowsEvents {
             request: Some(request),
             limits,
             old_name: None,
+            #[cfg(test)]
+            test_completion: None,
+            #[cfg(test)]
+            test_now: None,
         })
+    }
+    // Deterministic completion/clock seam only for tests. Injected bytes never
+    // touch the live kernel buffer or OVERLAPPED; native I/O remains pending.
+    #[cfg(test)]
+    pub(crate) fn inject_completion_for_test(&mut self, bytes: Vec<u8>, now: Instant) {
+        assert!(self.test_completion.is_none());
+        self.test_completion = Some(bytes);
+        self.test_now = Some(now);
+    }
+    #[cfg(test)]
+    pub(crate) fn advance_clock_for_test(&mut self, now: Instant) {
+        self.test_now = Some(now);
+    }
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_now {
+            return now;
+        }
+        Instant::now()
+    }
+    fn finish_batch(&self, mut batch: EventBatch) -> EventBatch {
+        // Old-only and idle pending batches cannot establish a reliable cut.
+        // Retain one bounded old-name for pairing until its deadline.
+        if self.old_name.is_some() {
+            batch.losses.insert(Loss::UnpairedRename);
+        }
+        batch
     }
     fn arm_or_loss(&mut self, batch: &mut EventBatch) -> io::Result<bool> {
         match self.request.as_mut().unwrap().arm() {
@@ -336,6 +371,7 @@ impl WindowsEvents {
         limits: EventLimits,
         old_name: &mut Option<(PathBuf, Instant)>,
         bytes: &[u8],
+        now: Instant,
         batch: &mut EventBatch,
     ) {
         let mut offset = 0;
@@ -360,6 +396,7 @@ impl WindowsEvents {
             }
             let end = offset + 12 + length;
             if end > bytes.len()
+                || (next == 0 && bytes.len() - end > 3)
                 || (next != 0
                     && (next % 4 != 0
                         || next < 12 + length
@@ -390,11 +427,11 @@ impl WindowsEvents {
                 FILE_ACTION_ADDED | FILE_ACTION_MODIFIED => Some(Change::Refresh(path)),
                 FILE_ACTION_REMOVED => Some(Change::Remove(path)),
                 FILE_ACTION_RENAMED_OLD_NAME => {
-                    *old_name = Some((path, Instant::now()));
+                    *old_name = Some((path, now));
                     None
                 }
                 FILE_ACTION_RENAMED_NEW_NAME => match old_name.take() {
-                    Some((from, at)) if at.elapsed() < RENAME_TTL => {
+                    Some((from, at)) if now.saturating_duration_since(at) < RENAME_TTL => {
                         Some(Change::Rename { from, to: path })
                     }
                     _ => {
@@ -431,12 +468,26 @@ impl EventSource for WindowsEvents {
             batch.state = SourceState::Stopped;
             return Ok(batch);
         }
+        let now = self.now();
         if self
             .old_name
             .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() >= RENAME_TTL)
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= RENAME_TTL)
         {
             Self::lose_rename(&mut self.old_name, &mut batch);
+        }
+        #[cfg(test)]
+        if let Some(bytes) = self.test_completion.take() {
+            if bytes.is_empty() {
+                batch.losses.insert(Loss::KernelOverflow);
+                Self::lose_rename(&mut self.old_name, &mut batch);
+            } else if bytes.len() > self.limits.buffer_bytes() {
+                batch.losses.insert(Loss::InvalidEvent);
+                Self::lose_rename(&mut self.old_name, &mut batch);
+            } else {
+                Self::decode(self.limits, &mut self.old_name, &bytes, now, &mut batch);
+            }
+            return Ok(self.finish_batch(batch));
         }
         if !self.request.as_ref().unwrap().pending && !self.arm_or_loss(&mut batch)? {
             return Ok(batch);
@@ -459,7 +510,7 @@ impl EventSource for WindowsEvents {
                         let bytes = unsafe {
                             std::slice::from_raw_parts(request.storage.buffer as *const u8, length)
                         };
-                        Self::decode(self.limits, &mut self.old_name, bytes, &mut batch);
+                        Self::decode(self.limits, &mut self.old_name, bytes, now, &mut batch);
                     }
                 }
                 Err(error) if error.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR) => {
@@ -489,17 +540,14 @@ impl EventSource for WindowsEvents {
                 break;
             }
         }
-        // An old-only completion consumed a real event. Until it is paired or
-        // expires, even another empty poll cannot represent a reliable cut.
-        // Keep the name for bounded cross-read pairing; the engine discards
-        // this incomplete batch and remains Pending instead of publishing it.
-        if self.old_name.is_some() {
-            batch.losses.insert(Loss::UnpairedRename);
-        }
-        Ok(batch)
+        Ok(self.finish_batch(batch))
     }
     fn stop(&mut self) -> io::Result<()> {
         self.old_name = None;
+        #[cfg(test)]
+        {
+            self.test_completion = None;
+        }
         if let Some(mut request) = self.request.take() {
             request.cancel()
         } else {

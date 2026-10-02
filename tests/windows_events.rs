@@ -371,3 +371,247 @@ fn native_attribute_changes_refresh_the_entry() {
     fs::set_permissions(path, permissions).unwrap();
     assert!(batch.losses.is_empty());
 }
+
+// The following tests inject FILE_NOTIFY_INFORMATION completion payloads and
+// virtual timestamps. They verify decoder/poll state, not native delivery.
+fn injected_record(action: u32, name: &str) -> Vec<u8> {
+    let wide: Vec<u16> = name.encode_utf16().collect();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&action.to_le_bytes());
+    bytes.extend_from_slice(&((wide.len() * 2) as u32).to_le_bytes());
+    for unit in wide {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+#[test]
+fn injected_old_then_new_in_separate_completions_never_exposes_reliable_pending_batch() {
+    let _serial = SERIAL.lock().unwrap();
+    let fixture = Fixture::new();
+    let mut source = WindowsEvents::open(&fixture.0, EventLimits::default()).unwrap();
+    let now = Instant::now();
+    source.inject_completion_for_test(injected_record(4, "before.txt"), now);
+    let old_only = source.poll().unwrap();
+    assert_eq!(old_only.state, SourceState::Watching);
+    assert!(old_only.changes.is_empty());
+    assert!(old_only.losses.contains(&events::Loss::UnpairedRename));
+    source.advance_clock_for_test(now + Duration::from_millis(1));
+    let waiting = source.poll().unwrap();
+    assert!(waiting.changes.is_empty());
+    assert!(waiting.losses.contains(&events::Loss::UnpairedRename));
+    source.inject_completion_for_test(
+        injected_record(5, "after.txt"),
+        now + Duration::from_millis(2),
+    );
+    let paired = source.poll().unwrap();
+    assert_eq!(
+        paired.changes,
+        vec![Change::Rename {
+            from: "before.txt".into(),
+            to: "after.txt".into()
+        }]
+    );
+    assert!(paired.losses.is_empty());
+}
+
+#[test]
+fn injected_old_only_expires_at_deadline_and_late_new_is_unpaired() {
+    let _serial = SERIAL.lock().unwrap();
+    let fixture = Fixture::new();
+    let mut source = WindowsEvents::open(&fixture.0, EventLimits::default()).unwrap();
+    let now = Instant::now();
+    source.inject_completion_for_test(injected_record(4, "expired.txt"), now);
+    assert!(source
+        .poll()
+        .unwrap()
+        .losses
+        .contains(&events::Loss::UnpairedRename));
+    source.advance_clock_for_test(now + Duration::from_millis(99));
+    assert!(source
+        .poll()
+        .unwrap()
+        .losses
+        .contains(&events::Loss::UnpairedRename));
+    source.advance_clock_for_test(now + Duration::from_millis(100));
+    let expired = source.poll().unwrap();
+    assert!(expired.changes.is_empty());
+    assert!(expired.losses.contains(&events::Loss::UnpairedRename));
+    source.advance_clock_for_test(now + Duration::from_millis(101));
+    let idle = source.poll().unwrap();
+    assert!(idle.changes.is_empty() && idle.losses.is_empty());
+    source.inject_completion_for_test(
+        injected_record(5, "too-late.txt"),
+        now + Duration::from_millis(102),
+    );
+    let late = source.poll().unwrap();
+    assert!(late.changes.is_empty());
+    assert!(late.losses.contains(&events::Loss::UnpairedRename));
+}
+#[test]
+fn injected_pending_rename_stop_discards_staged_new_and_releases_native_handles() {
+    let _serial = SERIAL.lock().unwrap();
+    let fixture = Fixture::new();
+    let baseline = handle_count();
+    let mut source = WindowsEvents::open(&fixture.0, EventLimits::default()).unwrap();
+    let now = Instant::now();
+    source.inject_completion_for_test(injected_record(4, "before.txt"), now);
+    assert!(source
+        .poll()
+        .unwrap()
+        .losses
+        .contains(&events::Loss::UnpairedRename));
+    source.inject_completion_for_test(
+        injected_record(5, "after.txt"),
+        now + Duration::from_millis(1),
+    );
+    source.stop().unwrap();
+    source.stop().unwrap();
+    assert_eq!(handle_count(), baseline);
+    for _ in 0..3 {
+        let batch = source.poll().unwrap();
+        assert_eq!(batch.state, SourceState::Stopped);
+        assert!(batch.changes.is_empty() && batch.losses.is_empty());
+    }
+}
+#[test]
+fn injected_trailing_record_bytes_are_loss_and_cannot_pair_with_old_name() {
+    let _serial = SERIAL.lock().unwrap();
+    let fixture = Fixture::new();
+    let mut source = WindowsEvents::open(&fixture.0, EventLimits::default()).unwrap();
+    let now = Instant::now();
+    source.inject_completion_for_test(injected_record(4, "before.txt"), now);
+    source.poll().unwrap();
+    let mut malformed = injected_record(5, "after.txt");
+    malformed.extend_from_slice(&[0; 4]); // beyond possible DWORD padding
+    source.inject_completion_for_test(malformed, now + Duration::from_millis(1));
+    let batch = source.poll().unwrap();
+    assert!(batch.losses.contains(&events::Loss::InvalidEvent));
+    assert!(batch.losses.contains(&events::Loss::UnpairedRename));
+    assert!(batch.changes.is_empty());
+}
+
+#[test]
+fn injected_malformed_completions_are_loss_and_retire_pending_rename() {
+    let _serial = SERIAL.lock().unwrap();
+    let fixture = Fixture::new();
+    let mut source = WindowsEvents::open(&fixture.0, EventLimits::default()).unwrap();
+    let mut malformed = Vec::new();
+    malformed.push(vec![0; 11]);
+    for (field, value) in [
+        (8usize, 0u32),
+        (8, 1),
+        (8, 4098),
+        (8, u32::MAX),
+        (0, 1),
+        (0, 12),
+        (0, 4096),
+        (0, u32::MAX),
+    ] {
+        let mut bytes = injected_record(5, "after.txt");
+        bytes[field..field + 4].copy_from_slice(&value.to_le_bytes());
+        malformed.push(bytes);
+    }
+    let mut truncated_name = injected_record(5, "after.txt");
+    truncated_name.pop();
+    malformed.push(truncated_name);
+    malformed.push(injected_record(99, "after.txt"));
+    for name in [
+        "C:\\escape.txt",
+        "\\escape.txt",
+        "\\\\host\\share\\escape.txt",
+        "..\\escape.txt",
+        "dir\\..\\escape.txt",
+        ".\\escape.txt",
+        "dir\\\\escape.txt",
+        "entry:stream",
+        "entry\0name",
+        "",
+    ] {
+        malformed.push(injected_record(5, name));
+    }
+    let mut bad_next_header = injected_record(1, "valid.txt");
+    let next = bad_next_header.len().next_multiple_of(4);
+    bad_next_header[0..4].copy_from_slice(&(next as u32).to_le_bytes());
+    bad_next_header.resize(next + 1, 0);
+    malformed.push(bad_next_header);
+    malformed.push(vec![0; EventLimits::default().buffer_bytes() + 4]);
+    let now = Instant::now();
+    for (case, bytes) in malformed.into_iter().enumerate() {
+        let at = now + Duration::from_millis(case as u64 * 3);
+        source.inject_completion_for_test(injected_record(4, "before.txt"), at);
+        assert!(source
+            .poll()
+            .unwrap()
+            .losses
+            .contains(&events::Loss::UnpairedRename));
+        source.inject_completion_for_test(bytes, at + Duration::from_millis(1));
+        let bad = source.poll().unwrap();
+        assert!(
+            bad.losses.contains(&events::Loss::InvalidEvent),
+            "malformed case {case}"
+        );
+        assert!(
+            bad.losses.contains(&events::Loss::UnpairedRename),
+            "malformed case {case}"
+        );
+        assert!(
+            !bad.changes
+                .iter()
+                .any(|c| matches!(c, Change::Rename { .. })),
+            "malformed case {case}"
+        );
+        source.inject_completion_for_test(
+            injected_record(5, "later.txt"),
+            at + Duration::from_millis(2),
+        );
+        let later = source.poll().unwrap();
+        assert!(
+            later.changes.is_empty(),
+            "stale old-name paired in case {case}"
+        );
+        assert!(later.losses.contains(&events::Loss::UnpairedRename));
+    }
+}
+#[test]
+fn injected_zero_byte_completion_is_kernel_loss_and_breaks_rename_pairing() {
+    let _serial = SERIAL.lock().unwrap();
+    let fixture = Fixture::new();
+    let mut source = WindowsEvents::open(&fixture.0, EventLimits::default()).unwrap();
+    let now = Instant::now();
+    source.inject_completion_for_test(injected_record(4, "before.txt"), now);
+    source.poll().unwrap();
+    source.inject_completion_for_test(Vec::new(), now + Duration::from_millis(1));
+    let overflow = source.poll().unwrap();
+    assert!(overflow.losses.contains(&events::Loss::KernelOverflow));
+    assert!(overflow.losses.contains(&events::Loss::UnpairedRename));
+    source.inject_completion_for_test(
+        injected_record(5, "after.txt"),
+        now + Duration::from_millis(2),
+    );
+    let new_only = source.poll().unwrap();
+    assert!(new_only.changes.is_empty());
+    assert!(new_only.losses.contains(&events::Loss::UnpairedRename));
+}
+#[test]
+fn injected_intervening_record_cannot_pair_two_different_rename_observations() {
+    let _serial = SERIAL.lock().unwrap();
+    let fixture = Fixture::new();
+    let mut source = WindowsEvents::open(&fixture.0, EventLimits::default()).unwrap();
+    let now = Instant::now();
+    source.inject_completion_for_test(injected_record(4, "before.txt"), now);
+    source.poll().unwrap();
+    source.inject_completion_for_test(
+        injected_record(1, "unrelated.txt"),
+        now + Duration::from_millis(1),
+    );
+    let interrupted = source.poll().unwrap();
+    assert!(interrupted.losses.contains(&events::Loss::UnpairedRename));
+    source.inject_completion_for_test(
+        injected_record(5, "after.txt"),
+        now + Duration::from_millis(2),
+    );
+    let new_only = source.poll().unwrap();
+    assert!(new_only.changes.is_empty());
+    assert!(new_only.losses.contains(&events::Loss::UnpairedRename));
+}
