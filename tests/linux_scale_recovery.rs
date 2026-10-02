@@ -422,3 +422,67 @@ fn cli_watch_can_cancel_rebuild_show_old_results_and_recover_permission_failure(
     expected.extend(one);
     assert_eq!(bytes, expected);
 }
+
+#[test]
+fn bounded_correction_updates_watch_and_retained_resources_and_preserves_cancelled_reader() {
+    let fixture = Fixture::new();
+    for id in 0..24 {
+        let directory = fixture.root.join(format!("directory-{id:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("kept.txt"), b"").unwrap();
+    }
+    let mut expected = Vec::new();
+    for item in fs::read_dir(&fixture.root).unwrap() {
+        let directory = item.unwrap().path();
+        expected.push(directory.join("kept.txt"));
+        expected.push(directory);
+    }
+    expected.sort();
+    let mut options = EngineOptions::scale();
+    options.scan_batch = 2;
+    let mut engine = Engine::open_with_options(&fixture.root, None, options).unwrap();
+    settle(&mut engine, &expected);
+    let old = engine.query().lease().unwrap();
+    let version = engine.view().version;
+    let retained_before = engine.view().resources.snapshot_bytes;
+    engine.request_rebuild().unwrap();
+    for _ in 0..24 {
+        engine.poll().unwrap();
+        if engine.view().resources.session_watches >= 3 {
+            break;
+        }
+    }
+    let partial = engine.view();
+    assert_eq!(partial.status, Status::Pending);
+    assert_eq!(partial.version, version);
+    assert!(partial.resources.inventory_slots > 1);
+    assert!(partial.resources.session_watches > 1);
+    assert!(partial.resources.session_watches < 25);
+    assert_eq!(
+        partial.resources.session_watches,
+        partial.resources.process_watches
+    );
+    assert!(partial.resources.retained_snapshot_bytes >= retained_before);
+    engine.poll_with_cancel(&AtomicBool::new(true)).unwrap();
+    let cancelled = engine.view();
+    assert_eq!(cancelled.status, Status::Pending);
+    assert_eq!(cancelled.version, version);
+    assert_eq!(
+        cancelled.resources.session_watches,
+        partial.resources.session_watches
+    );
+    let page = old
+        .page("", None, 50, &AtomicBool::new(false), &AtomicUsize::new(0))
+        .unwrap();
+    let mut paths = page.paths;
+    paths.sort();
+    assert_eq!(paths, expected);
+    assert!(!page.validated_at_start_and_finish);
+    drop(old);
+    engine.request_rebuild().unwrap();
+    settle(&mut engine, &expected);
+    let final_view = engine.view();
+    assert_eq!(final_view.resources.session_watches, 25);
+    assert_eq!(final_view.resources.inventory_slots, 49);
+    assert!(final_view.coverage_gaps.is_empty());
+}
