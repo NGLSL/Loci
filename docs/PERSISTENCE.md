@@ -83,4 +83,18 @@ cargo +1.99.0 test --release --offline --locked
 
 Windows 原生测试使用明确选择的临时目录与实际文件操作。`tests/windows_events.rs` 包括原生增删、文件/目录 rename、Unicode、非法 UTF-16 原名、实际 kernel overflow、停止/取消完成竞态及句柄计数；长 rename 的多次读取测试不能当作已确定观察到单个 old/new 跨 completion 的证明。`tests/engine.rs` 的外部可控 EventSource 是明确模拟的错误/loss/竞态证据，和原生夹具分别记录。`tests/storage.rs` 的恶意库在有墙钟期限的独立子进程验证。
 
+2026-10-02，本轮代码提交 `1828276cc154a7cf808989feac70bb1391a53672` 在 x86_64 Windows/MSVC、D: NTFS、Rust 1.99.0（`b940084d7`，LLVM 23.1.1）验证：
+
+| 检查 | 实际结果 |
+| --- | --- |
+| fmt / all-targets check / linux-ffi-check | 全部通过；FFI check 仅是类型检查 |
+| debug 全量测试 | 89 passed，0 failed，2 ignored |
+| release 全量测试 | 89 passed，0 failed，2 ignored |
+| 原生来源 | 13 tests，包括真实 kernel overflow；来源持有时 OS handles +2，128 次取消/完成竞态后回到基线 |
+| 引擎 | 16 tests，包含两个独立进程间保存/重开、离线 add/delete/rename 及普通可靠变化不增加 full_scans |
+| 持久化 | 9 tests，实际 Windows 锁文件使替换失败后旧库仍可读；恶意输入与临时名称碰撞在有 10 秒上限的子进程中拒绝 |
+| 两轴审计 | 规范审计发现 Stopped + WatchLost 被误认正常停止，补回归并修复；规格审计无其他可行动发现 |
+
+两个 ignored 测试是现有显式性能测量，不是本轮性能结论。新引擎取消回归使用预置取消；执行中取消的既有覆盖来自共享查询原型。本轮未新增吞吐或内存改善声明。
+
 本轮当前 Linux 新引擎原生装配、Unix rename/fsync 执行、真实断电、长期运行、其他文件系统及生产调用方集成尚未验收。原 Linux 原型历史结果不能替代本轮精确提交的运行验证。许可证、release 和 main 合并仍待用户另行决定。
