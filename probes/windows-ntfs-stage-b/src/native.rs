@@ -124,23 +124,42 @@ fn scoped_parent(scope: &[u16], name: &[u16]) -> io::Result<Option<PathBuf>> {
 }
 pub fn hardlink_parents(spec: &str, object: u128, root: &Path) -> io::Result<Vec<PathBuf>> {
     let object=u64::try_from(object).map_err(|_|io::Error::new(io::ErrorKind::Unsupported,"128-bit file reference requires FileId128 OpenFileById support; rebuild/downgrade required"))?;
-    let mut volume: Vec<u16> = format!(r"\\.\{spec}").encode_utf16().collect();
-    volume.push(0);
+    let raw_scope: Vec<u16> = root
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| if unit == 47 { 92 } else { unit })
+        .collect();
+    let scope = volume_relative(&raw_scope)?;
+    let drive_offset = raw_scope.len() - scope.len() - 2;
+    let source = spec.as_bytes();
+    if source.len() != 2
+        || !source[0].is_ascii_alphabetic()
+        || source[1] != b':'
+        || raw_scope[drive_offset] > 127
+        || (raw_scope[drive_offset] as u8).to_ascii_uppercase() != source[0].to_ascii_uppercase()
+    {
+        return Err(invalid("hardlink source drive differs from scope drive"));
+    }
+    // OpenFileById accepts ANY file handle on the volume as hVolumeHint.
+    // The caller pins the engineering root; no privileged volume open is needed.
+    let mut hint_path = raw_scope.clone();
+    hint_path.push(0);
     let handle = unsafe {
         CreateFileW(
-            volume.as_ptr(),
-            0x80000000,
+            hint_path.as_ptr(),
+            0,
             7,
             ptr::null(),
             3,
-            0,
+            0x02000000 | 0x00200000,
             ptr::null_mut(),
         )
     };
     if handle == INVALID {
         return Err(io::Error::last_os_error());
     }
-    let volume = Handle(handle);
+    let hint = Handle(handle);
+    let hint_before = information(hint.0)?;
     let descriptor = Descriptor {
         size: mem::size_of::<Descriptor>() as u32,
         kind: 0,
@@ -148,7 +167,7 @@ pub fn hardlink_parents(spec: &str, object: u128, root: &Path) -> io::Result<Vec
     };
     let handle = unsafe {
         OpenFileById(
-            volume.0,
+            hint.0,
             &descriptor,
             0,
             7,
@@ -168,7 +187,7 @@ pub fn hardlink_parents(spec: &str, object: u128, root: &Path) -> io::Result<Vec
     }
     let object_handle = Handle(handle);
     let before = information(object_handle.0)?;
-    if before.0 != object {
+    if before.0 != object || before.1 != hint_before.1 {
         return Err(invalid(
             "OpenFileById returned a different complete file reference",
         ));
@@ -196,8 +215,6 @@ pub fn hardlink_parents(spec: &str, object: u128, root: &Path) -> io::Result<Vec
         return Err(io::Error::last_os_error());
     }
     let find = Find(handle);
-    let raw_scope: Vec<u16> = root.as_os_str().encode_wide().collect();
-    let scope = volume_relative(&raw_scope)?;
     let mut parents = BTreeSet::new();
     let mut count = 0usize;
     loop {
@@ -225,10 +242,13 @@ pub fn hardlink_parents(spec: &str, object: u128, root: &Path) -> io::Result<Vec
     }
     let after = information(object_handle.0)?;
     let path_after = crate::win::identity(&resolved)?;
+    let hint_after = information(hint.0)?;
     if before != after
         || after.2 as usize != count
         || path_after.object != object as u128
         || path_after.volume_serial != before.1
+        || hint_before.0 != hint_after.0
+        || hint_before.1 != hint_after.1
     {
         return Err(invalid(
             "hardlink identity/count changed during native enumeration; retry required",
@@ -279,5 +299,66 @@ mod tests {
         ] {
             assert!(scoped_parent(&wide("\\Project\\run\\fixture"), &wide(name)).is_err());
         }
+    }
+    #[test]
+    fn real_engineering_hardlinks_open_by_directory_hint() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let worktree = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let run = worktree.join(".scratch/windows-ntfs-stage-b/run");
+        // Pin literal ancestors before creating even our owned tiny fixture.
+        let _pins = crate::win::DirectoryPins::hold(&run).unwrap();
+        let owned = run.join(format!(
+            "native-hint-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&owned).unwrap();
+        let root = owned.join("scope");
+        fs::create_dir(&root).unwrap();
+        let _root_pins = crate::win::DirectoryPins::hold(&root).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        let outside = owned.join("outside-source");
+        fs::write(&outside, b"engineering hardlink fixture").unwrap();
+        let identity = crate::win::identity(&outside).unwrap();
+        let raw: Vec<u16> = root.as_os_str().encode_wide().collect();
+        let scope = volume_relative(&raw).unwrap();
+        let drive_offset = raw.len() - scope.len() - 2;
+        let spec = format!("{}:", char::from_u32(raw[drive_offset] as u32).unwrap());
+        // This object has never appeared in the scope before this alias.
+        fs::hard_link(&outside, root.join("a/first-alias")).unwrap();
+        assert_eq!(
+            hardlink_parents(&spec, identity.object, &root).unwrap(),
+            vec![PathBuf::from("a")]
+        );
+        fs::hard_link(&outside, root.join("b/second-alias")).unwrap();
+        assert_eq!(
+            hardlink_parents(&spec, identity.object, &root).unwrap(),
+            vec![PathBuf::from("a"), PathBuf::from("b")]
+        );
+        let first = crate::win::identity(&root.join("a/first-alias")).unwrap();
+        let second = crate::win::identity(&root.join("b/second-alias")).unwrap();
+        assert_eq!(first.object, identity.object);
+        assert_eq!(second.object, identity.object);
+        assert_eq!(first.volume_serial, identity.volume_serial);
+        assert_eq!(second.volume_serial, identity.volume_serial);
+        assert_eq!(first.links, 3);
+        assert_eq!(second.links, 3);
+        assert_eq!(crate::win::hardlink_names(&outside).unwrap().len(), 3);
+        crate::win::diagnostics().unwrap();
+        println!("native_directory_hint_real_fixture=passed scoped_links=2 total_links=3 retained_owned_fixture=true");
     }
 }

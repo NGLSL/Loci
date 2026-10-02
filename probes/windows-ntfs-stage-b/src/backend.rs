@@ -23,6 +23,7 @@ const DIRECTORY: u32 = 0x10;
 const REPARSE: u32 = 0x400;
 const MAX_RECORDS: usize = 1_000_000;
 const DEADLINE: Duration = Duration::from_secs(30);
+const MAX_ATTEMPTS: usize = 32;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
     Ready,
@@ -40,6 +41,7 @@ pub struct Stats {
     pub journal_major_versions: BTreeSet<u16>,
     pub scoped_reason_mask: u32,
     pub native_link_queries: usize,
+    pub retry_attempts: usize,
 }
 #[derive(Debug)]
 pub struct QueryResult {
@@ -80,6 +82,27 @@ fn check(cancel: &AtomicBool, began: Instant) -> io::Result<()> {
     }
     Ok(())
 }
+fn diagnosed<T>(phase: &str, result: io::Result<T>) -> io::Result<T> {
+    if let Err(error) = &result {
+        eprintln!(
+            "backend_phase={phase} error_kind={:?} os_code={:?}",
+            error.kind(),
+            error.raw_os_error()
+        );
+    }
+    result
+}
+fn retry_wait(cancel: &AtomicBool, began: Instant, attempt: usize) -> io::Result<()> {
+    let millis = (5u64 << attempt.min(6)).min(250);
+    let until = Instant::now() + Duration::from_millis(millis);
+    while Instant::now() < until {
+        check(cancel, began)?;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    check(cancel, began)
+}
+#[cfg(test)]
+thread_local! { static SCAN_ENTRY_HOOK:std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> = std::cell::RefCell::new(None); }
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetVolumeNameForVolumeMountPointW(root: *const u16, name: *mut u16, length: u32) -> i32;
@@ -213,8 +236,8 @@ fn scan_directory(
         return Err(invalid("namespace depth budget exceeded"));
     }
     let path = root.join(relative);
-    let pin = DirectoryPins::hold(&path)?;
-    let before = win::identity(&path)?;
+    let pin = diagnosed("scan_directory_pin", DirectoryPins::hold(&path))?;
+    let before = diagnosed("scan_directory_identity_before", win::identity(&path))?;
     if before.object != expected || before.volume_serial != serial || !ordinary(before.attributes) {
         return Err(invalid("directory identity changed during reconciliation"));
     }
@@ -237,10 +260,16 @@ fn scan_directory(
         .collect();
     let mut children = Vec::new();
     let mut discovered = BTreeMap::new();
-    for item in fs::read_dir(&path)? {
+    for item in diagnosed("scan_directory_read", fs::read_dir(&path))? {
         check(cancel, began)?;
-        let item = item?;
-        let identity = win::identity(&item.path())?;
+        let item = diagnosed("scan_directory_next_entry", item)?;
+        #[cfg(test)]
+        SCAN_ENTRY_HOOK.with(|hook| {
+            if let Some(callback) = hook.borrow_mut().as_mut() {
+                callback(&item.path());
+            }
+        });
+        let identity = diagnosed("scan_entry_identity", win::identity(&item.path()))?;
         if identity.volume_serial != serial {
             return Err(invalid("namespace entry changed volume"));
         }
@@ -259,7 +288,7 @@ fn scan_directory(
             return Err(invalid("directory exceeds entry budget"));
         }
     }
-    let after = win::identity(&path)?;
+    let after = diagnosed("scan_directory_identity_after", win::identity(&path))?;
     if before.object != after.object || before.attributes != after.attributes {
         return Err(invalid("directory changed during enumeration"));
     }
@@ -335,6 +364,42 @@ fn dirty_parents(
     }
     dirty
 }
+fn initial_scan(
+    root: &Path,
+    snapshot: &mut Snapshot,
+    cancel: &AtomicBool,
+    began: Instant,
+    stats: &mut Stats,
+) -> io::Result<()> {
+    for attempt in 0..MAX_ATTEMPTS {
+        snapshot.entries.clear();
+        stats.full_scans += 1;
+        match scan_directory(
+            root,
+            Path::new(""),
+            snapshot.root,
+            snapshot.checkpoint.volume_serial,
+            &mut snapshot.entries,
+            true,
+            cancel,
+            began,
+            stats,
+            0,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                eprintln!("backend_phase=initial_namespace_scan attempt={} candidate_entries={} os_code={:?}",attempt+1,snapshot.entries.len(),error.raw_os_error());
+                if matches!(error.raw_os_error(), Some(2 | 3)) && attempt + 1 < MAX_ATTEMPTS {
+                    stats.retry_attempts += 1;
+                    retry_wait(cancel, began, attempt)?;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    unreachable!("bounded scan attempts return a result")
+}
 impl Backend {
     pub fn build(root: &Path, storage: &Path, cancel: &AtomicBool) -> io::Result<Self> {
         let began = Instant::now();
@@ -361,33 +426,8 @@ impl Backend {
             volume_guid: guid(&spec)?,
             entries: BTreeMap::new(),
         };
-        let mut stats = Stats {
-            full_scans: 1,
-            ..Stats::default()
-        };
-        for attempt in 0..4 {
-            snapshot.entries.clear();
-            let scanned = scan_directory(
-                &root_path,
-                Path::new(""),
-                snapshot.root,
-                volume.serial,
-                &mut snapshot.entries,
-                true,
-                cancel,
-                began,
-                &mut stats,
-                0,
-            );
-            match scanned {
-                Ok(_) => break,
-                Err(error) if matches!(error.raw_os_error(), Some(2 | 3)) && attempt < 3 => {
-                    stats.full_scans += 1;
-                    check(cancel, began)?;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let mut stats = Stats::default();
+        initial_scan(&root_path, &mut snapshot, cancel, began, &mut stats)?;
         let mut backend = Self {
             root_path,
             storage,
@@ -485,7 +525,10 @@ impl Backend {
             for object in objects {
                 check(cancel, began)?;
                 self.stats.native_link_queries += 1;
-                let parents = crate::native::hardlink_parents(&spec, object, &self.root_path)?;
+                let parents = diagnosed(
+                    "hardlink_all_names",
+                    crate::native::hardlink_parents(&spec, object, &self.root_path),
+                )?;
                 for mut parent in parents {
                     // If a new directory is not indexed yet, scan its nearest
                     // known ancestor; recursive discovery supplies all children.
@@ -539,17 +582,26 @@ impl Backend {
         began: Instant,
     ) -> io::Result<()> {
         let seed = candidate.clone();
-        for attempt in 0..4 {
+        for attempt in 0..MAX_ATTEMPTS {
             *candidate = seed.clone();
             match self.replay(candidate, cancel, began) {
                 Ok(()) => return Ok(()),
-                Err(error) if matches!(error.raw_os_error(), Some(2 | 3)) && attempt < 3 => {
-                    check(cancel, began)?;
+                Err(error) => {
+                    eprintln!(
+                        "backend_phase=journal_replay attempt={} os_code={:?}",
+                        attempt + 1,
+                        error.raw_os_error()
+                    );
+                    if matches!(error.raw_os_error(), Some(2 | 3)) && attempt + 1 < MAX_ATTEMPTS {
+                        self.stats.retry_attempts += 1;
+                        retry_wait(cancel, began, attempt)?;
+                    } else {
+                        return Err(error);
+                    }
                 }
-                Err(error) => return Err(error),
             }
         }
-        unreachable!("four attempts always return a result")
+        unreachable!("bounded replay attempts return a result")
     }
     pub fn sync(&mut self, cancel: &AtomicBool) -> io::Result<Stats> {
         if self.status == Status::Stopped {
@@ -727,6 +779,138 @@ mod tests {
         assert_eq!(
             backend.sync(&AtomicBool::new(false)).unwrap_err().kind(),
             io::ErrorKind::BrokenPipe
+        );
+    }
+    #[test]
+    fn real_enumerated_file_rename_exhausts_old_retries_then_settles_without_partial_publish() {
+        use std::sync::mpsc::sync_channel;
+        fn writer_hook(root: &Path) -> std::thread::JoinHandle<()> {
+            let (request_tx, request_rx) = sync_channel::<PathBuf>(0);
+            let (ack_tx, ack_rx) = sync_channel(0);
+            let root = root.to_path_buf();
+            let writer = std::thread::spawn(move || {
+                for _ in 0..4 {
+                    let old = request_rx.recv().unwrap();
+                    let new = root.join(if old.file_name().unwrap() == "race.txt" {
+                        "race-switched.txt"
+                    } else {
+                        "race.txt"
+                    });
+                    fs::rename(old, new).unwrap();
+                    ack_tx.send(()).unwrap();
+                }
+            });
+            let mut remaining = 4;
+            SCAN_ENTRY_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |path| {
+                    if remaining > 0
+                        && matches!(
+                            path.file_name().and_then(|name| name.to_str()),
+                            Some("race.txt" | "race-switched.txt")
+                        )
+                    {
+                        request_tx.send(path.to_path_buf()).unwrap();
+                        ack_rx.recv().unwrap();
+                        remaining -= 1;
+                    }
+                }))
+            });
+            writer
+        }
+        let base =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/windows-ntfs-stage-b/run");
+        let _parent_pin = DirectoryPins::hold(base.parent().unwrap()).unwrap();
+        match fs::create_dir(&base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("engineering run creation failed: {error}"),
+        }
+        let _base_pin = DirectoryPins::hold(&base).unwrap();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let literal = base.join(format!("scanner-race-unit-{}-{unique}", std::process::id()));
+        fs::create_dir(&literal).unwrap();
+        let root = fs::canonicalize(&literal).unwrap();
+        for number in 0..1000 {
+            fs::write(root.join(format!("stable-{number:04}.txt")), []).unwrap();
+        }
+        fs::write(root.join("race.txt"), []).unwrap();
+        let identity = win::identity(&root).unwrap();
+        let mut snapshot = Snapshot {
+            checkpoint: Checkpoint {
+                volume_serial: identity.volume_serial,
+                journal_id: 1,
+                cursor: 0,
+            },
+            root: identity.object,
+            scope: raw(&root),
+            volume_guid: r"\\?\Volume{00000000-0000-0000-0000-000000000001}\".into(),
+            entries: BTreeMap::new(),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut old_stats = Stats::default();
+        let old_writer = writer_hook(&root);
+        for _ in 0..4 {
+            snapshot.entries.clear();
+            let error = scan_directory(
+                &root,
+                Path::new(""),
+                snapshot.root,
+                identity.volume_serial,
+                &mut snapshot.entries,
+                true,
+                &cancel,
+                Instant::now(),
+                &mut old_stats,
+                0,
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(2));
+        }
+        SCAN_ENTRY_HOOK.with(|hook| hook.borrow_mut().take());
+        old_writer.join().unwrap();
+        let writer = writer_hook(&root);
+        let mut stats = Stats::default();
+        initial_scan(&root, &mut snapshot, &cancel, Instant::now(), &mut stats).unwrap();
+        SCAN_ENTRY_HOOK.with(|hook| hook.borrow_mut().take());
+        writer.join().unwrap();
+        assert_eq!(stats.full_scans, 5);
+        assert_eq!(stats.retry_attempts, 4);
+        snapshot.validate().unwrap();
+        let independent: BTreeSet<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|item| item.unwrap().file_name().encode_wide().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(independent.len(), 1001);
+        assert_eq!(
+            store::paths(snapshot.root, &snapshot.entries).unwrap(),
+            independent
+        );
+        eprintln!("controlled_real_filesystem_race old_attempts=4 old_os_code=2 new_attempts={} stable_complete_paths={} actual_usn_sync=false injected_error_code=false",stats.full_scans,independent.len());
+        for item in fs::read_dir(&root).unwrap() {
+            fs::remove_file(item.unwrap().path()).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn retry_backoff_respects_cancel_and_original_deadline() {
+        assert_eq!(
+            retry_wait(&AtomicBool::new(true), Instant::now(), 6)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            retry_wait(
+                &AtomicBool::new(false),
+                Instant::now() - Duration::from_secs(31),
+                6
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
         );
     }
 }

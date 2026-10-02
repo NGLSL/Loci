@@ -209,6 +209,10 @@ fn emit_stats(label: &str, stats: &crate::backend::Stats) {
         "native_link_queries label={label} count={}",
         stats.native_link_queries
     );
+    println!(
+        "retry_attempts label={label} count={}",
+        stats.retry_attempts
+    );
 }
 fn identity_of(snapshot: &Snapshot, name: &str) -> io::Result<u128> {
     let name: Vec<_> = name.encode_utf16().collect();
@@ -263,7 +267,14 @@ pub fn build(root: &Path, storage: &Path, count: usize) -> io::Result<()> {
     done.store(true, Ordering::Release);
     let rounds = writer
         .join()
-        .map_err(|_| fail("fixture writer panicked"))??;
+        .map_err(|_| fail("fixture writer panicked"))?
+        .inspect_err(|error| {
+            eprintln!("fixture_writer_failed os_code={:?}", error.raw_os_error())
+        })?;
+    println!(
+        "fixture_writer_completed rounds={rounds} directory_rename_operations={}",
+        if rounds > 0 { 2 } else { 0 }
+    );
     let mut backend = built?;
     emit_stats("bootstrap", backend.stats());
     let live_memory = win::metrics()?;
