@@ -1,5 +1,7 @@
 #[path = "stages.rs"]
 mod stages;
+#[path = "verifier.rs"]
+mod verifier;
 use crate::process::{self, DeadlineRead};
 use crate::protocol::{b, frame_read, frame_write, hex, invalid, n, s, unhex, Json};
 use crate::Options;
@@ -658,6 +660,11 @@ fn query_bench(
     options: &Options,
     log: &mut Log,
 ) -> io::Result<()> {
+    let version = worker
+        .wait_validated(Duration::from_secs(3600))?
+        .get("version")?
+        .number()?;
+    let mut observed = Vec::with_capacity(queries.len());
     for q in queries {
         for repetition in 0..5 {
             let result = worker.query(q)?;
@@ -666,9 +673,14 @@ fn query_bench(
                 Json::object([
                     ("query", s(q.clone())),
                     ("repetition", n(repetition as u64)),
-                    ("result", result),
+                    ("result", result.clone()),
                 ]),
             )?;
+            if repetition == 0 {
+                observed.push(verifier::FirstPage::capture(&result, version)?);
+            } else {
+                observed.last().unwrap().check(&result)?;
+            }
         }
     }
     let passes = if options.smoke { 1 } else { 2 };
@@ -683,6 +695,22 @@ fn query_bench(
                 let roundtrip = start.elapsed().as_nanos();
                 match result {
                     Ok(result) => {
+                        if let Err(error) = observed[index].check(&result) {
+                            log.record(
+                                "query",
+                                Json::object([
+                                    ("query_id", n(index)),
+                                    ("query", s(q.clone())),
+                                    ("pass", n(pass as u64)),
+                                    ("repetition", n(repetition)),
+                                    ("roundtrip_ns", n(roundtrip)),
+                                    ("success", b(false)),
+                                    ("error", s(error.to_string())),
+                                    ("result", result),
+                                ]),
+                            )?;
+                            return Err(error);
+                        }
                         let elapsed = result.get("total_public_ns")?.number()?;
                         let reply_summary = Json::object([
                             ("total_public_ns", n(elapsed)),
@@ -742,7 +770,7 @@ fn query_bench(
             )?;
         }
     }
-    Ok(())
+    verifier::verify_queries(worker, queries, options, log, &observed)
 }
 fn select_regular(root: &Path) -> io::Result<PathBuf> {
     let mut todo = vec![root.to_path_buf()];

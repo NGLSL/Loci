@@ -12,9 +12,6 @@ mod process;
 #[path = "million_acceptance/protocol.rs"]
 mod protocol;
 #[cfg(target_os = "linux")]
-#[path = "million_acceptance/verifier.rs"]
-mod verifier;
-#[cfg(target_os = "linux")]
 #[path = "million_acceptance/worker.rs"]
 mod worker;
 use protocol::invalid;
