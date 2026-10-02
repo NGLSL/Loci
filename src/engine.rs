@@ -231,17 +231,19 @@ impl Engine {
         Ok(())
     }
     fn consume(&mut self, batch: EventBatch) -> io::Result<()> {
+        // The Windows cancellation/lost-watch path can be Stopped + WatchLost.
+        // Unexpected watch loss remains a failure, not a successful user stop.
+        if batch.losses.contains(&Loss::WatchLost) {
+            if let Some(mut source) = self.source.take() {
+                let _ = source.stop();
+            }
+            return Err(io::Error::other("event watch lost; reopen the engine"));
+        }
         if batch.state == SourceState::Stopped {
             self.stop()?;
             return Ok(());
         }
         if !batch.losses.is_empty() {
-            if batch.losses.contains(&Loss::WatchLost) {
-                if let Some(mut source) = self.source.take() {
-                    let _ = source.stop();
-                }
-                return Err(io::Error::other("event watch lost; reopen the engine"));
-            }
             for loss in batch.losses {
                 self.invalidate(match loss {
                     Loss::KernelOverflow => Signal::KernelOverflow,

@@ -293,7 +293,7 @@ fn simulated_capture_during_scan_and_build_rejects_stale_candidates() {
 
 #[test]
 fn simulated_fatal_error_watch_lost_and_stopped_keep_distinct_states() {
-    for case in 0..3 {
+    for case in 0..4 {
         let f = Fixture::new();
         fs::write(f.root.join("kept.txt"), "x").unwrap();
         let (mut engine, inputs) = simulated(&f);
@@ -301,6 +301,11 @@ fn simulated_fatal_error_watch_lost_and_stopped_keep_distinct_states() {
         match case {
             0 => inputs.step(|| Err(io::Error::from_raw_os_error(5))),
             1 => inputs.batch(EventBatch {
+                losses: [Loss::WatchLost].into(),
+                ..EventBatch::default()
+            }),
+            3 => inputs.batch(EventBatch {
+                state: SourceState::Stopped,
                 losses: [Loss::WatchLost].into(),
                 ..EventBatch::default()
             }),
