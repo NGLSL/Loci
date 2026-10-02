@@ -18,7 +18,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-const MAX_SCANNED: usize = 2_000_000;
+// Calibrated from the real D: run: 2M records took 3.8 s and did not reach EOF.
+// This is an I/O work budget; retained namespace and time limits stay fixed.
+const MAX_SCANNED: usize = 10_000_000;
 const MAX_NAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SCOPED: usize = 8192;
 type Paths = BTreeSet<Vec<u16>>;

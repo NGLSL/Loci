@@ -50,6 +50,8 @@
 
 依然保留 20 秒枚举、8192 scoped 项、32 层、32 MiB retained 名称预算；额外限制最多 2000000 个 scanned records。扫描预算是退出条件，不是容量/吞吐承诺，也不是创建百万文件。成功/失败只输出 scanned、retained、batch 和字节计数。没有改根 Cargo、共享引擎或其 4096/128 约束。
 
+上述 2000000 是首轮流式实验预算；下面第二次管理员实测触发该预算，之后校准为最多 **10000000** 条扫描记录。20 秒、批次与 retained/scope 限制不变。这是对 D: 已有 MFT 读取工作量的调整，不能据此宣称纯 MFT 建库或百万级索引产品化。
+
 源代码同时补充失败返回后的资源诊断，以及 capability 多轮中任一轮失败不能被最后一轮成功掩盖。新版管理员复验及稳定完整路径结果另按实际执行更新；首份失败不能被这些代码修正冒充为已通过。
 
 范围 seed 在受控 writer 启动前收集，避免读取 seed 时就与自己的删除/改名竞争。MFT 历史路径已消失时，OS code 2/3 明确计数；路径前后对象身份或 serial 不匹配也计数，均令投影 degraded，不把别的对象链接误并入。ACL/其它 I/O/未知版本仍失败。只有最终 namespace + USN + 独立 oracle 路线通过才能发布 hybrid 完整状态，degraded 投影不能声称完整。
@@ -57,6 +59,16 @@
 另外补齐真实 USN 操作验证：bootstrap 在变更前记录旧对象/parent，变更后记录新增对象；要求 create、delete、文件 old/new rename、目录 old/new rename 六项都在实际 READ 批次中匹配 object、parent、raw UTF-16 name 和 reason mask。`recover --verify-offline-fixture-events` 从保存库存取得旧对象，要求对应六项离线操作命中。缺项不保存。匹配器只保留六项已知工程动作和版本集合，不保留外部名称。硬链接增删仍以最终完整路径集合证明，没有单独核对 USN hard-link reason，也不声称 reason 能还原所有链接名称。
 
 修正版本 fmt、all-targets check、release build、PowerShell AST 解析通过；debug/release 各 **24 tests、0 failed、0 ignored**（包含一个跨进程 helper）。其中新增真实工程文件删除/改名/路径复用测试验证 stale 投影处理；范围/预算、USN 六动作正反、OS5 和未知版本使用明确注入。私有日志为 `run/streamed-trace-{debug,release}-tests.txt`。这些测试不能替代修正后管理员真 USN 的成功路径。
+
+## 第二次管理员执行：真实流式预算校准
+
+用户再次明确授权一次 UAC。固定代码 `76eac4fd477b573ed28445195a004d1258047594` 重新构建并运行，管理员 token=true，Aura module=false；build/capabilities 均 exit 0，bootstrap exit 1。
+
+MFT 批次确实读取/解析 **2000001 条记录、3260 batches**；只保留 19 个 graph/native objects、640 bytes raw 名称、7 个 directory seeds。该计数是读取的记录数，没有执行整卷 dedup，不等于独立文件条目数。第 2000001 条触发扫描预算，`MFT_stream_complete=false`，没有达到卷尾。
+
+错误为 `MFT scanned record budget exceeded; incomplete, no checkpoint published`，本地预算错误没有 OS code。失败清理后测得：elapsed 3826 ms；handles **56 → 56**；total working set 5963776 bytes，private commit 1409024 bytes，peak total working set 6119424 bytes。内核、private working set 仍未测量。它直接支持 bounded user-space 生命周期结论，不能外推成功 USN 的 pending 取消或长期资源。
+
+私有 evidence：`run/native-20261002T201052Z-a1402c7be7a24817ad928200a45c421d/`。此前的失败现场仍保留。尚未运行离线变更/恢复，也没有完整库存。依据该实测，读取工作量预算改为 10000000 records，同时保留20秒枚举及小 scope/批次/内存限制；再次原生执行必须另获 UAC 授权，不能复用已经退出的管理员 token 或此前的一次性许可。
 
 ## 保留的验收边界
 
