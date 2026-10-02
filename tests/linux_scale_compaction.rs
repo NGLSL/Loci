@@ -205,7 +205,7 @@ fn mutation_and_cancellation_of_a_batched_compaction_preserve_queryable_cuts() {
     let added = fixture.root.join("added");
     fs::write(&added, b"").unwrap();
     engine.poll().unwrap();
-    assert_eq!(engine.view().version, version);
+    assert!(engine.view().version > version);
     assert!(
         !old.page("", None, 2, &AtomicBool::new(false), &AtomicUsize::new(0))
             .unwrap()
@@ -218,6 +218,12 @@ fn mutation_and_cancellation_of_a_batched_compaction_preserve_queryable_cuts() {
     assert_eq!(paths(&engine.query().lease().unwrap()), expected);
     assert_eq!(engine.metrics().full_scans, 1);
     assert!(engine.metrics().compaction_restarts > 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine.metrics().compactions == 0 {
+        assert!(Instant::now() < deadline);
+        engine.poll().unwrap();
+    }
+    assert_eq!(paths(&engine.query().lease().unwrap()), expected);
 }
 
 #[test]
@@ -323,4 +329,123 @@ fn cli_compaction_can_pause_resume_and_query_while_reporting_resource_admission(
         memory_reported,
         "CLI did not report its process memory admission"
     );
+}
+
+#[test]
+fn ordinary_native_updates_publish_within_500ms_during_a_long_compaction() {
+    let fixture = Fixture::new();
+    for number in 0..60 {
+        fs::write(fixture.root.join(format!("seed{number:02}")), b"").unwrap();
+    }
+    let mut options = EngineOptions::scale();
+    options.scan_batch = 1;
+    let mut owner = Engine::open_with_options(&fixture.root, None, options)
+        .unwrap()
+        .spawn()
+        .unwrap();
+    let ready = Instant::now() + Duration::from_secs(5);
+    while owner.view().status != Status::Validated {
+        assert!(Instant::now() < ready);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    owner
+        .request_compaction()
+        .unwrap()
+        .wait(Duration::from_secs(2))
+        .unwrap();
+    while !owner.view().resources.compaction_in_progress {
+        assert!(Instant::now() < ready);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let query = owner.query();
+    for number in 0..3 {
+        let added = fixture.root.join(format!("new-visible-{number}"));
+        let began = Instant::now();
+        fs::write(&added, b"").unwrap();
+        loop {
+            let page = query
+                .lease()
+                .unwrap()
+                .page(
+                    &format!("new-visible-{number}"),
+                    None,
+                    50,
+                    &AtomicBool::new(false),
+                    &AtomicUsize::new(0),
+                )
+                .unwrap();
+            if page.paths == [added.clone()] && page.validated_at_start_and_finish {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_millis(500),
+                "ordinary event waited behind compaction: {:?}, {:?}",
+                owner.view(),
+                owner.metrics()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    assert_eq!(owner.metrics().full_scans, 1);
+    owner.stop(Duration::from_secs(2)).unwrap();
+}
+
+#[test]
+fn simulated_reliable_batches_arriving_during_apply_do_not_rescan_the_root() {
+    use loci_experiment::events::{Change, EventBatch, EventSource};
+    use std::sync::{atomic::Ordering, Arc};
+    struct Consecutive {
+        enabled: Arc<AtomicBool>,
+        polls: usize,
+    }
+    impl EventSource for Consecutive {
+        fn stop(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> std::io::Result<EventBatch> {
+            if !self.enabled.load(Ordering::Relaxed) {
+                return Ok(EventBatch::default());
+            }
+            self.polls += 1;
+            Ok(EventBatch {
+                changes: match self.polls {
+                    1 => vec![Change::Refresh(PathBuf::from("a"))],
+                    2 => vec![Change::Refresh(PathBuf::from("b"))],
+                    _ => vec![],
+                },
+                ..EventBatch::default()
+            })
+        }
+    }
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("seed"), b"").unwrap();
+    let enabled = Arc::new(AtomicBool::new(false));
+    let mut engine = Engine::with_source_and_options(
+        &fixture.root,
+        None,
+        Consecutive {
+            enabled: enabled.clone(),
+            polls: 0,
+        },
+        EngineOptions::scale(),
+    )
+    .unwrap();
+    let old = engine.query().lease().unwrap();
+    let version = engine.view().version;
+    fs::write(fixture.root.join("a"), b"").unwrap();
+    fs::write(fixture.root.join("b"), b"").unwrap();
+    enabled.store(true, Ordering::Relaxed);
+    engine.poll().unwrap();
+    assert_eq!(engine.view().version, version);
+    assert_eq!(paths(&old), [fixture.root.join("seed")]);
+    settle(&mut engine, version);
+    assert_eq!(
+        paths(&engine.query().lease().unwrap()),
+        [
+            fixture.root.join("a"),
+            fixture.root.join("b"),
+            fixture.root.join("seed")
+        ]
+    );
+    assert_eq!(engine.metrics().full_scans, 1);
 }

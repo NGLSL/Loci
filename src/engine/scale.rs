@@ -251,6 +251,24 @@ impl Runtime {
                 }
             }
     }
+    fn pending_fits_writer(&self) -> bool {
+        let mut slots = self.inventory.data.slots;
+        let mut names = self.inventory.name_bytes;
+        for change in &self.pending {
+            let (path, adds_slot) = match change {
+                Change::Remove(_) => continue,
+                Change::Refresh(path) => (path, self.inventory.find(path).is_none()),
+                Change::Rename { from, to } => (to, self.inventory.find(from).is_none()),
+            };
+            if matches!(change, Change::Refresh(_)) && !adds_slot {
+                continue;
+            }
+            slots = slots.saturating_add(usize::from(adds_slot));
+            names = names.saturating_add(path.file_name().map_or(0, |name| name.as_bytes().len()));
+        }
+        slots <= self.options.scale_budgets.max_slots
+            && names <= self.options.scale_budgets.max_name_bytes
+    }
     fn update_resources(&self) {
         let mut resources = self.source.resources();
         resources.queued_events += self.pending.len();
@@ -528,14 +546,21 @@ impl Runtime {
             .is_some_and(|compact| compact.generation != self.generation)
         {
             self.compact = None;
+            self.compact_requested = true;
             self.metrics.compaction_restarts += 1;
         }
         if !self.correction {
             let names = self.pending.iter().map(Self::change_bytes).sum();
-            if self.compact_requested
+            let compaction_needed = self.compact_requested
                 || self.compact.is_some()
-                || self.inventory.needs_compaction(self.pending.len(), names)
-            {
+                || self.inventory.needs_compaction(self.pending.len(), names);
+            // Ordinary trusted events take priority while the current writer has
+            // space. Keep the compaction request for the next quiet poll; a full
+            // writer still needs bounded reclamation before it can accept work.
+            if compaction_needed && !self.pending.is_empty() && self.pending_fits_writer() {
+                self.compact = None;
+                self.compact_requested = true;
+            } else if compaction_needed {
                 if !self.store.ready() {
                     return Ok(false);
                 }
@@ -613,7 +638,9 @@ impl Runtime {
             return Ok(false);
         }
         if generation != self.generation {
-            self.correction = true;
+            // The unpublished writer contains the first batch. The next poll
+            // applies newly captured changes before publishing the complete cut.
+            // capture already marks actual loss or scope changes for correction.
             return Ok(false);
         }
         self.metrics.transactions += 1;

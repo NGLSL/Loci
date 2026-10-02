@@ -17,8 +17,13 @@ requests correction and preserves the last published data. Old leases retain
 their original IDs, paths and cursor order. A new compacted epoch can assign new
 IDs. A pinned retired snapshot pauses publication with ReadersPinned; allocation
 failure preserves the previous query cut and reports failure. Cancellation drops
-the candidate. Pending events are applied to compacted writer IDs before any
-Validated publication, and the source is captured again before commit.
+the candidate. Trusted pending events take priority when the current writer has
+slot/name headroom: the candidate is dropped, changes are published, and the
+compaction request remains queued. If headroom is exhausted, bounded compaction
+must finish before those events can be applied. Cancellation of candidate work
+does not pause ordinary updates with headroom. Events captured during application
+retain the unpublished writer and are applied on the next poll; reliable batches
+alone do not force a root scan. The source is captured again before commit.
 
 `Metrics` reports compaction attempts/completions/restarts, copied live entries,
 reclaimed physical slots and obsolete name bytes. These counters are separate
@@ -61,7 +66,9 @@ checks. Directory traversal opens and checks mount identity before descent, so a
 new bind mount cannot be traversed while the table is cached. Nested scope changes
 request correction; a selected-root bind rebind fails on its first poll. Coverage
 audits retain their five-second/16-directory default budget. Quiet capture avoids
-walking all retained segments, and raw inventory allocation capacity is cached.
+walking all retained segments or copying the watch-path map. Capture still checks
+overflow, bounded drains and pending rename expiry before its empty-batch return.
+Raw inventory allocation capacity is cached.
 
 Development performance evidence is recorded separately with exact production
 SHA, real wall-clock duration, engine PID CPU/RSS/HWM, native watch/fd counts,

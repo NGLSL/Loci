@@ -233,6 +233,12 @@ impl EventSource for LinuxEvents {
             return Ok(self.lost(BTreeSet::from([Loss::UnpairedRename])));
         }
         self.pending.extend(captured.events);
+        // Capture, overflow/drain tracking, and rename expiry must run even on a
+        // quiet poll. With no pending records there is no topology to translate;
+        // avoid cloning every watch path fifty times per second while idle.
+        if self.pending.is_empty() {
+            return Ok(EventBatch::default());
+        }
         // Never use the old translator's guessed remove/refresh for an unpaired
         // rename. Preserve the complete ordered batch until its cookie is paired.
         let mut pairs = BTreeMap::<u32, (bool, bool)>::new();
