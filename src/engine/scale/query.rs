@@ -329,7 +329,7 @@ impl Lease {
         }
         data.search
             .fill_path(entry.parent, data.name(id), normalized);
-        query.matches_normalized(normalized)
+        query.matches_normalized(normalized, data.name(id))
     }
     fn kind(&self, id: u32) -> crate::engine::EntryKind {
         match self.snapshot.data.entry(id).kind {

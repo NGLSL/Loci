@@ -365,3 +365,103 @@ fn completed_sort_pins_its_cut_and_release_unblocks_publication() {
         loci_experiment::engine::Status::Stopped
     );
 }
+#[test]
+fn invalid_paths_normalize_extension_suffix_independently_without_changing_terms() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let fixture = Fixture::new();
+    let invalid_parent = fixture.root.join(OsString::from_vec(vec![255]));
+    fs::create_dir(&invalid_parent).unwrap();
+    let invalid_name = fixture
+        .root
+        .join(OsString::from_vec(b"\xff.A.\xce\xa3".to_vec()));
+    let invalid_suffix = invalid_parent.join(OsString::from_vec(b"A.\xce\xa3\xff".to_vec()));
+    for path in [
+        fixture.root.join("A.Σ"),
+        fixture.root.join("A.Σ\u{301}"),
+        invalid_parent.join("A.Σ"),
+        invalid_parent.join("A.Σ\u{301}"),
+        invalid_name.clone(),
+        invalid_suffix,
+    ] {
+        fs::write(path, b"").unwrap();
+    }
+    let engine = Engine::open_with_options(&fixture.root, None, EngineOptions::scale()).unwrap();
+    // Greek final-sigma lowercasing depends on preceding cased text across a dot.
+    // Valid paths retain whole-path context; invalid paths normalize raw suffixes
+    // independently, even when the invalid byte is in an ancestor or filename.
+    for (query, mut expected) in [
+        (
+            "ext:σ",
+            vec![invalid_parent.join("A.Σ"), invalid_name.clone()],
+        ),
+        ("ext:ς", vec![fixture.root.join("A.Σ")]),
+        ("ext:σ\u{301}", vec![invalid_parent.join("A.Σ\u{301}")]),
+        ("ext:ς\u{301}", vec![fixture.root.join("A.Σ\u{301}")]),
+        ("ς ext:σ", vec![invalid_parent.join("A.Σ"), invalid_name]),
+        ("σ ext:σ", vec![]),
+    ] {
+        expected.sort();
+        assert_eq!(complete_paths(&engine.query(), query), expected, "{query}");
+        let count = engine.query().start_count(query).unwrap();
+        await_job(&count);
+        assert_eq!(count.state(), QueryJobState::Complete, "{query}");
+        assert_eq!(count.count(), Some(expected.len()), "{query}");
+        drop(count);
+        let sort = engine.query().start_sort(query).unwrap();
+        await_job(&sort);
+        assert_eq!(sort.state(), QueryJobState::Complete, "{query}");
+        // PathBuf ordering compares components; public SORT orders raw bytes.
+        expected.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
+        assert_eq!(sort.page(0, 50).unwrap().paths, expected, "{query}");
+    }
+}
+
+#[test]
+fn invalid_ancestor_rename_rebuilds_extension_filters_and_preserves_old_lease() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let fixture = Fixture::new();
+    let invalid = fixture.root.join(OsString::from_vec(vec![255]));
+    let valid = fixture.root.join("clear");
+    fs::create_dir(&invalid).unwrap();
+    fs::write(invalid.join("A.Σ\u{301}"), b"").unwrap();
+    let mut engine =
+        Engine::open_with_options(&fixture.root, None, EngineOptions::scale()).unwrap();
+    let old = engine.query().lease().unwrap();
+    let version = engine.view().version;
+    fs::rename(&invalid, &valid).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while engine.view().version <= version {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert!(complete_paths(&engine.query(), "ext:σ\u{301}").is_empty());
+    assert_eq!(
+        complete_paths(&engine.query(), "ext:ς\u{301}"),
+        [valid.join("A.Σ\u{301}")]
+    );
+    let old_page = old
+        .page(
+            "ext:σ\u{301}",
+            None,
+            50,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(old_page.paths, [invalid.join("A.Σ\u{301}")]);
+    assert!(!old_page.validated_at_start_and_finish);
+    drop(old);
+    let version = engine.view().version;
+    fs::rename(&valid, &invalid).unwrap();
+    while engine.view().version <= version {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert_eq!(
+        complete_paths(&engine.query(), "ext:σ\u{301}"),
+        [invalid.join("A.Σ\u{301}")]
+    );
+    assert!(complete_paths(&engine.query(), "ext:ς\u{301}").is_empty());
+}

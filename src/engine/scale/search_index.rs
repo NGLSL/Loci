@@ -142,9 +142,20 @@ impl SearchIndex {
         filter.grams[id as usize % SEGMENT] = trigram_signature(&path);
         let mut entry_pairs = PairSignature::default();
         entry_pairs.insert(&path);
-        filter.pairs[id as usize % SEGMENT] = entry_pairs;
         // Union-only block filters remain safe when an entry is renamed/deleted.
         filter.short[id as usize % SEGMENT / SHORT_BLOCK].insert(&path);
+        // Invalid paths match extensions using standalone raw suffix lowercase.
+        // It may differ from normalized filename context (A.Σ -> a.ς versus
+        // standalone Σ -> σ), so all prefilters must admit both representations.
+        // Only the contextual path is retained for ordinary term verification.
+        if path.contains(&255) {
+            if let Some(suffix) = crate::index::normalized_raw_extension(name) {
+                filter.grams[id as usize % SEGMENT] |= trigram_signature(suffix.as_bytes());
+                entry_pairs.insert(suffix.as_bytes());
+                filter.short[id as usize % SEGMENT / SHORT_BLOCK].insert(suffix.as_bytes());
+            }
+        }
+        filter.pairs[id as usize % SEGMENT] = entry_pairs;
         if kind == Kind::Directory {
             if id != 0 {
                 path.push(b'/');

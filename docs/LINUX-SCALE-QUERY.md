@@ -11,6 +11,17 @@ cargo run --offline --locked --release --example linux-query-baseline -- /path/t
 
 The driver walks the native filesystem and compares complete snapshot pagination for all 39 queries to that full-set oracle, then independently completes exact-count jobs. Small native regression tests use a separate valid-run oracle for Unicode lowercase expansion, invalid bytes, ancestor/slash boundaries, AND and exact extensions. The timed path includes public handle lease acquisition and first-page retrieval of up to 50 entries, with no prior exact count or global sorting. Each query runs 200 times; raw rows retain separate lease/page/total times, returned rows and completeness. Full raw-byte lexical sorting and process worker-admission/cancellation checks run outside timing loops. These warmed repetitions measure one immutable snapshot; they do not include cold index construction or native owner scheduling.
 
+Extension matching preserves the shared raw-query contract. Valid UTF-8 paths
+compare the suffix after whole-path lowercasing. A path containing invalid UTF-8
+instead compares the valid raw basename suffix after independent lowercasing:
+`A.Σ` has contextual suffix `ς`, while the same basename below an invalid-byte
+ancestor has standalone suffix `σ`. Its query filters conservatively admit both
+forms without retaining another filename copy. Terms still use contextual valid
+runs, and an invalid suffix cannot match a valid extension. Snapshot filters are
+rebuilt for affected descendants on directory moves; held leases retain the old
+semantics. The native tests cover combining-mark suffixes, count, raw
+lexical sort and moves between valid and invalid ancestry.
+
 Build and validation took 318.878 ms. All 7,800 timed queries, 39 complete result sets, 39 exact counts and the optional full 100k sort passed their oracle assertions. Aggregate p50/p95/p99: 0.027047/2.786263/4.431977 ms. The worst per-query p95 was `dir00000` at 4.779512 ms; the table preserves every query class rather than relying on the aggregate.
 
 | Query | Exact matches | p50 ms | p95 ms | p99 ms |
