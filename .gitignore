@@ -13,9 +13,6 @@ __pycache__/
 /.archive/
 
 # Local agent configuration; sharing is not established
-/.agents/
-/AGENTS.md
-/skills-lock.json
 /docs/agents/
 .zcode
 .claude
