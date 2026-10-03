@@ -7,8 +7,8 @@
 __pycache__/
 *.pyc
 
-# Local research, recovery archives and task records
-/.scratch/
+# Local worktrees and recovery archives; .scratch task records are tracked
+/.scratch/worktrees/
 /.artifact-archive/
 /.archive/
 
