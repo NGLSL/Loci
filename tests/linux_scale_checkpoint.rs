@@ -14,6 +14,9 @@ fn settle(engine: &mut Engine) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while engine.view().status != Status::Validated {
         engine.poll().unwrap();
+        if engine.view().status == Status::Validated {
+            break;
+        }
         assert!(Instant::now() < deadline, "{:?}", engine.view());
     }
 }
