@@ -150,3 +150,44 @@ above an exact million-entry reference inventory. This does not raise physical
 slot/name/snapshot/process/watch caps, migrate checkpoint formats, or imply that
 the performance gates already pass. LOCISCL1 graph validation uses the configured
 live budget; bounded Engine validation remains separate and unchanged.
+
+## Scale buffer layout and page reclamation
+
+Linux scale record segments, basename arenas and derived filter arrays use
+private anonymous read/write mappings. Their containing Arc retains ownership
+through older snapshots and query jobs. Copy-on-write allocates a separate,
+fallible mapping; the old mapping stays readable until its last Arc drops, then
+munmap returns its pages directly. This does not map corpus or checkpoint files.
+The page size is observed through Linux sysconf. Snapshot/retained accounting
+charges page-rounded mapping capacity and buffer metadata before allocation;
+name-arena growth also admits the old/new transient overlap before copying.
+Shared mappings remain deduplicated in retained accounting. These capacity
+credits are distinct from actual process RSS and kernel memory.
+
+Writer lookup keys preserve the complete parent u32 and basename hash u64 in a
+12-byte key, avoiding tuple padding without truncating either value. Entry IDs
+already require checked u32 conversion; sibling positions also use checked u32
+conversion under the configured live-entry bound. Collision buckets still
+verify original basename bytes. Writer child lists retain up to 64 IDs inside
+their hash-table buckets, with Vec overflow for larger directories. Directory
+prefixes retain up to 128 normalized bytes inside snapshot cache buckets, with
+immutable Arc<Vec> fallback for longer ancestry. No full file-path cache is
+introduced. Prefix and adjacency bucket capacities join their respective
+snapshot/retained and conservative two-writer process admission bounds.
+
+GNU Linux additionally requests allocator maintenance after dropping at least
+16 MiB of uniquely owned scale allocations. A final drop-guard field records
+that request after its owned buffers actually finish dropping. Active scale
+poll/stop boundaries drain the atomic request with malloc_trim(0), outside the
+shared snapshot mutex. Ordinary small COW updates do not meet this threshold;
+a quiet poll only checks the atomic flag. This releases unused GNU allocator
+pages without moving live buffers. Other Linux libc builds use direct mapping
+release without the GNU trim call. Default bounded Linux and Windows layouts
+and behavior remain unchanged; Windows scale mode remains Unsupported.
+
+The development lifecycle measurements distinguish mapped/cached capacities,
+GNU allocator chunk statistics and actual engine-process RSS. GNU mallinfo2 in
+the opt-in measurement example is read-only diagnostics, requires a supporting
+GNU libc, and does not report live Rust payload or RSS. The production library
+has no mallinfo2 dependency. See [memory evidence](../LINUX-MILLION-MEMORY-RECLAMATION.md)
+for complete failed runs, successful-cut requirements and environment limits.
