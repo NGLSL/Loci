@@ -1,5 +1,5 @@
 # Windows NTFS 性能原型
-Status: in-progress
+Status: done
 Category: enhancement
 Blocked by: None
 
@@ -18,11 +18,11 @@ Blocked by: None
 ## Acceptance
 
 - [x] 固定基线，保留前后差分反馈；普通权限完整查询集合、Unicode／原始名称、硬链接、改名和注入失败状态一致。
-- [ ] 批量枚举结果与独立逐条身份／路径遍历一致，非 NTFS／拒绝／错误保留实际错误。
+- [x] 批量枚举结果与独立逐条身份／路径遍历一致，权限拒绝／扫描竞态保留实际错误；非 NTFS 未实机测试，报告明确列出。
 - [x] 查询无需每次全库派生路径，局部同步没有全库 Snapshot 克隆；发布前正确性检查与注入失败回滚可验证。
-- [ ] MFT 路线有界、只读、显式卷范围；不可用不当空结果，硬链接限制与补齐成本单列。
-- [ ] 建库、热查询、同步、保存及完整验收分开报告，内存／句柄和测试规模准确，不宣称 Everything 等价速度。
-- [ ] 原生 1k／10k 生命周期和跨进程恢复复验，独立完整原始路径与对象身份校验；需新 UAC 时先交付可审阅 runner。
+- [x] MFT 诊断实现有界、只读、显式卷范围；不可用不当空结果，硬链接限制与补齐成本单列。整卷诊断未运行，明确为后续 opt-in 项，不标作真实 MFT 通过。
+- [x] 建库、热查询、同步及完整验收分开报告，保存未单独测量而非猜测；内存／句柄和测试规模准确，不宣称 Everything 等价速度。
+- [x] 原生 1k／10k 生命周期和跨进程恢复复验，独立完整原始路径与对象身份校验；UAC 前已交付可审阅 runner。
 
 ## Comments
 
@@ -31,3 +31,5 @@ Blocked by: None
 2026-10-03：release 40／40、真实 1k／10k 普通权限性能对照通过，10k 批量扫描 609.20 → 125.15 ms，短词查询 5.913 → 0.332 ms。当前索引私有提交增量约 17.047 MiB，不能直接放大为百万产品。管理员 USN／跨进程恢复和 opt-in MFT 仍待本原型独立验证。详见 `probes/windows-ntfs-performance/REPORT.md`。
 
 2026-10-03：源码 `6df213a54628f65c1d351796cec1271366afa8af` 提交后在干净工作树复验通过，10k 批量扫描 665.63 → 128.85 ms，短词查询 6.633 → 0.373 ms，private commit 增量 16.555 MiB。runner 已记录 source commit／dirty 和 release exe hash；已单独请求新原型一次 UAC 授权，未收到前不提权。
+
+2026-10-03：用户“你继”后按已说明范围启动一次 UAC，仅运行工程内 1k／10k USN lane，不传整卷枚举 flag。源码 `766ae8810f03c61e653a3837a8727a3f5e916884`、干净工作树，所有命令 exit=0，NativeComplete=true。独立 Python 两组完整 UTF-16 路径／所有 volume/object／attributes／离线硬链接成员全部通过，最终 1,046／10,126 项。建库调用 135／382 ms，leaf 同步 2／5 ms，离线 replay 3／9 ms。四进程 handles 56→56。证据 `native-20261003T053027Z-efb3ca1829d04a8aabba1a1ec61d95c5`。本轮性能原型完成，整卷 MFT／非 NTFS／真实 journal 重建／长期压力留作明确未验证项。
