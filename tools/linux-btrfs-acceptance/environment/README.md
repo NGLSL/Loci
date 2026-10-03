@@ -13,12 +13,17 @@ CLI/test/driver destinations with read-only artifact bindings, verifies source
 and build logs, and records environment helper source/compiler/image digests.
 It never downloads, globally installs tools, loads host modules, changes sysctl,
 starts a network guest or uses a host block device. `plan` validates and writes a
-recipe; only its explicit `--assemble` compiles small helpers and creates fresh
-regular owned images. It does not start QEMU. Images/results belong outside Git.
+recipe. `--stage-only` compiles small helpers and stages the runtime/content/newc
+archive for review without allocating images; its `runtime-stage.json` explicitly
+records `runtime_staged_not_assembled`, no guest execution and no acceptance.
+`--assemble` also provisions fresh regular owned images. Neither starts QEMU.
+Images/results belong outside Git.
 
 An explicit8GiB sparse Btrfs image is provisioned with an exact path/uid/dev/inode/
 run-token ownership receipt. Assembly reserves its entire possible growth,
-artifact image and logs while keeping15% host backing free. The guest records
+artifact image, copied artifact tree, initramfs tree/archive and external logs
+while keeping15% host backing free. Stage-only admission reserves the staged
+bytes and logs; it does not charge unallocated data/artifact images. The guest records
 raw `btrfs filesystem usage -b`; a real100k physical metadata DUP pilot precedes
 million creation with1.5x measured physical growth projection. Unknown profiles,
 insufficient minfree/device/statvfs reserve or failed pilot stops. f_files=0 is
@@ -84,8 +89,17 @@ Btrfs/compiled ELF ABI dependency closure. These are explicit environment inputs
 not a second package/runtime resolver; GNU sort still comes from shared stage_tools.
 `--rust-env` is optional if supplied PATH already provides the chosen rustc.
 
-After recipe/budget review and an isolated scheduled window, change output to a
-fresh directory and add `--assemble`. It produces `assembly.json`, outer
+For runtime review before image provisioning, change output to a fresh directory
+and add `--stage-only`. Newly generated guest mapping ancestors and artifact root
+are explicitly mode0755; mapped executables are mode0755 and readable content is
+mode0644 even under umask077. The read-only write-probe is mode0666 so its eventual
+failure tests EROFS. Input source/package trees and copied private files such as
+`etc/shadow` retain their permissions. The newc root/entries are root-owned; the
+public mapping permits the ordinary UID1000 guest to traverse and execute them.
+No images, outer guest manifest or completed Engine receipt are emitted.
+
+After recipe/budget review and an isolated scheduled window, use another fresh
+output directory and add `--assemble`. It produces `assembly.json`, outer
 `guest-manifest.json`, content mapping, exact data-owner receipt, compiler logs,
 initramfs and regular artifact/data images. Source/image identity is checked;
 outer checked runner owns bounded actual launch and post-run classification.
@@ -100,10 +114,15 @@ python3 -m unittest discover \
 python3 -m py_compile tools/linux-btrfs-acceptance/environment/stage.py
 ```
 
-They check exact mapping, newc console/symlink serialization and explicitly
-synthetic DUP usage parsing. They invoke no compiler, QEMU, image formatter,
-fixture generator or native Engine. C/Rust helpers require separate compilation
-and real guest proof after the parent schedules it.
+The default checks exercise the public source-only/plan CLI and synthetic DUP
+usage parsing; they invoke no compiler, QEMU, image formatter or native Engine.
+The optional `LOCI_BTRFS_STAGE_INPUTS` test consumes an explicit JSON object with
+absolute `output`, `owned_prefix`, `source`, `sha`, `build_manifest`, `qemu`,
+`kernel`, `base_initramfs`, `fs_tools`, `run_id` and `rust_env` fields. It invokes
+public `--stage-only` under umask077, compiles the small helpers, verifies actual
+newc root-owned mapping metadata and unchanged private input permissions, and
+requires no images or guest-execution claim. Its output must be fresh. Ordinary
+UID1000 execution and actual Btrfs/Engine acceptance require separate proofs.
 
 ## Native budget receipt contract
 

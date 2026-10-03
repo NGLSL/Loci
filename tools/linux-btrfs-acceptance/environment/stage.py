@@ -81,9 +81,16 @@ def plan(args):
     result_size = 2 * 1024 * 1024 * 1024
     v = os.statvfs(args.output.parent)
     available = v.f_bavail * v.f_frsize
-    host_budget = data_size + artifact_size + 128 * 1024 * 1024
+    base_bytes = sum(p.stat().st_size for p in args.base_initramfs.rglob('*')
+                     if p.is_file() and not p.is_symlink())
+    # Include the copied artifacts/tree and compressed archive alongside images.
+    # Results live inside data.btrfs; 128MiB covers external assembly/serial logs.
+    stage_budget = total + 2 * base_bytes + 16 * 1024 * 1024
+    host_budget = stage_budget + 128 * 1024 * 1024
+    if not args.stage_only:
+        host_budget += data_size + artifact_size
     if available - host_budget < v.f_blocks * v.f_frsize * 0.15:
-        raise ValueError('host cannot retain15% after full sparse/image/log growth')
+        raise ValueError('host cannot retain15% after planned staging/image/log growth')
     for path in (args.source,args.build_manifest,args.qemu,args.kernel,args.base_initramfs,args.fs_tools,args.output):
         if not path.is_absolute():
             raise ValueError('explicit absolute environment/source/output paths required')
@@ -94,13 +101,27 @@ def plan(args):
         if not path.is_file() or path.is_symlink():
             raise ValueError('explicit regular immutable QEMU/kernel required')
     jobs = m.jobs_for(manifest, ('suites', '100k', 'overflow'), 600)
-    value = {'status': 'planned_not_assembled', 'source_sha': args.sha, 'build_manifest': str(args.build_manifest), 'build_manifest_sha256': digest(args.build_manifest), 'run_id': args.run_id, 'cli': cli, 'driver': driver, 'guest_mapping': entries, 'jobs': jobs, 'artifact_image_bytes': artifact_size, 'data_image_bytes': data_size, 'result_budget_bytes': result_size, 'host_planned_write_bytes': host_budget, 'reference_hardware_verified': False, 'engine_acceptance': False, 'issue16_resolved': False}
-    if not args.assemble:
+    value = {'status': 'planned_not_assembled', 'source_sha': args.sha, 'build_manifest': str(args.build_manifest), 'build_manifest_sha256': digest(args.build_manifest), 'run_id': args.run_id, 'cli': cli, 'driver': driver, 'guest_mapping': entries, 'jobs': jobs, 'artifact_image_bytes': artifact_size, 'data_image_bytes': data_size, 'result_budget_bytes': result_size, 'host_planned_write_bytes': host_budget, 'stage_planned_write_bytes': stage_budget, 'reference_hardware_verified': False, 'engine_acceptance': False, 'issue16_resolved': False}
+    if not (args.assemble or args.stage_only):
         m.source_identity(args.source,args.sha)
         save(args.output, value)
         print(json.dumps(value, indent=2))
         return
     assemble(args, value, manifest, m)
+
+def guest_parents(root, destination):
+    # Only new staged mappings are public. Do not chmod the source/package tree
+    # or follow a copied absolute symlink into the host filesystem.
+    relative = destination.relative_to(root)
+    current = root
+    current.chmod(0o755)
+    for component in relative.parent.parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError('symlink ancestor in guest mapping: ' + str(current))
+        current.mkdir(exist_ok=True)
+        current.chmod(0o755)
+
 
 def archive_initramfs(tree, path):
     inode = 1
@@ -116,6 +137,7 @@ def archive_initramfs(tree, path):
             out.write(b'\x00' * ((-len(header) - len(name)) % 4))
             out.write(data)
             out.write(b'\x00' * (-len(data) % 4))
+        entry('.', tree.stat().st_mode)
         for p in sorted(tree.rglob('*')):
             s = p.lstat()
             data = os.readlink(p).encode() if p.is_symlink() else p.read_bytes() if p.is_file() else b''
@@ -150,10 +172,12 @@ def assemble(args, value, manifest, m):
         command(version)
         for src, name in [('native-probe.c', 'native-probe'), ('fixture.c', 'fixture')]:
             command([args.cc, '-O2', '-Wall', '-Wextra', str(HERE / src), '-o', str(out / name)])
+            (out / name).chmod(0o755)
         rust = [args.rustc, '-O', str(HERE / 'btrfs-matrix.rs'), '-o', str(out / 'btrfs-matrix')]
         if args.rust_env:
             rust = ['bash', '-c', 'source ' + shlex.quote(str(args.rust_env)) + '; exec ' + shlex.join(rust)]
         command(rust)
+        (out / 'btrfs-matrix').chmod(0o755)
         extra = {'/guest/native-probe': out / 'native-probe', '/guest/fixture': out / 'fixture', '/guest/btrfs-matrix': out / 'btrfs-matrix', '/guest/btrfs': args.fs_tools / 'usr/bin/btrfs', '/guest/usage_guard.awk': HERE / 'usage_guard.awk', '/guest/queries.txt': args.source / 'tools/linux-million-acceptance/queries.txt'}
         for name in ('native-probe.c', 'fixture.c', 'btrfs-matrix.rs', 'init.in', 'orchestrate.in', 'workload.in', 'stage.py'):
             extra['/guest/source/' + name] = HERE / name
@@ -184,26 +208,44 @@ def assemble(args, value, manifest, m):
         content = {'source_sha': args.sha, 'artifacts': [{'guest_path': guest_destination(dst), 'sha256': row['sha256']} for dst, row in sorted(value['guest_mapping'].items())]}
         for dst, row in value['guest_mapping'].items():
             dest = art / dst.lstrip('/')
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            guest_parents(art, dest)
             shutil.copy2(row['host_path'], dest)
+            mode = 0o755 if dest.stat().st_mode & 0o111 else 0o644
+            if dst == '/guest/readonly-proof':
+                mode = 0o666  # Write attempt must test EROFS, not DAC permissions.
+            dest.chmod(mode)
             if digest(dest) != row['sha256']:
                 raise ValueError('source changed while staging ' + dst)
         save(out / 'content.json', content)
         shutil.copy2(out / 'content.json', art / 'content.json')
+        (art / 'content.json').chmod(0o644)
         content_sha = digest(out / 'content.json')
         binds = []
         for dst in sorted(value['guest_mapping']):
             target = tree / dst.lstrip('/')
-            target.parent.mkdir(parents=True, exist_ok=True)
+            guest_parents(tree, target)
             if target.is_symlink():
                 target.unlink()
             if not target.exists():
                 target.touch()
+            target.chmod(0o644)
             binds += ['mount --bind ' + shlex.quote('/artifacts' + dst) + ' ' + shlex.quote(dst), 'mount -o remount,bind,ro ' + shlex.quote(dst)]
         body = (HERE / 'init.in').read_text().replace('@SOURCE_SHA@', args.sha).replace('@RUN_ID@', args.run_id).replace('@CONTENT_SHA@', content_sha).replace('@BIND_ARTIFACTS@', '\n'.join(binds)).replace('@CLI@', value['cli']).replace('@DRIVER@', value['driver'])
         (tree / 'init').write_text(body)
         (tree / 'init').chmod(493)
         archive_initramfs(tree, out / 'initramfs.cpio.gz')
+        if args.stage_only:
+            m.source_identity(args.source, args.sha)
+            value.update(status='runtime_staged_not_assembled', actual_guest_execution=False,
+                         data_image_created=False, artifact_image_created=False,
+                         initramfs_sha256=digest(out / 'initramfs.cpio.gz'),
+                         content_sha256=content_sha, environment_commands=commands,
+                         source_helper_digests={p.name: digest(p) for p in HERE.iterdir()
+                                                if p.is_file() and p.name != 'preparation.json'})
+            save(out / 'runtime-stage.json', value)
+            print(json.dumps({'status': value['status'], 'output': str(out),
+                              'engine_acceptance': False, 'data_image_created': False}))
+            return
         fsenv = {**env, 'LD_LIBRARY_PATH': str(args.fs_tools / 'usr/lib/x86_64-linux-gnu'), 'MKE2FS_CONFIG': str(args.fs_tools / 'etc/mke2fs.conf')}
         for name, size in [('artifacts.ext4', value['artifact_image_bytes']), ('data.btrfs', value['data_image_bytes'])]:
             fd = os.open(out / name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 384)
@@ -239,7 +281,10 @@ def main():
     p.add_argument('--fs-tools', type=pathlib.Path)
     p.add_argument('--run-id')
     p.add_argument('--rust-env', type=pathlib.Path)
-    p.add_argument('--assemble', action='store_true')
+    modes = p.add_mutually_exclusive_group()
+    modes.add_argument('--assemble', action='store_true')
+    modes.add_argument('--stage-only', action='store_true',
+                       help='stage public guest runtime/newc for review without creating disk images')
     a = p.parse_args()
     if a.action == 'source-only':
         source_only(a)
