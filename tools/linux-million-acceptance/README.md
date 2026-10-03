@@ -124,3 +124,6 @@ fixtures do not satisfy the standard million fixture check. Assessment is eviden
 for review: it never closes an issue, establishes reference hardware/native
 filesystem/Windows/24-hour acceptance, or treats exit zero as product acceptance.
 Its own successful exit means the evidence was read, including failed findings.
+The event gate requires the driver's canonical `add`, `delete` and `file-rename`
+classes, with at least 200 samples each and p95 at most 500 ms. Missing evidence
+remains unverified; unknown or incomplete class sets cannot pass.

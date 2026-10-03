@@ -58,7 +58,7 @@ def assess(output, expected_sha=None):
 
     events = rows['event-summary']
     check('ordinary_native_event_200_each_class', bool(events),
-          {row.get('class') for row in events} == {'add', 'delete', 'rename'}
+          {row.get('class') for row in events} == {'add', 'delete', 'file-rename'}
           and len(events) == 3 and all(row.get('samples', 0) >= 200
               and row.get('p95_ns', float('inf')) <= 500_000_000 for row in events), events)
     corrections = rows['full-correction']
