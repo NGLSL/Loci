@@ -465,3 +465,75 @@ fn invalid_ancestor_rename_rebuilds_extension_filters_and_preserves_old_lease() 
     );
     assert!(complete_paths(&engine.query(), "ext:ς\u{301}").is_empty());
 }
+
+#[test]
+fn long_directory_ancestry_survives_inline_moves_old_leases_and_checkpoint_restore() {
+    use std::os::unix::ffi::OsStringExt;
+    let fixture = Fixture::new();
+    let long = fixture
+        .root
+        .join(format!("{}{}", "Ancestor".repeat(18), "报告"));
+    let raw_component = std::ffi::OsString::from_vec(b"raw\xff".to_vec());
+    let raw = long.join(&raw_component);
+    fs::create_dir_all(&raw).unwrap();
+    fs::write(raw.join("A.Σ\u{301}"), b"").unwrap();
+    let raw_file = std::ffi::OsString::from_vec(b"ab\xffCD.TXT".to_vec());
+    fs::write(raw.join(&raw_file), b"").unwrap();
+    let database = fixture.root.parent().unwrap().join("long-prefix.loci");
+    let mut engine =
+        Engine::open_with_options(&fixture.root, Some(&database), EngineOptions::scale()).unwrap();
+    assert_eq!(
+        complete_paths(&engine.query(), "ext:σ\u{301}"),
+        [raw.join("A.Σ\u{301}")]
+    );
+    assert_eq!(
+        complete_paths(&engine.query(), "ancestor ab cd ext:txt"),
+        [raw.join(&raw_file)]
+    );
+    assert!(complete_paths(&engine.query(), "abcd").is_empty());
+    let old = engine.query().lease().unwrap();
+    let short = fixture.root.join("短");
+    let version = engine.view().version;
+    fs::rename(&long, &short).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while engine.view().version <= version {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert_eq!(
+        complete_paths(&engine.query(), "短 ab cd ext:txt"),
+        [short.join(&raw_component).join(&raw_file)]
+    );
+    assert!(complete_paths(&engine.query(), "ancestor").is_empty());
+    assert_eq!(
+        old.page(
+            "ext:σ\u{301}",
+            None,
+            50,
+            &Default::default(),
+            &Default::default()
+        )
+        .unwrap()
+        .paths,
+        [raw.join("A.Σ\u{301}")]
+    );
+    drop(old);
+    let version = engine.view().version;
+    fs::rename(&short, &long).unwrap();
+    while engine.view().version <= version {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    engine.save().unwrap();
+    drop(engine);
+    let reopened =
+        Engine::open_with_options(&fixture.root, Some(&database), EngineOptions::scale()).unwrap();
+    assert_eq!(
+        complete_paths(&reopened.query(), "ancestor ab cd ext:txt"),
+        [raw.join(&raw_file)]
+    );
+    assert_eq!(
+        complete_paths(&reopened.query(), "ext:σ\u{301}"),
+        [raw.join("A.Σ\u{301}")]
+    );
+}

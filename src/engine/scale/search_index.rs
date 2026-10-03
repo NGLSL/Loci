@@ -27,10 +27,55 @@ impl Default for Filters {
 fn filter_bytes() -> usize {
     super::mapped::allocation_bytes::<Filters>(1).expect("fixed filter capacity")
 }
+// Directory-only prefixes remain snapshot-owned. Pack short prefixes into map
+// buckets to avoid persistent tiny Vec/Arc allocations pinning allocator pages.
+// Longer and deeply nested prefixes preserve the shared immutable Vec fallback.
+#[derive(Clone)]
+enum Prefix {
+    Inline { bytes: [u8; 128], length: usize },
+    Heap(Arc<Vec<u8>>),
+}
+impl Prefix {
+    fn new(mut path: Vec<u8>) -> Self {
+        if path.len() <= 128 {
+            let mut bytes = [0; 128];
+            bytes[..path.len()].copy_from_slice(&path);
+            Self::Inline {
+                bytes,
+                length: path.len(),
+            }
+        } else {
+            path.shrink_to_fit();
+            Self::Heap(Arc::new(path))
+        }
+    }
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, length } => &bytes[..*length],
+            Self::Heap(path) => path,
+        }
+    }
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+    fn heap(&self) -> Option<&Arc<Vec<u8>>> {
+        match self {
+            Self::Heap(path) => Some(path),
+            _ => None,
+        }
+    }
+    fn extra_bytes(&self) -> usize {
+        self.heap().map_or(0, |path| {
+            std::mem::size_of::<Vec<u8>>() + 16 + path.capacity()
+        })
+    }
+}
+// Includes bucket payload, hash control bytes, and capacity/load-factor slack.
+const PREFIX_BUCKET_BYTES: usize = 192;
 #[derive(Clone)]
 pub(super) struct SearchIndex {
     filters: Vec<Arc<super::mapped::Buffer<Filters>>>,
-    directories: Arc<HashMap<EntryId, Arc<Vec<u8>>>>,
+    directories: Arc<HashMap<EntryId, Prefix>>,
     pub derived: usize,
     allocated: usize,
 }
@@ -40,7 +85,7 @@ impl Default for SearchIndex {
             filters: Vec::new(),
             directories: Arc::new(HashMap::new()),
             derived: 0,
-            allocated: std::mem::size_of::<HashMap<EntryId, Arc<Vec<u8>>>>() + 16,
+            allocated: std::mem::size_of::<HashMap<EntryId, Prefix>>() + 16,
         }
     }
 }
@@ -88,13 +133,14 @@ impl SearchIndex {
             * (filter_bytes() + std::mem::size_of::<super::mapped::Buffer<Filters>>() + 16);
         if Arc::strong_count(&self.directories) == 1 {
             // Capacity times entry payload is a lower bound on the real map
-            // allocation; no conservative 64-byte accounting estimate here.
-            bytes += std::mem::size_of::<HashMap<EntryId, Arc<Vec<u8>>>>()
+            // allocation; no conservative bucket accounting estimate here.
+            bytes += std::mem::size_of::<HashMap<EntryId, Prefix>>()
                 + 16
-                + self.directories.capacity() * std::mem::size_of::<(EntryId, Arc<Vec<u8>>)>();
+                + self.directories.capacity() * std::mem::size_of::<(EntryId, Prefix)>();
             bytes += self
                 .directories
                 .values()
+                .filter_map(Prefix::heap)
                 .filter(|prefix| Arc::strong_count(prefix) == 1)
                 .map(|prefix| std::mem::size_of::<Vec<u8>>() + 16 + prefix.capacity())
                 .sum::<usize>();
@@ -111,11 +157,11 @@ impl SearchIndex {
             }
         }
         if seen.insert(Arc::as_ptr(&self.directories) as usize) {
-            bytes += std::mem::size_of::<HashMap<EntryId, Arc<Vec<u8>>>>()
+            bytes += std::mem::size_of::<HashMap<EntryId, Prefix>>()
                 + 16
-                + self.directories.capacity() * 64;
+                + self.directories.capacity() * PREFIX_BUCKET_BYTES;
         }
-        for prefix in self.directories.values() {
+        for prefix in self.directories.values().filter_map(Prefix::heap) {
             if seen.insert(Arc::as_ptr(prefix) as usize) {
                 bytes += std::mem::size_of::<Vec<u8>>()
                     + prefix.capacity()
@@ -141,11 +187,11 @@ impl SearchIndex {
         }
         if kind == Kind::Directory {
             if Arc::strong_count(&self.directories) > 1 {
-                bytes += self.directories.capacity() * 64
-                    + std::mem::size_of::<HashMap<EntryId, Arc<Vec<u8>>>>();
+                bytes += self.directories.capacity() * PREFIX_BUCKET_BYTES
+                    + std::mem::size_of::<HashMap<EntryId, Prefix>>();
             }
             if self.directories.len() == self.directories.capacity() {
-                bytes += self.directories.capacity().max(4) * 128;
+                bytes += self.directories.capacity().max(4) * PREFIX_BUCKET_BYTES * 2;
             }
             // Unicode lowercase expands at most threefold; include Vec and Arc.
             bytes += self.directories.get(&parent).map_or(1, |p| p.len()) + name.len() * 3 + 1 + 64;
@@ -203,15 +249,14 @@ impl SearchIndex {
             if id != 0 {
                 path.push(b'/');
             }
-            path.shrink_to_fit();
+            let prefix = Prefix::new(path);
             let old_capacity = self.directories.capacity();
-            let new_bytes = std::mem::size_of::<Vec<u8>>() + path.capacity() + 16;
-            let old = Arc::make_mut(&mut self.directories).insert(id, Arc::new(path));
-            self.allocated = self.allocated + new_bytes + self.directories.capacity() * 64
-                - old_capacity * 64
-                - old.map_or(0, |prefix| {
-                    std::mem::size_of::<Vec<u8>>() + prefix.capacity() + 16
-                });
+            let new_bytes = prefix.extra_bytes();
+            let old = Arc::make_mut(&mut self.directories).insert(id, prefix);
+            self.allocated =
+                self.allocated + new_bytes + self.directories.capacity() * PREFIX_BUCKET_BYTES
+                    - old_capacity * PREFIX_BUCKET_BYTES
+                    - old.map_or(0, |prefix| prefix.extra_bytes());
         }
         Ok(())
     }
