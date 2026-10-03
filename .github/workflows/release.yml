@@ -1,0 +1,58 @@
+name: Windows package
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Rust 1.99
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt
+      - name: Check release version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $package = (cargo +1.99.0 metadata --no-deps --format-version 1 --locked | ConvertFrom-Json).packages[0]
+            if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
+            if ($env:GITHUB_REF_NAME -ne "v$($package.version)") { throw 'Tag must match Cargo package version' }
+          }
+      - name: Validate
+        run: |
+          cargo +1.99.0 fmt --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.99.0 test --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.99.0 test --release --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install NSIS
+        run: choco install nsis -y
+      - name: Build independent Loci installer
+        run: ./scripts/build-installer.ps1 -Nsis 'C:\Program Files (x86)\NSIS\makensis.exe'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loci-windows-x64
+          path: |
+            target/package/loci-setup.exe
+            target/package/loci-setup.exe.sha256
+            target/package/loci-kite-plugin.zip
+            target/package/loci-kite-plugin.zip.sha256
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            target/package/loci-setup.exe
+            target/package/loci-setup.exe.sha256
+            target/package/loci-kite-plugin.zip
+            target/package/loci-kite-plugin.zip.sha256

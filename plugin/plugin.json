@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "plugin": {
+    "id": "com.kite.loci",
+    "name": "Loci 文件搜索",
+    "version": "0.1.0",
+    "description": "独立 Loci 插件包：一次管理员授权安装 NTFS 索引服务，Kite 日常普通权限搜索。",
+    "usage": "导入插件后输入 loci，点击“安装服务（管理员授权）”并完成安装；然后点击“查看状态”。安装只在点击时启动，不自动提权。\nKite 文件搜索直接使用 Loci；也可输入 loci 文件名 搜索。\n后台服务负责 NTFS 卷索引，插件以普通权限只读查询。\n待校正或失败时结果可能过时或不完整；插件空闲退出后后台服务继续运行。",
+    "author": "Loci"
+  },
+  "compatibility": {
+    "plugin_api": 1,
+    "minimum_kite_version": "0.5.0"
+  },
+  "runtime": {
+    "command": "kite-plugin-loci.exe",
+    "args": [],
+    "startup_timeout_ms": 5000,
+    "idle_timeout_ms": 300000
+  },
+  "contributes": {
+    "examples": [
+      "loci",
+      "loci status"
+    ],
+    "commands": [
+      {
+        "id": "open",
+        "title": "Loci 文件搜索",
+        "keywords": [
+          "loci"
+        ],
+        "action": {
+          "type": "enter_provider",
+          "provider": "files"
+        }
+      }
+    ],
+    "providers": [
+      {
+        "id": "files",
+        "response_mode": "list",
+        "triggers": [
+          {
+            "type": "keyword",
+            "value": "loci"
+          }
+        ]
+      },
+      {
+        "id": "file_search",
+        "response_mode": "list",
+        "triggers": []
+      }
+    ]
+  }
+}

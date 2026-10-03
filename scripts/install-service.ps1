@@ -5,6 +5,30 @@ param(
     [switch]$StopOnly
 )
 $ErrorActionPreference = 'Stop'
+function Test-LociUnsafeRule {
+    param($Rule, [bool]$Strict)
+    if ($Rule.AccessControlType -ne 'Allow') { return $false }
+    if (-not $Strict -and ($Rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { return $false }
+    $rights = [int64][int]$Rule.FileSystemRights -band 0xffffffffL
+    # Ancestors may allow creating new directories without allowing replacement
+    # of an existing protected directory. The install directory and files cannot.
+    $mask = 0x500d0042L # generic all/write, delete, delete-child, write DAC/owner, write data
+    if ($Strict) { $mask = $mask -bor 0x116L } # append, write attributes/EA
+    return ($rights -band $mask) -ne 0
+}
+function Assert-LociProtectedPath {
+    param([string]$Path, [bool]$Strict)
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Loci installation path must not contain a reparse point: $Path" }
+    $acl = Get-Acl -LiteralPath $Path
+    $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin $trusted) { throw "Loci installation path has an untrusted owner: $Path" }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        $sid = $rule.IdentityReference.Value
+        if ($sid -notin $trusted -and (Test-LociUnsafeRule $rule $Strict)) { throw "Loci installation path grants untrusted write access: $Path" }
+    }
+}
 try {
     if ($Uninstall -and $StopOnly) { throw 'Choose either Uninstall or StopOnly.' }
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -15,6 +39,56 @@ try {
     $serviceName = 'LociIndex'
     $expectedPath = [IO.Path]::GetFullPath($ExecutablePath)
     if ($expectedPath.Contains('"') -or $expectedPath.Contains("`n") -or $expectedPath.Contains("`r")) { throw 'Invalid executable path.' }
+    $registry = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $versionKey = $registry.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion')
+        try { $programFiles = [string]$versionKey.GetValue('ProgramFilesDir') } finally { $versionKey.Dispose() }
+    } finally { $registry.Dispose() }
+    if (-not $programFiles) { throw 'Cannot determine the native Program Files directory.' }
+    $installDirectory = Join-Path $programFiles 'Loci'
+    $fixedPath = Join-Path $installDirectory 'loci-service.exe'
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($expectedPath, $fixedPath)) { throw "Loci service must be installed at $fixedPath." }
+    $ancestor = [IO.DirectoryInfo]::new($programFiles)
+    while ($ancestor) {
+        Assert-LociProtectedPath $ancestor.FullName $false
+        $ancestor = $ancestor.Parent
+    }
+    if (-not (Test-Path -LiteralPath $installDirectory)) {
+        if ($Uninstall) { throw 'Loci installation directory is missing; no service was modified.' }
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class LociSecureInstallDirectory {
+    [StructLayout(LayoutKind.Sequential)] public struct SA { public int Size; public IntPtr Descriptor; public int Inherit; }
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string s, uint revision, out IntPtr descriptor, out uint size);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CreateDirectory(string path, ref SA attributes);
+    [DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr memory);
+}
+'@
+        [IntPtr]$installDescriptor = [IntPtr]::Zero
+        [uint32]$installDescriptorSize = 0
+        if (-not [LociSecureInstallDirectory]::ConvertStringSecurityDescriptorToSecurityDescriptor('O:BAG:BAD:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;BU)', 1, [ref]$installDescriptor, [ref]$installDescriptorSize)) { throw 'Cannot prepare protected Loci installation ACL.' }
+        try {
+            $installAttributes = [LociSecureInstallDirectory+SA]::new()
+            $installAttributes.Size = [Runtime.InteropServices.Marshal]::SizeOf($installAttributes)
+            $installAttributes.Descriptor = $installDescriptor
+            if (-not [LociSecureInstallDirectory]::CreateDirectory($installDirectory, [ref]$installAttributes)) {
+                $installError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                if ($installError -ne 183) { throw "Cannot create protected Loci installation directory: $installError" }
+            }
+        } finally { [void][LociSecureInstallDirectory]::LocalFree($installDescriptor) }
+    }
+    $installItem = Get-Item -LiteralPath $installDirectory -Force
+    if (-not $installItem.PSIsContainer) { throw 'Loci installation path must be a directory.' }
+    Assert-LociProtectedPath $installDirectory $true
+    if (Test-Path -LiteralPath $expectedPath) {
+        if ((Get-Item -LiteralPath $expectedPath -Force).PSIsContainer) { throw 'Loci service executable must be a file.' }
+        Assert-LociProtectedPath $expectedPath $true
+    }
+    foreach ($installedName in @('install-service.ps1', 'uninstall.exe', 'loci.exe')) {
+        $installedFile = Join-Path $installDirectory $installedName
+        if (Test-Path -LiteralPath $installedFile) { Assert-LociProtectedPath $installedFile $true }
+    }
     if (-not $Uninstall -and -not $StopOnly -and -not [IO.File]::Exists($expectedPath)) { throw "Service executable does not exist: $expectedPath" }
     $existing = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
     if ($existing) {

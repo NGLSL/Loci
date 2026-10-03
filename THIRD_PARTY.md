@@ -14,7 +14,11 @@ Loci的许可证选择尚未完成。本次没有添加LICENSE文件，也没有
 
 ## 当前 Cargo 依赖
 
-直接依赖为 `serde` 1.0.229、`serde_json` 1.0.151；传递依赖包括 serde_core、serde_derive、itoa、memchr、proc-macro2、quote、syn、unicode-ident、zmij，具体版本以 Cargo.lock 为准。再分发时应保留所使用 crate 包中的许可文件与版权声明；以下算法参考记录不替代实际依赖的许可记录。
+直接依赖为 `serde` 1.0.229、`serde_json` 1.0.151；传递依赖包括 serde_core、serde_derive、itoa、memchr、proc-macro2、quote、syn、unicode-ident、zmij，具体版本以 Cargo.lock 为准。独立安装包将 Cargo 锁定依赖源包中的 LICENSE／COPYING／NOTICE 文件放入安装目录 `licenses/<crate>-<version>/`，并附带本说明。以下算法参考记录不替代实际依赖的许可记录。
+
+## Kite 插件 SDK
+
+`plugin/src/sdk.rs` 复制了 Kite Rust 插件 SDK 的 JSON-RPC 帧与响应助手，来源及固定提交见 [SDK-SOURCE.md](plugin/SDK-SOURCE.md)。原版权和 Apache-2.0 许可证保留在 [SDK-LICENSE](plugin/SDK-LICENSE) 和源码文件头；SDK 不依赖 Kite 仓库的本地路径。插件 ZIP 附带这两个文件、本说明及锁定 Cargo 依赖的许可文件。
 
 ## 参考项目的已核实许可来源
 
