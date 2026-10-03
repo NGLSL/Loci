@@ -8,7 +8,7 @@ Loci 是 Windows 文件名／路径搜索项目，提供独立 **LociIndex** 后
 
 ## 独立安装包
 
-Loci 独立产出 Kite 插件包 `loci-kite-plugin.zip`。解压后，在 Kite 的插件管理中导入解压目录，再从 Loci 插件点击安装服务，接受一次管理员授权。插件包内附 `loci-setup.exe`；服务默认安装目录为 `C:\Program Files\Loci`，注册独立的 Windows 卸载信息。Kite 构建无需克隆 Loci，日常查询无需管理员权限。插件导入不自动提权，也不随 Kite 卸载服务。
+Loci 独立产出 Kite 插件包 [`loci-kite-plugin.zip`](https://github.com/NGLSL/Loci/releases/latest/download/loci-kite-plugin.zip)。在支持 ZIP 导入和 Loci 文件搜索的 Kite 构建中，直接导入下载的 ZIP，再从 Loci 插件点击安装服务，接受一次管理员授权。旧版仅支持目录导入时，先解压再导入含 `plugin.json` 的目录；旧版不会自动获得新的文件搜索接入。插件包内附 `loci-setup.exe`；服务默认安装目录为 `C:\Program Files\Loci`，注册独立的 Windows 卸载信息。Kite 构建无需克隆 Loci，日常查询无需管理员权限。插件导入不自动提权，也不随 Kite 卸载服务。
 
 开发者只克隆 Loci 即可生成独立 Windows x64 安装包，需要 Rust 1.99.0 和 NSIS：
 
@@ -27,7 +27,7 @@ Loci 独立产出 Kite 插件包 `loci-kite-plugin.zip`。解压后，在 Kite �
 
 安装与升级固定使用受保护的原生 `Program Files\Loci`，不支持自定义目录；安装脚本核查目录、祖先和已有执行文件的归属及权限，拒绝可被普通用户改写的路径或重解析点。安装与卸载互斥运行。遇到其他目录所属的 `LociIndex`，安装器会拒绝覆盖；若此前安装过 Kite 内置的服务，需要先卸载原归属的服务，再安装独立 Loci。
 
-`Windows package` workflow 可手动生成构建产物；版本匹配的 `v*` tag 在检查、测试与打包通过后发布插件 ZIP、安装器和 SHA256 文件。添加 workflow 不代表已经发布版本，实际服务安装、升级和卸载仍需 Windows 验收。
+[`Windows package`](https://github.com/NGLSL/Loci/actions/workflows/release.yml) workflow 可在 GitHub Actions 手动生成构建产物；版本匹配的 `v*` tag 在检查、测试与打包通过后发布插件 ZIP、安装器和 SHA256 文件。添加 workflow 不代表已经发布版本，实际服务安装、升级和卸载仍需 Windows 验收。
 
 ## 源码构建与服务管理
 

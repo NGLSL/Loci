@@ -16,6 +16,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
       - name: Rust 1.99
         run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt
       - name: Check release version
@@ -26,6 +28,14 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed' }
             if ($env:GITHUB_REF_NAME -ne "v$($package.version)") { throw 'Tag must match Cargo package version' }
           }
+      - name: Verify tagged commit is on main
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          git fetch origin main --no-tags
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag must point to a commit contained in main' }
       - name: Validate
         run: |
           cargo +1.99.0 fmt --check
@@ -41,6 +51,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: loci-windows-x64
+          if-no-files-found: error
           path: |
             target/package/loci-setup.exe
             target/package/loci-setup.exe.sha256
@@ -50,7 +61,8 @@ jobs:
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body_path: docs/releases/v0.1.0.md
           files: |
             target/package/loci-setup.exe
             target/package/loci-setup.exe.sha256
