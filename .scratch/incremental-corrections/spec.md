@@ -1,5 +1,5 @@
 # P1/P2增量正确性修复
-Status: ready-for-agent
+Status: done
 Category: bug
 Blocked by: None
 
@@ -27,3 +27,18 @@ P1发现事件时间路径与最终磁盘不一致时，保留旧版Pending并�
 
 ## Further Notes
 云端P1工作树Linux79pass是单独补丁证据，不能当联合80项已通过。用户gitignore设置必须保留，公开只增加回归文件白名单。
+
+## Implementation Issues
+
+- [01：P1 依赖目录改名批次校正](issues/01-dependent-directory-renames.md) — done。
+- [02：P2 Windows ADS 事件路径拒绝](issues/02-windows-stream-event-paths.md) — done。
+
+## Current Verification
+
+2026-10-03 核对确认原始修复已由 `277271a37581ee388cc88b3c0086b067928c43c5` 实现并进入 main；先前 `ready-for-agent` 是任务记录未回写，不是代码未实施。本次没有重复修改共享引擎代码。
+
+Windows 合并树 `94740f7576888ddccae01cbb6ef98c744ce7c04a`：P1 定向四项回归通过；主项目 debug/release 各96 passed、0 failed、2 ignored，覆盖P2真实ADS、ADS与父rename组合、普通独立rename快路径、Engine整批校验。fmt及all-targets linux-ffi-check通过。ignored为原有两项显式性能测量，不是正确性测试。三个独立NTFS原型release分别24/24/40 passed。
+
+复验命令：`cargo +1.99.0 test --offline --locked -- --test-threads=1`，release加`--release`；`cargo +1.99.0 fmt --check`；`cargo +1.99.0 check --all-targets --features linux-ffi-check --offline --locked`。本轮独立target在验证工作树内，不改变4096条目／128目录上限，不安装依赖，不操作真实journal。
+
+本次未重新执行Linux原生回归，Windows上的Linux cfg测试为0项，linux-ffi-check仅证明类型检查。Linux合法冒号名称与原生rename回归保留；历史Linux证据与本次Windows结果分列，不把旧79项或预期80项当作本次联合提交的原生通过。
