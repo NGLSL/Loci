@@ -11,7 +11,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 static NATIVE: Mutex<()> = Mutex::new(());
 fn settle(engine: &mut Engine) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    settle_before(engine, Instant::now() + Duration::from_secs(15));
+}
+fn settle_before(engine: &mut Engine, deadline: Instant) {
     while engine.view().status != Status::Validated {
         engine.poll().unwrap();
         if engine.view().status == Status::Validated {
@@ -417,6 +419,9 @@ fn failed_atomic_save_preserves_old_checkpoint_and_cleans_owned_temporaries() {
 #[test]
 #[ignore = "opt-in: creates 100,000 real entries across 2,000 owned directories; check disk/inode budget"]
 fn one_hundred_thousand_entry_checkpoint_saves_reopens_and_exports_full_set() {
+    // Functional full-set work shares the native runner's 600s job budget,
+    // including fixture creation and both corrections; this is not startup timing.
+    let deadline = Instant::now() + Duration::from_secs(600);
     let _guard = NATIVE.lock().unwrap();
     let fixture = Fixture::new();
     if !fixture_capacity::hundred_thousand_fixture_preflight(&fixture.base) {
@@ -439,13 +444,13 @@ fn one_hundred_thousand_entry_checkpoint_saves_reopens_and_exports_full_set() {
     options.scan_batch = 4096;
     let mut engine =
         Engine::open_with_options(&fixture.root, Some(&database), options.clone()).unwrap();
-    settle(&mut engine);
+    settle_before(&mut engine, deadline);
     assert_eq!(all(&engine.query()), expected);
     engine.save().unwrap();
     engine.stop().unwrap();
     let mut reopened = Engine::open_with_options(&fixture.root, Some(&database), options).unwrap();
     assert_eq!(all(&reopened.query()), expected);
-    settle(&mut reopened);
+    settle_before(&mut reopened, deadline);
     assert_eq!(all(&reopened.query()), expected);
     reopened.stop().unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_loci-experiment"))
@@ -473,6 +478,10 @@ fn one_hundred_thousand_entry_checkpoint_saves_reopens_and_exports_full_set() {
         .map(|path| path.as_os_str().as_bytes())
         .collect();
     assert_eq!(paths, expected);
+    assert!(
+        Instant::now() < deadline,
+        "100k checkpoint functional job budget"
+    );
 }
 
 #[test]
