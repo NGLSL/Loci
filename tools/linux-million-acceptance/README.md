@@ -108,3 +108,19 @@ python3 tools/linux-million-acceptance/protocol_smoke.py \
 It checks native capture, invalid UTF-8, symlink/hardlink kinds, a held snapshot,
 exact count/sort, and release of watches and descriptors in the same live PID.
 It establishes neither million-entry performance nor reference hardware acceptance.
+
+Read-only evidence assessment for the archived standard 52-query million fixture:
+
+```sh
+python3 tools/linux-million-acceptance/assess.py /absolute/run/results \
+  --sha EXACT_40_CHARACTER_SOURCE_SHA > /absolute/run/assessment.json
+```
+
+The script reads retained JSONL and completion metadata; it neither runs workloads
+nor reimplements the oracle. It checks numeric thresholds from reported values and
+lists each requirement as `passed`, `failed`, or `unverified`. A stages-only run
+leaves query/event/save200/restart200/600-second gates unverified. Smaller or dense
+fixtures do not satisfy the standard million fixture check. Assessment is evidence
+for review: it never closes an issue, establishes reference hardware/native
+filesystem/Windows/24-hour acceptance, or treats exit zero as product acceptance.
+Its own successful exit means the evidence was read, including failed findings.
