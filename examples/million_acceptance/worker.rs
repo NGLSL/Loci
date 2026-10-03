@@ -604,34 +604,6 @@ pub fn run(options: Options) -> io::Result<()> {
             let active = owner.as_ref().ok_or_else(|| invalid("owner stopped"))?;
             match op {
                 "STATUS" => Ok(status(active)),
-                "DEVELOPMENT_NATIVE_TRIM"
-                    if std::env::var("LOCI_DEVELOPMENT_TRIM").as_deref() == Ok("1") =>
-                {
-                    #[cfg(target_env = "gnu")]
-                    {
-                        unsafe extern "C" {
-                            fn malloc_trim(pad: usize) -> std::ffi::c_int;
-                        }
-                        let before = allocator_snapshot();
-                        let started = Instant::now();
-                        let released = unsafe { malloc_trim(0) };
-                        Ok(Json::object([
-                            ("development_only", b(true)),
-                            ("manual", b(true)),
-                            ("acceptance", b(false)),
-                            ("before_allocator", before),
-                            ("after_allocator", allocator_snapshot()),
-                            ("elapsed_ns", n(started.elapsed().as_nanos())),
-                            ("released", b(released != 0)),
-                            ("remaining_jobs", n(jobs.len())),
-                            ("remaining_leases", n(leases.len())),
-                        ]))
-                    }
-                    #[cfg(not(target_env = "gnu"))]
-                    {
-                        Err(invalid("GNU native allocator diagnostic unavailable"))
-                    }
-                }
                 "QUERY50" => query50(active, &query_text(arg(2)?)?),
                 "HOLD_LEASE" => {
                     if leases.len() >= MAX_HELD_LEASES {

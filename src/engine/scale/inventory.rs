@@ -8,6 +8,19 @@ use std::sync::Arc;
 
 const BLOCK: usize = 1024;
 pub(super) type EntryId = u32;
+// Preserve all parent/hash bits without the u64 alignment padding of a tuple.
+// With the u32 entry value, each lookup bucket is 16 rather than 24 bytes.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct LookupKey([u8; 12]);
+impl LookupKey {
+    fn new(parent: EntryId, name_hash: u64) -> Self {
+        let mut bytes = [0; 12];
+        bytes[..4].copy_from_slice(&parent.to_le_bytes());
+        bytes[4..].copy_from_slice(&name_hash.to_le_bytes());
+        Self(bytes)
+    }
+}
+
 // Most scan directories have small child lists. Keep their IDs in the writer
 // hash table rather than separate persistent allocator chunks that pin free
 // pages between maintenance epochs. Large directories retain a Vec fallback.
@@ -149,8 +162,8 @@ impl Data {
 }
 pub(super) struct Inventory {
     pub data: Data,
-    lookup: HashMap<(EntryId, u64), EntryId>,
-    collisions: HashMap<(EntryId, u64), Vec<EntryId>>,
+    lookup: HashMap<LookupKey, EntryId>,
+    collisions: HashMap<LookupKey, Vec<EntryId>>,
     pub entries: usize,
     pub directories: usize,
     pub directory_ids: std::collections::BTreeSet<EntryId>,
@@ -160,7 +173,7 @@ pub(super) struct Inventory {
     pub name_bytes: usize,
     pub live_name_bytes: usize,
     children: HashMap<EntryId, Children>,
-    positions: Vec<usize>,
+    positions: Vec<u32>,
     budgets: ScaleBudgets,
     allocation_credit: usize,
     // Last: all unique writer lookup/graph allocations have dropped first.
@@ -171,11 +184,11 @@ impl Drop for Inventory {
         let lookup_bytes = self
             .lookup
             .capacity()
-            .saturating_mul(std::mem::size_of::<((EntryId, u64), EntryId)>());
+            .saturating_mul(std::mem::size_of::<(LookupKey, EntryId)>());
         let position_bytes = self
             .positions
             .capacity()
-            .saturating_mul(std::mem::size_of::<usize>());
+            .saturating_mul(std::mem::size_of::<u32>());
         self.reclaim.arm(
             lookup_bytes.saturating_add(position_bytes).saturating_add(
                 self.children.capacity() * std::mem::size_of::<(EntryId, Children)>(),
@@ -277,7 +290,7 @@ impl Inventory {
         Ok(())
     }
     pub fn child(&self, parent: EntryId, name: &[u8]) -> Option<EntryId> {
-        let key = (parent, hash(name));
+        let key = LookupKey::new(parent, hash(name));
         self.lookup
             .get(&key)
             .copied()
@@ -362,7 +375,10 @@ impl Inventory {
         if id != 0 {
             self.add_lookup(parent, name, id);
             let siblings = self.children.entry(parent).or_default();
-            self.positions.push(siblings.len());
+            self.positions.push(
+                u32::try_from(siblings.len())
+                    .map_err(|_| io::Error::other("child position exhausted"))?,
+            );
             siblings.push(id);
             self.entries += 1;
         } else {
@@ -422,7 +438,7 @@ impl Inventory {
         Ok(())
     }
     fn add_lookup(&mut self, parent: EntryId, name: &[u8], id: EntryId) {
-        let key = (parent, hash(name));
+        let key = LookupKey::new(parent, hash(name));
         if let std::collections::hash_map::Entry::Vacant(entry) = self.lookup.entry(key) {
             entry.insert(id);
         } else {
@@ -430,7 +446,7 @@ impl Inventory {
         }
     }
     fn remove_lookup(&mut self, id: EntryId) {
-        let key = (self.data.entry(id).parent, hash(self.data.name(id)));
+        let key = LookupKey::new(self.data.entry(id).parent, hash(self.data.name(id)));
         if self.lookup.get(&key) == Some(&id) {
             if let Some(replacement) = self.collisions.get_mut(&key).and_then(|ids| ids.pop()) {
                 self.lookup.insert(key, replacement);
@@ -480,8 +496,8 @@ impl Inventory {
     fn detach_child(&mut self, parent: EntryId, id: EntryId) {
         let siblings = self.children.get_mut(&parent).unwrap();
         let position = self.positions[id as usize];
-        siblings.swap_remove(position);
-        if let Some(moved) = siblings.get(position) {
+        siblings.swap_remove(position as usize);
+        if let Some(moved) = siblings.get(position as usize) {
             self.positions[*moved as usize] = position;
         }
     }
@@ -530,7 +546,8 @@ impl Inventory {
         if previous_parent != parent {
             self.detach_child(previous_parent, id);
             let siblings = self.children.entry(parent).or_default();
-            self.positions[id as usize] = siblings.len();
+            self.positions[id as usize] = u32::try_from(siblings.len())
+                .map_err(|_| io::Error::other("child position exhausted"))?;
             siblings.push(id);
         }
         self.remove_lookup(id);

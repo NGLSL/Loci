@@ -105,21 +105,6 @@ fn settle_resources(
             ("acceptance", b(false)),
         ]),
     )?;
-    if std::env::var("LOCI_DEVELOPMENT_TRIM").as_deref() == Ok("1") {
-        let first = process::sample(worker.child.id())?;
-        let probe = worker.request("DEVELOPMENT_NATIVE_TRIM", &[], Duration::from_secs(10))?;
-        let last = process::sample(worker.child.id())?;
-        log.record(
-            "development-native-trim",
-            Json::object([
-                ("stage", s(stage)),
-                ("probe", probe),
-                ("before_resources", first),
-                ("after_resources", last),
-                ("acceptance", b(false)),
-            ]),
-        )?;
-    }
     if !quiet_single_epoch {
         return Err(invalid(
             "maintenance settle did not preserve unleased validated epoch",
