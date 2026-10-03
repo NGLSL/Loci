@@ -7,12 +7,19 @@
 __pycache__/
 *.pyc
 
-# Local worktrees and recovery archives; .scratch task records are tracked
+# Generated local worktrees, probe outputs and historical verification copies.
+# Core .scratch specs, issues and maps remain versioned.
 /.scratch/worktrees/
+/.scratch/windows-ntfs-stage-a/target/
+/.scratch/windows-ntfs-stage-a/run/
+/.scratch/windows-ntfs-stage-b/target/
+/.scratch/windows-ntfs-stage-b/run/
+/.scratch/windows-ntfs-performance/target/
+/.scratch/windows-ntfs-performance/run/
+/.scratch/incremental-corrections/run/
 /.artifact-archive/
 /.archive/
 
-# Local agent configuration; sharing is not established
-/docs/agents/
+# User-local agent configurations; project rules live in docs/agents/.
 .zcode
 .claude
