@@ -712,7 +712,7 @@ impl Runtime {
             self.metrics.full_scans += 1;
             self.metrics.correction_attempts += 1;
             self.scan = Some(Scan {
-                inventory: self.candidate_inventory(
+                inventory: self.correction_inventory(
                     self.inventory.data.epoch.checked_add(1).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -930,8 +930,15 @@ impl Runtime {
         self.update_resources();
         Ok(published)
     }
+    fn correction_inventory(&mut self, epoch: u64) -> io::Result<Inventory> {
+        let candidate = self.inventory.correction_candidate(epoch);
+        self.initialize_candidate(candidate)
+    }
     fn candidate_inventory(&self, epoch: u64) -> io::Result<Inventory> {
-        let mut candidate = Inventory::empty(epoch, self.options.scale_budgets);
+        // Compaction traverses the old writer graph while building its candidate.
+        self.initialize_candidate(Inventory::empty(epoch, self.options.scale_budgets))
+    }
+    fn initialize_candidate(&self, mut candidate: Inventory) -> io::Result<Inventory> {
         candidate.set_allocation_credit(
             self.store
                 .allocation_credit(&self.inventory.data, Some(&candidate.data))?,

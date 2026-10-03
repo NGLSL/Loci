@@ -185,6 +185,17 @@ pages without moving live buffers. Other Linux libc builds use direct mapping
 release without the GNU trim call. Default bounded Linux and Windows layouts
 and behavior remain unchanged; Windows scale mode remains Unsupported.
 
+Complete filesystem correction reuses the unique writer lookup, collision,
+child-list and position-container capacities for its new candidate. It clears
+these indexes before enumeration and keeps the old immutable Data/query cut.
+Events are not applied to the retired writer while correction is pending; a
+cancelled or failed candidate preserves old searchable/saveable data and requires
+correction before ordinary updates resume. Compaction still uses an independent
+writer because it traverses the old graph. This avoids repeated large allocator
+releases during correction without changing admission or snapshot/lease limits.
+It does not establish that the steady RSS gate passes; complete lifecycle
+measurements remain required.
+
 The development lifecycle measurements distinguish mapped/cached capacities,
 GNU allocator chunk statistics and actual engine-process RSS. GNU mallinfo2 in
 the opt-in measurement example is read-only diagnostics, requires a supporting

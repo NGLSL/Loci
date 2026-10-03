@@ -229,6 +229,22 @@ impl Inventory {
             reclaim: Default::default(),
         }
     }
+    pub fn correction_candidate(&mut self, epoch: u64) -> Self {
+        // A correction keeps the old immutable Data searchable, but it never
+        // applies events or traverses the old writer indexes before replacement.
+        // Reuse these unique capacities instead of leaving successive large
+        // hash/position allocations as resident free chunks in the allocator.
+        let mut candidate = Self::empty(epoch, self.budgets);
+        candidate.lookup = std::mem::take(&mut self.lookup);
+        candidate.lookup.clear();
+        candidate.collisions = std::mem::take(&mut self.collisions);
+        candidate.collisions.clear();
+        candidate.children = std::mem::take(&mut self.children);
+        candidate.children.clear();
+        candidate.positions = std::mem::take(&mut self.positions);
+        candidate.positions.clear();
+        candidate
+    }
     pub fn validate_restored_lookup(&self) -> io::Result<()> {
         let mut names = HashSet::new();
         for id in 1..self.data.slots as u32 {
