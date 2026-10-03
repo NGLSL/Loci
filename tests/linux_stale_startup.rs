@@ -126,6 +126,14 @@ fn cancelled_or_failed_startup_keeps_saved_pending_results_and_preserves_checkpo
         Engine::open_with_options(&fixture.root, Some(&database), EngineOptions::scale()).unwrap();
     engine.save().unwrap();
     engine.stop().unwrap();
+    assert_eq!(
+        paths(&engine.query().lease().unwrap()),
+        [fixture.root.join("saved.txt")]
+    );
+    assert_eq!(engine.view().status, Status::Stopped);
+    // Stop preserves query snapshots; dropping this unused owner releases its
+    // conservative capacity before the next phase, instead of shadowing it.
+    drop(engine);
     let checkpoint = fs::read(&database).unwrap();
     fs::write(fixture.root.join("offline.txt"), "x").unwrap();
     let mut options = EngineOptions::scale();
@@ -161,7 +169,13 @@ fn cancelled_or_failed_startup_keeps_saved_pending_results_and_preserves_checkpo
     );
     assert!(engine.save().is_err());
     engine.stop().unwrap();
+    assert_eq!(
+        paths(&engine.query().lease().unwrap()),
+        [fixture.root.join("saved.txt")]
+    );
+    assert_eq!(engine.view().status, Status::Stopped);
     assert_eq!(fs::read(&database).unwrap(), checkpoint);
+    drop(engine);
     fs::rename(&fixture.root, fixture.base.join("original-root")).unwrap();
     fs::create_dir(&fixture.root).unwrap();
     let error = Engine::open_with_options(&fixture.root, Some(&database), EngineOptions::scale())

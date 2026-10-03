@@ -268,10 +268,23 @@ fn source_stop_error_still_releases_root_database_descriptors_and_lock() {
         Engine::with_source_and_options(&f.root, Some(&db), StopError, EngineOptions::scale())
             .unwrap();
     assert!(engine.stop().is_err());
+    let stopped = engine
+        .query()
+        .lease()
+        .unwrap()
+        .page("", None, 50, &AtomicBool::new(false), &AtomicUsize::new(0))
+        .unwrap();
+    assert_eq!(stopped.paths, [f.root.join("kept.txt")]);
+    assert_eq!(stopped.finished.status, Status::Stopped);
+    assert!(!stopped.validated_at_start_and_finish);
     assert_eq!(fs::read_dir("/proc/self/fd").unwrap().count(), descriptors);
     let mut reopened =
         Engine::open_with_options(&f.root, Some(&db), EngineOptions::scale()).unwrap();
     reopened.stop().unwrap();
+    // The still-live stopped engines retain searchable cuts and their capacity
+    // credits. Close this phase before admitting another full-capacity owner.
+    drop(reopened);
+    drop(engine);
     let mut owner =
         Engine::with_source_and_options(&f.root, Some(&db), StopError, EngineOptions::scale())
             .unwrap()
@@ -279,5 +292,14 @@ fn source_stop_error_still_releases_root_database_descriptors_and_lock() {
             .unwrap();
     assert!(owner.stop(Duration::from_secs(1)).is_err());
     assert!(owner.is_joined());
+    let stopped = owner
+        .query()
+        .lease()
+        .unwrap()
+        .page("", None, 50, &AtomicBool::new(false), &AtomicUsize::new(0))
+        .unwrap();
+    assert_eq!(stopped.paths, [f.root.join("kept.txt")]);
+    assert_eq!(stopped.finished.status, Status::Stopped);
+    assert!(!stopped.validated_at_start_and_finish);
     assert_eq!(fs::read_dir("/proc/self/fd").unwrap().count(), descriptors);
 }
