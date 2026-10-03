@@ -28,7 +28,9 @@ create their own user/mount namespace.
 
 The base image must provide Bash, `cat`, `cp`, `df`, `findmnt`, `id`, `mkdir`,
 `mount`, `stat`, `timeout`, `umount`, `uname`, `unshare`, `sha256sum`, the launcher,
-and their runtime libraries. `prepare` snapshots missing helpers `kill`, `mkfifo`,
+and their runtime libraries. The [archived environment source](environment/README.md)
+provides a parameterized launcher and explicit rootfs staging glue; it does not
+bundle a built image or claim final native acceptance. `prepare` snapshots missing helpers `kill`, `mkfifo`,
 `true`, GNU `sort` and their `ldd` libraries into the owned artifact directory. It never
 mutates a shared rootfs, image or global installation. `Dockerfile.runtime`
 allows a later unified runtime-image build; by default the runner mounts those
