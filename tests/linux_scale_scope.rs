@@ -199,7 +199,10 @@ fn native_bind_mount_scope_in_private_namespace() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("native_bind_scope_verified"));
+    let proof = String::from_utf8_lossy(&output.stdout);
+    assert!(proof.contains("native_bind_scope_verified"));
+    assert!(proof.contains("native_local_directory_mount_boundary_verified"));
+    print!("{proof}");
 }
 
 #[test]
@@ -283,6 +286,29 @@ fn native_bind_mount_scope_child() {
         .unwrap();
     assert!(page.complete && !page.validated_at_start_and_finish);
     drop(mask);
+    drop(old);
+    drop(fresh);
+    // Install a nested mount after the scope was read. The local scanner must
+    // consult its fresh directory fd, before the interval mount-table refresh.
+    let local_fixture = Fixture::new();
+    let mut options = EngineOptions::scale();
+    options.scan_batch = 1;
+    let mut local = Engine::open_with_options(&local_fixture.root, None, options).unwrap();
+    settle(&mut local, &[]);
+    let incoming = local_fixture.root.join("incoming");
+    let boundary = incoming.join("mounted");
+    fs::create_dir_all(&boundary).unwrap();
+    let local_mount = Mounted::bind(&outside, &boundary);
+    settle(&mut local, &[incoming.clone(), boundary.clone()]);
+    assert!(query(&local.query(), "secret").is_empty());
+    assert_eq!(
+        local.metrics().full_scans,
+        1,
+        "trusted new directories must enumerate locally"
+    );
+    drop(local_mount);
+    drop(local);
+    println!("native_local_directory_mount_boundary_verified");
     println!("native_bind_scope_verified");
 }
 
