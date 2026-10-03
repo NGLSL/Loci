@@ -106,6 +106,28 @@ IN_Q_OVERFLOW assertion and both ignored bounded compatibility fixtures. The
 older fixtures may print SKIP for their conservative generation budget; those
 specific gates remain unverified even if the scale overflow proof passes.
 
+Both 100k fixtures share `tests/common/fixture_capacity.rs`. Reported filesystems
+retain the greater-than-800,000 KiB, greater-than-125,000 inode and 15% free-space
+guards. A confirmed Btrfs zero inode counter is labelled unavailable and still
+requires actual `btrfs filesystem usage -b` with Metadata,DUP and Data,single,
+minimum free/unallocated physical capacity, and a positive measured pilot slope.
+The plan reserves 1.5 times that slope for 125,000 entries plus 512 MiB for
+fixture data, checkpoint and logs, leaving at least 15% of the physical device.
+Direct query access creates only an owned 1,000-entry pilot outside the searched
+root and removes it after measuring; it does not create the full fixture early.
+
+When UID1000 cannot query detailed Btrfs capacity, the root environment may
+provide `LOCI_BTRFS_CAPACITY_RECEIPT` and `LOCI_TEST_SOURCE_SHA`. The regular,
+root-owned receipt must be inaccessible to group/world writes, fresh within
+600 seconds, and bind the canonical working directory, inode, device, mount ID,
+frozen source SHA, actual pilot entries/physical delta and hashed raw usage.
+Its schema is `loci.btrfs-capacity.v1`: key=value headers, a blank line, then
+the unchanged native usage output. This is capacity input only; the tests still
+create all 100,000 entries and validate the complete native oracle themselves.
+Missing/unsupported capacity evidence prints `SKIP: UNVERIFIED:` and returns;
+the libtest pass must not earn native acceptance credit. Insufficient measured
+capacity fails the test. No helper installs tools or mounts a filesystem.
+
 ## Interpreting results
 
 `summary.json` classifies every job as passed, failed or unverified. `SKIP:` and

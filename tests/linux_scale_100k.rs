@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 mod common;
+#[path = "common/fixture_capacity.rs"]
+mod fixture_capacity;
 use common::Fixture;
 use loci_experiment::engine::{Engine, EngineOptions, QueryHandle, Status};
 use std::fs;
@@ -60,26 +62,13 @@ fn settle(engine: &mut Engine, previous: u64) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
-fn preflight(base: &Path) {
-    for (flag, reserve) in [("-Pk", 800_000u64), ("-Pi", 125_000u64)] {
-        let output = Command::new("df").arg(flag).arg(base).output().unwrap();
-        assert!(output.status.success());
-        let text = String::from_utf8(output.stdout).unwrap();
-        let values: Vec<_> = text.lines().nth(1).unwrap().split_whitespace().collect();
-        let available: u64 = values[3].parse().unwrap();
-        let total: u64 = values[1].parse().unwrap();
-        assert!(
-            available > reserve && available * 100 / total >= 15,
-            "insufficient fixture budget: {text}"
-        );
-    }
-}
-
 #[test]
 #[ignore = "creates 100,000 real entries and performs full native/oracle checks"]
 fn real_hundred_thousand_entries_remain_correct_after_local_updates() {
     let fixture = Fixture::new();
-    preflight(&fixture.base);
+    if !fixture_capacity::hundred_thousand_fixture_preflight(&fixture.base) {
+        return;
+    }
     let create = Instant::now();
     let families = [
         ("invoice", "txt"),
