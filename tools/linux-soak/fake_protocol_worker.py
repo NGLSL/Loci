@@ -14,7 +14,7 @@ if mode == 'oversize':
     sys.stdout.buffer.write(struct.pack('<I', 65537))
     sys.stdout.buffer.flush()
 else:
-    write(0, 'HELLO', process_start_ticks=start)
+    write(0, 'HELLO', process_start_ticks=start, sha=(sys.argv[2] if len(sys.argv)>2 else 'a'*40), poll_ms=20, baseline_resources={})
 while True:
     n = sys.stdin.buffer.read(4)
     if not n:

@@ -30,6 +30,11 @@ struct Scan {
     current: Option<(Directory, ReadDir)>,
     generation: u64,
 }
+#[derive(Default)]
+struct LocalScan {
+    todo: Vec<Directory>,
+    current: Option<(Directory, ReadDir)>,
+}
 struct CompactFrame {
     source: EntryId,
     target: EntryId,
@@ -49,6 +54,7 @@ pub(super) struct Runtime {
     scope_input: (u64, u64),
     inventory: Inventory,
     scan: Option<Scan>,
+    local: Option<LocalScan>,
     compact: Option<Compact>,
     compact_requested: bool,
     pending: Vec<Change>,
@@ -142,6 +148,7 @@ impl Runtime {
             options,
             inventory: Inventory::empty(0, budgets),
             scan: None,
+            local: None,
             compact: None,
             compact_requested: false,
             pending: vec![],
@@ -204,6 +211,7 @@ impl Runtime {
         self.retry_after = None;
         self.drain_polls = 0;
         self.scan = None;
+        self.local = None;
         self.compact = None;
         self.clear_pending();
         self.correction = true;
@@ -227,6 +235,7 @@ impl Runtime {
     fn cancel_recovery(&mut self) {
         self.cancelled = true;
         self.scan = None;
+        self.local = None;
         self.compact = None;
         self.clear_pending();
         self.correction = true;
@@ -376,6 +385,7 @@ impl Runtime {
             self.generation += 1;
             self.correction = true;
             self.scan = None;
+            self.local = None;
             self.clear_pending();
             self.store.status(Status::Pending);
         }
@@ -386,8 +396,11 @@ impl Runtime {
             CoverageGapKind::KernelWatchLimit
         } else if error.kind() == io::ErrorKind::PermissionDenied {
             CoverageGapKind::Permission
-        } else if error.to_string().contains("budget") {
-            CoverageGapKind::WatchBudget
+        } else if let Some(classified) = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<super::CoverageError>())
+        {
+            classified.kind.clone()
         } else {
             CoverageGapKind::Scan
         };
@@ -405,8 +418,11 @@ impl Runtime {
                 path: self.root.clone(),
                 kind: if error.kind() == io::ErrorKind::PermissionDenied {
                     CoverageGapKind::Permission
-                } else if error.to_string().contains("identity changed") {
-                    CoverageGapKind::SourceIdentity
+                } else if let Some(classified) = error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<super::CoverageError>())
+                {
+                    classified.kind.clone()
                 } else {
                     CoverageGapKind::Source
                 },
@@ -414,7 +430,11 @@ impl Runtime {
                 errno: error.raw_os_error(),
             });
         }
-        if error.to_string().contains("selected root identity changed") {
+        if error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<super::CoverageError>())
+            .is_some_and(|error| error.kind == CoverageGapKind::SourceIdentity)
+        {
             self.store.gap(CoverageGap {
                 path: self.root.clone(),
                 kind: CoverageGapKind::SourceIdentity,
@@ -439,12 +459,14 @@ impl Runtime {
         ));
         self.correction = true;
         self.scan = None;
+        self.local = None;
         self.compact = None;
     }
     pub fn stop(&mut self) -> io::Result<()> {
         self.stopped = true;
         self.clear_pending();
         self.scan = None;
+        self.local = None;
         self.compact = None;
         self.store.status(Status::Stopped);
         let result = self.source.stop();
@@ -493,6 +515,7 @@ impl Runtime {
             self.record_losses(&batch.losses);
             self.clear_pending();
             self.scan = None;
+            self.local = None;
             self.correction = true;
             self.generation += 1;
             self.store.status(Status::Pending);
@@ -518,6 +541,7 @@ impl Runtime {
                 self.record_losses(&[Loss::UserOverflow].into());
                 self.clear_pending();
                 self.scan = None;
+                self.local = None;
                 self.correction = true;
             } else {
                 self.pending_bytes += bytes;
@@ -558,7 +582,7 @@ impl Runtime {
             self.compact_requested = true;
             self.metrics.compaction_restarts += 1;
         }
-        if !self.correction {
+        if !self.correction && self.local.is_none() {
             let names = self.pending.iter().map(Self::change_bytes).sum();
             let compaction_needed = self.compact_requested
                 || self.compact.is_some()
@@ -576,14 +600,14 @@ impl Runtime {
                 return self.compact_step(cancel);
             }
         }
-        if !self.correction && self.pending.is_empty() {
+        if !self.correction && self.pending.is_empty() && self.local.is_none() {
             self.audit()?;
             if self.correction {
                 return Ok(false);
             }
             return Ok(self.store.handle.view().status == Status::Validated);
         }
-        if self.correction && cancel.load(Ordering::Relaxed) {
+        if (self.correction || self.local.is_some()) && cancel.load(Ordering::Relaxed) {
             self.cancel_recovery();
             return Ok(false);
         }
@@ -610,6 +634,22 @@ impl Runtime {
             }
             self.drain_polls = 0;
             return self.correct(cancel);
+        }
+        if self.local.is_some() {
+            if !self.local_step(cancel)? {
+                return Ok(false);
+            }
+            self.capture()?;
+            if self.stopped || self.correction || !self.pending.is_empty() {
+                return Ok(false);
+            }
+            self.metrics.transactions += 1;
+            self.metrics.last_touched_entries = self.inventory.touched;
+            self.metrics.last_copied_entries = self.inventory.copied_entries;
+            self.metrics.last_copied_segments = self.inventory.copied_segments;
+            let published = self.store.publish(self.inventory.data.clone())?;
+            self.update_resources();
+            return Ok(published);
         }
         let generation = self.generation;
         self.inventory.reset_work();
@@ -640,6 +680,9 @@ impl Runtime {
             }
         }
         if self.correction {
+            return Ok(false);
+        }
+        if !self.local_step(cancel)? {
             return Ok(false);
         }
         self.capture()?;
@@ -772,6 +815,7 @@ impl Runtime {
         }
         if scan.generation != self.generation {
             self.scan = None;
+            self.local = None;
             self.fail(&io::Error::other(
                 "correction candidate invalidated by concurrent observation; retry bounded",
             ));
@@ -986,6 +1030,49 @@ impl Runtime {
         }
         Ok(())
     }
+    fn check_path_limits(&self, path: &Path, kind: Kind) -> io::Result<()> {
+        let absolute = self.root.join(path);
+        let depth = path.components().count();
+        let error = if absolute.as_os_str().as_bytes().len() > 4096 {
+            Some("scale full path byte budget exhausted")
+        } else if depth > self.options.limits.depth + 1
+            || (kind == Kind::Directory
+                && depth > self.options.limits.depth
+                && !self.scope.boundary(&absolute))
+        {
+            Some("scale directory depth exhausted")
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            self.store.gap(CoverageGap {
+                path: absolute,
+                kind: CoverageGapKind::Scan,
+                error: error.into(),
+                errno: None,
+            });
+            return Err(io::Error::other(error));
+        }
+        Ok(())
+    }
+    fn check_move_limits(&self, id: EntryId, to: &Path) -> io::Result<()> {
+        // Traverse only the moved subtree. Cursor frames retain one ancestor
+        // chain, rather than cloning lookup state or a wide sibling list.
+        let mut stack = vec![(id, to.to_path_buf(), 0)];
+        while let Some((member, path, offset)) = stack.last_mut() {
+            if *offset == 0 {
+                self.check_path_limits(path, self.inventory.data.entry(*member).kind)?;
+            }
+            if let Some(child) = self.inventory.child_at(*member, *offset) {
+                *offset += 1;
+                let next = path.join(std::ffi::OsStr::from_bytes(self.inventory.data.name(child)));
+                stack.push((child, next, 0));
+            } else {
+                stack.pop();
+            }
+        }
+        Ok(())
+    }
     fn refresh(&mut self, path: &Path) -> io::Result<()> {
         if self.excluded(path) {
             return self.remove(path);
@@ -993,7 +1080,11 @@ impl Runtime {
         let Some((kind, metadata)) = self.inspect(path)? else {
             return self.remove(path);
         };
-        if kind == Kind::Directory && !self.scope.boundary(&self.root.join(path)) {
+        self.check_path_limits(path, kind)?;
+        if self.inventory.find(path).is_some()
+            && kind == Kind::Directory
+            && !self.scope.boundary(&self.root.join(path))
+        {
             // IN_ATTRIB preserves object identity, but a revoked listing permission
             // invalidates coverage immediately instead of waiting for the audit cycle.
             drop(
@@ -1004,17 +1095,11 @@ impl Runtime {
         if let Some(id) = self.inventory.find(path) {
             let old = self.inventory.data.entry(id);
             if old.dev != metadata.dev() || old.ino != metadata.ino() || old.kind != kind {
-                return Err(io::Error::other(
+                return Err(super::coverage_error(
+                    CoverageGapKind::SourceIdentity,
                     "object identity changed; correction required",
                 ));
             }
-            return Ok(());
-        }
-        if kind == Kind::Directory {
-            // New/moved-in subtrees need watch-before-enumeration. The initial
-            // small mode obtains that through correction rather than guessing.
-            self.correction = true;
-            self.store.status(Status::Pending);
             return Ok(());
         }
         let parent = self
@@ -1027,15 +1112,116 @@ impl Runtime {
         if self.inventory.entries >= self.options.limits.entries {
             return Err(io::Error::other("scale entry budget exhausted"));
         }
-        self.inventory.insert(
+        let id = self.inventory.insert(
             parent,
             name.as_bytes(),
             kind,
             metadata.dev(),
             metadata.ino(),
         )?;
+        if self.inventory.directories > self.options.limits.directories {
+            return Err(io::Error::other("scale directory budget exhausted"));
+        }
+        if kind == Kind::Directory && !self.scope.boundary(&self.root.join(path)) {
+            self.local
+                .get_or_insert_with(LocalScan::default)
+                .todo
+                .push(Directory {
+                    id,
+                    path: self.root.join(path),
+                    depth: path.components().count(),
+                });
+            self.metrics.subtree_scans += 1;
+        }
         self.metrics.changed_paths += 1;
         Ok(())
+    }
+    fn local_step(&mut self, cancel: &AtomicBool) -> io::Result<bool> {
+        let Some(mut local) = self.local.take() else {
+            return Ok(true);
+        };
+        let mut work = 0;
+        while work < self.options.scan_batch.min(4096) {
+            if cancel.load(Ordering::Relaxed) {
+                self.cancel_recovery();
+                return Ok(false);
+            }
+            if local.current.is_none() {
+                let Some(directory) = local.todo.pop() else {
+                    break;
+                };
+                work += 1;
+                let opened = crate::engine::open_linux_root(&directory.path)
+                    .map_err(|error| self.scoped_error(&directory.path, error))?;
+                let entry = self.inventory.data.entry(directory.id);
+                let metadata = opened.metadata()?;
+                if entry.dev != metadata.dev() || entry.ino != metadata.ino() {
+                    return Err(super::coverage_error(
+                        CoverageGapKind::SourceIdentity,
+                        "local directory identity changed; correction required",
+                    ));
+                }
+                if scope::mount_id(&opened)? != self.scope.root_mount {
+                    continue;
+                }
+                self.source
+                    .before_directory(&directory.path)
+                    .map_err(|error| self.scoped_error(&directory.path, error))?;
+                let listing = fs::read_dir(&directory.path)
+                    .map_err(|error| self.scoped_error(&directory.path, error))?;
+                local.current = Some((directory, listing));
+            }
+            let (directory, listing) = local.current.as_mut().unwrap();
+            let Some(child) = listing.next() else {
+                local.current = None;
+                continue;
+            };
+            let child = child.map_err(|error| self.scoped_error(&directory.path, error))?;
+            work += 1;
+            self.metrics.scanned_entries += 1;
+            let path = child.path();
+            let relative = path.strip_prefix(&self.root).unwrap();
+            if self.excluded(relative) {
+                continue;
+            }
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|error| self.scoped_error(&path, error))?;
+            self.metrics.metadata_calls += 1;
+            let Some(kind) = kind(&metadata) else {
+                continue;
+            };
+            self.check_path_limits(relative, kind)?;
+            if self.inventory.find(relative).is_some() {
+                continue;
+            }
+            if self.inventory.entries >= self.options.limits.entries {
+                return Err(io::Error::other("scale entry budget exhausted"));
+            }
+            let id = self.inventory.insert(
+                directory.id,
+                child.file_name().as_bytes(),
+                kind,
+                metadata.dev(),
+                metadata.ino(),
+            )?;
+            if self.inventory.directories > self.options.limits.directories {
+                return Err(io::Error::other("scale directory budget exhausted"));
+            }
+            if kind == Kind::Directory && !self.scope.boundary(&path) {
+                local.todo.push(Directory {
+                    id,
+                    path,
+                    depth: directory.depth + 1,
+                });
+            }
+        }
+        let complete = local.current.is_none() && local.todo.is_empty();
+        if !complete {
+            self.local = Some(local);
+        }
+        self.capture()?;
+        self.update_resources();
+        Ok(complete && !self.correction && !self.stopped)
     }
     fn apply(&mut self, change: Change) -> io::Result<()> {
         match change {
@@ -1052,12 +1238,20 @@ impl Runtime {
                     return self.remove(&from);
                 };
                 let Some(id) = self.inventory.find(&from) else {
-                    self.remove(&to)?;
-                    return self.refresh(&to);
+                    if kind != Kind::Directory {
+                        self.remove(&to)?;
+                        return self.refresh(&to);
+                    }
+                    // Unknown directory origins cannot establish a trusted local cut.
+                    self.correction = true;
+                    self.local = None;
+                    self.store.status(Status::Pending);
+                    return Ok(());
                 };
                 let old = self.inventory.data.entry(id);
                 if old.kind != kind || old.dev != metadata.dev() || old.ino != metadata.ino() {
-                    return Err(io::Error::other(
+                    return Err(super::coverage_error(
+                        CoverageGapKind::SourceIdentity,
                         "ambiguous rename identity; correction required",
                     ));
                 }
@@ -1073,6 +1267,7 @@ impl Runtime {
                 let name = to
                     .file_name()
                     .ok_or_else(|| io::Error::other("rename name missing"))?;
+                self.check_move_limits(id, &to)?;
                 self.remove(&to)?;
                 self.inventory.rename(id, parent, name.as_bytes())?;
                 if kind == Kind::Directory {

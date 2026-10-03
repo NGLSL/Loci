@@ -20,7 +20,12 @@ fn reserve(counter: &AtomicUsize, cap: usize) -> io::Result<()> {
             (n < cap).then_some(n + 1)
         })
         .map(|_| ())
-        .map_err(|_| io::Error::other("process-wide inotify budget exhausted"))
+        .map_err(|_| {
+            crate::engine::coverage_error(
+                crate::engine::CoverageGapKind::WatchBudget,
+                "process-wide inotify budget exhausted",
+            )
+        })
 }
 pub fn process_usage() -> (usize, usize) {
     (
@@ -118,7 +123,10 @@ impl Session {
             return Ok(());
         }
         if self.watches.len() >= self.limit {
-            return Err(io::Error::other("watch budget exhausted"));
+            return Err(crate::engine::coverage_error(
+                crate::engine::CoverageGapKind::WatchBudget,
+                "watch budget exhausted",
+            ));
         }
         #[cfg(target_os = "linux")]
         let bytes = {

@@ -191,3 +191,28 @@ the opt-in measurement example is read-only diagnostics, requires a supporting
 GNU libc, and does not report live Rust payload or RSS. The production library
 has no mallinfo2 dependency. See [memory evidence](../LINUX-MILLION-MEMORY-RECLAMATION.md)
 for complete failed runs, successful-cut requirements and environment limits.
+
+## Reliable new directories and move scope
+
+The final scale implementation supersedes the milestone's unconditional
+correction for a new directory beneath an already known parent. The single
+writer installs the watch before opening each listing and enumerates only that
+new subtree in bounded batches. It does not clone writer lookup state or scan
+unrelated directories. The existing published cut stays queryable while local
+work is pending; publication waits for complete enumeration and trusted pending
+updates. Loss, ambiguous or unknown directory rename origins, changed source
+identity, scan failure and cancellation retain the established correction and
+coverage-gap contracts. A moved-in unpaired native rename remains observation
+loss and requires correction.
+
+Before a reliable rename edits writer relationships or removes its destination,
+it checks the resulting live subtree against the configured depth and 4096-byte
+full-path bound. A violation reports the affected path, keeps the previous
+query cut, and cannot publish Validated. Checkpoint graph/cycle/parent checks
+still cover every physical record. Depth/path scope checks apply to live records:
+a deleted child's historical basename cannot make a later valid ancestor move
+produce an unreadable checkpoint.
+
+Coverage error producers carry their classification separately from their
+human-readable text. Native application watch budgets, kernel errno limits,
+permission failures and source-identity changes keep distinct public gap kinds.

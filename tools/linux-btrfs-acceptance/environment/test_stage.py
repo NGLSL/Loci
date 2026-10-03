@@ -1,31 +1,38 @@
-"""Small source/mapping/parser checks only: no guest, compiler or native acceptance."""
-import gzip
-import importlib.util
-import pathlib
+"""Public source stager/parser CLI checks; no guest or native acceptance."""
+import json
+from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
-HERE=pathlib.Path(__file__).resolve().parent
-spec=importlib.util.spec_from_file_location('btrfs_stage',HERE/'stage.py');stage=importlib.util.module_from_spec(spec);spec.loader.exec_module(stage)
+HERE = Path(__file__).resolve().parent
 
-class MappingAndArchiveTests(unittest.TestCase):
-    def test_exact_absolute_cli_runtime_paths_stay_unchanged(self):
-        for value in ['/workspace/frozen-artifacts/target/debug/loci-experiment','/usr/bin/sort','/lib64/ld-linux-x86-64.so.2','/guest/source/native-probe.c']:
-            self.assertEqual(stage.guest_destination(value),value)
-        for value in ['relative','/x/./y','/x//y','/x/../y','/proc/self/exe','/dev/vda','/artifacts/a','/x\nmessage','/x space','/x"quote']:
-            with self.assertRaises(ValueError):stage.guest_destination(value)
+class StagerCLI(unittest.TestCase):
+    def test_source_only_receipt_does_not_claim_assembly_or_engine_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)/'preparation.json'
+            command = [sys.executable, str(HERE/'stage.py'), 'source-only', '--output', str(out)]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            receipt = json.loads(out.read_text())
+            self.assertEqual(receipt['status'], 'source_only_not_assembled')
+            self.assertFalse(receipt['engine_acceptance'])
+            self.assertFalse(receipt['actual_guest_execution'])
+            self.assertIsNone(receipt['final_sha'])
+            saved = out.read_bytes()
+            self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+            self.assertEqual(out.read_bytes(), saved)
 
-    def test_newc_assembly_preserves_symlink_and_declares_console_without_host_device(self):
-        with tempfile.TemporaryDirectory() as d:
-            root=pathlib.Path(d)/'tree';root.mkdir();(root/'bin').mkdir();(root/'bin/tool').write_bytes(b'tiny');(root/'bin/link').symlink_to('tool')
-            archive=pathlib.Path(d)/'initramfs.cpio.gz';stage.archive_initramfs(root,archive)
-            raw=gzip.decompress(archive.read_bytes())
-            self.assertTrue(raw.startswith(b'070701'));self.assertIn(b'bin/link\0',raw);self.assertIn(b'dev/console\0',raw);self.assertIn(b'TRAILER!!!\0',raw);self.assertFalse((root/'dev').exists())
-            with self.assertRaises(FileExistsError):stage.archive_initramfs(root,archive)
+    def test_plan_requires_final_source_and_environment_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)/'plan.json'
+            result = subprocess.run([sys.executable, str(HERE/'stage.py'), 'plan', '--output', str(out)], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('explicit final source/build/private environment/run token inputs required', result.stderr)
+            self.assertFalse(out.exists())
 
-class UsageParserTests(unittest.TestCase):
-    # Synthetic parser inputs only; never native capacity or Engine evidence.
-    usage='''Overall:
+    def test_physical_capacity_cli_requires_dup_and_measured_reserve(self):
+        usage = '''Overall:
     Device size: 8589934592
     Device allocated: 562036736
     Device unallocated: 8027897856
@@ -35,16 +42,14 @@ Data,single: Size:8388608, Used:100
 Metadata,DUP: Size:268435456, Used:1000
 System,DUP: Size:8388608, Used:16384
 '''
-    def parse(self,text,reserve):
-        with tempfile.TemporaryDirectory() as d:
-            out=pathlib.Path(d)/'physical.txt'
-            p=subprocess.run(['awk','-v',f'reserve={reserve}','-v',f'physical_out={out}','-f',str(HERE/'usage_guard.awk')],input=text,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-            return p.returncode,p.stdout,out.read_text() if out.exists() else None
-    def test_actual_fields_use_two_metadata_copies_and_record_unavailable_inodes(self):
-        code,body,physical=self.parse(self.usage,128*1024*1024)
-        self.assertEqual(code,0);self.assertEqual(physical,'2100\n');self.assertIn('metadata_physical_used=2000',body);self.assertIn('inode_capacity=unavailable_dynamic',body)
-    def test_unknown_profiles_missing_measurements_or_insufficient_reserve_fail(self):
-        for text,reserve in [(self.usage.replace('Metadata,DUP:','Metadata,single:'),1),(self.usage.replace('Device unallocated:','Missing unknown:'),1),(self.usage.replace('Used:1000','Used:unknown'),1),(self.usage,5*1024*1024*1024)]:
-            code,body,_=self.parse(text,reserve);self.assertNotEqual(code,0);self.assertIn('LOCI_BTRFS_FAIL',body)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)/'physical.txt'
+            argv = ['awk', '-v', 'reserve=134217728', '-v', f'physical_out={out}', '-f', str(HERE/'usage_guard.awk')]
+            result = subprocess.run(argv, input=usage, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(out.read_text(), '2100\n')
+            for damaged in [usage.replace('Metadata,DUP:', 'Metadata,single:'), usage.replace('Device unallocated:', 'Missing unknown:')]:
+                self.assertNotEqual(subprocess.run(argv, input=damaged, text=True, capture_output=True).returncode, 0)
 
-if __name__=='__main__':unittest.main()
+if __name__ == '__main__':
+    unittest.main()

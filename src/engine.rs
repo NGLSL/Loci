@@ -137,6 +137,22 @@ pub enum CoverageGapKind {
     SourceIdentity,
     RetryLimit,
 }
+// Error text is display-only; coverage classification travels with its producer.
+#[derive(Debug)]
+pub(crate) struct CoverageError {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub kind: CoverageGapKind,
+    message: &'static str,
+}
+impl std::fmt::Display for CoverageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+impl std::error::Error for CoverageError {}
+pub(crate) fn coverage_error(kind: CoverageGapKind, message: &'static str) -> io::Error {
+    io::Error::other(CoverageError { kind, message })
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoverageGap {
     pub path: PathBuf,
@@ -1152,7 +1168,8 @@ impl RootIdentity {
     fn check(&self, path: &Path) -> io::Result<()> {
         let current = Self::open(path)?;
         if current.id != self.id {
-            return Err(io::Error::other(
+            return Err(coverage_error(
+                CoverageGapKind::SourceIdentity,
                 "selected root identity changed; reopen explicitly",
             ));
         }

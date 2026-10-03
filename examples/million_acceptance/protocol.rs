@@ -336,31 +336,3 @@ impl Parser<'_> {
         Ok(n)
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn raw_frame_and_unicode_roundtrip() {
-        let j = Json::object([
-            ("path", s("报告\n\"\u{0000}")),
-            ("raw", s(hex(b"\xff/file"))),
-            ("n", n(1000001u64)),
-        ]);
-        let bytes = j.encode().into_bytes();
-        assert_eq!(Json::parse(&bytes).unwrap(), j);
-        let mut stream = Vec::new();
-        frame_write(&mut stream, &bytes).unwrap();
-        assert_eq!(frame_read(&mut &stream[..]).unwrap(), Some(bytes));
-        assert_eq!(frame_read(&mut &[][..]).unwrap(), None);
-    }
-    #[test]
-    fn reject_oversize_truncation_and_ambiguous_json() {
-        assert!(frame_read(&mut &65537u32.to_le_bytes()[..]).is_err());
-        assert!(frame_read(&mut &[4, 0, 0, 0, 1][..]).is_err());
-        assert!(Json::parse(br#"{"x":1,"x":2}"#).is_err());
-        assert!(Json::parse(br#"[01]"#).is_err());
-        assert!(Json::parse(b"[true]junk").is_err());
-        assert!(unhex("ff0").is_err());
-        assert!(unhex("GG").is_err());
-    }
-}

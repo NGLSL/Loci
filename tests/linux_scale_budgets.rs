@@ -151,3 +151,223 @@ fn deleted_slots_are_reclaimed_before_another_live_entry_exhausts_the_budget() {
     assert_eq!(engine.metrics().full_scans, 1);
     assert_eq!(engine.view().resources.inventory_slots, 2);
 }
+
+#[test]
+fn directory_move_beyond_depth_preserves_old_query_and_reopenable_checkpoint() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.root.join("a")).unwrap();
+    fs::write(fixture.root.join("a/file"), b"").unwrap();
+    fs::create_dir(fixture.root.join("b")).unwrap();
+    let database = fixture.base.join("state.loci");
+    let mut options = EngineOptions::scale();
+    options.limits.depth = 1;
+    let mut engine =
+        Engine::open_with_options(&fixture.root, Some(&database), options.clone()).unwrap();
+    assert_eq!(engine.view().status, Status::Validated);
+    let handle = engine.query();
+    let old = paths(&handle);
+    engine.save().unwrap();
+    let saved = fs::read(&database).unwrap();
+    fs::rename(fixture.root.join("a"), fixture.root.join("b/a")).unwrap();
+    fail(&mut engine);
+    assert_eq!(paths(&handle), old);
+    assert_eq!(
+        engine.view().coverage_gaps[0].path,
+        fixture.root.join("b/a")
+    );
+    assert!(
+        !handle
+            .lease()
+            .unwrap()
+            .page("", None, 50, &AtomicBool::new(false), &AtomicUsize::new(0))
+            .unwrap()
+            .validated_at_start_and_finish
+    );
+    if engine.save().is_err() {
+        assert_eq!(fs::read(&database).unwrap(), saved);
+    }
+    engine.stop().unwrap();
+    let reopened = Engine::open_with_options(&fixture.root, Some(&database), options).unwrap();
+    assert_eq!(paths(&reopened.query()), old);
+}
+
+#[test]
+fn directory_move_cannot_publish_descendants_beyond_checkpoint_path_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = Fixture::new();
+    let mut leaf = fixture.root.join("a");
+    fs::create_dir(&leaf).unwrap();
+    for number in 0..15 {
+        leaf.push(format!("{number:02}{}", "d".repeat(238)));
+        fs::create_dir(&leaf).unwrap();
+    }
+    leaf.push("f".repeat(230));
+    assert!(leaf.as_os_str().as_bytes().len() <= 4096);
+    fs::write(&leaf, b"").unwrap();
+    let destination_parent = fixture.root.join("p".repeat(245));
+    fs::create_dir(&destination_parent).unwrap();
+    let mut options = EngineOptions::scale();
+    options.limits.depth = 32;
+    let database = fixture.base.join("state.loci");
+    let mut engine =
+        Engine::open_with_options(&fixture.root, Some(&database), options.clone()).unwrap();
+    let old = paths(&engine.query());
+    engine.save().unwrap();
+    fs::rename(fixture.root.join("a"), destination_parent.join("a")).unwrap();
+    fail(&mut engine);
+    assert_eq!(paths(&engine.query()), old);
+    assert!(engine.view().coverage_gaps[0]
+        .path
+        .starts_with(destination_parent.join("a")));
+    assert!(
+        engine.view().coverage_gaps[0]
+            .path
+            .as_os_str()
+            .as_bytes()
+            .len()
+            > 4096
+    );
+    engine.stop().unwrap();
+    let reopened = Engine::open_with_options(&fixture.root, Some(&database), options).unwrap();
+    assert_eq!(paths(&reopened.query()), old);
+}
+
+#[test]
+fn reliable_new_directory_is_bounded_local_work_and_preserves_old_lease() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("seed"), b"").unwrap();
+    let mut options = EngineOptions::scale();
+    options.scan_batch = 1;
+    let mut engine = Engine::open_with_options(&fixture.root, None, options).unwrap();
+    while engine.view().status != Status::Validated {
+        engine.poll().unwrap();
+    }
+    let lease = engine.query().lease().unwrap();
+    let source = fixture.root.join("incoming");
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(source.join("nested/new"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        engine.poll().unwrap();
+        if engine.view().status == Status::Validated && paths(&engine.query()).len() == 4 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:?}", engine.view());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        engine.metrics().full_scans,
+        1,
+        "reliable known-parent mkdir/move-in must stay local"
+    );
+    let mut actual = paths(&engine.query());
+    actual.sort();
+    assert_eq!(
+        actual,
+        [
+            fixture.root.join("incoming"),
+            fixture.root.join("incoming/nested"),
+            fixture.root.join("incoming/nested/new"),
+            fixture.root.join("seed")
+        ]
+    );
+    assert_eq!(
+        lease
+            .page("", None, 50, &AtomicBool::new(false), &AtomicUsize::new(0))
+            .unwrap()
+            .paths,
+        [fixture.root.join("seed")]
+    );
+    drop(lease);
+    let version = engine.view().version;
+    fs::write(fixture.root.join("incoming/nested/later"), b"").unwrap();
+    while engine.view().version == version || engine.view().status != Status::Validated {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert_eq!(paths(&engine.query()).len(), 5);
+    assert_eq!(engine.metrics().full_scans, 1);
+}
+
+#[test]
+fn cancelling_a_batched_new_directory_preserves_the_last_published_cut() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("seed"), b"").unwrap();
+    let mut options = EngineOptions::scale();
+    options.scan_batch = 1;
+    let mut engine = Engine::open_with_options(&fixture.root, None, options).unwrap();
+    while engine.view().status != Status::Validated {
+        engine.poll().unwrap();
+    }
+    fs::create_dir(fixture.root.join("new")).unwrap();
+    for number in 0..50 {
+        fs::write(fixture.root.join(format!("new/file-{number}")), b"").unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while engine.view().status == Status::Validated {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    engine.poll_with_cancel(&AtomicBool::new(true)).unwrap();
+    assert_eq!(paths(&engine.query()), [fixture.root.join("seed")]);
+    assert_eq!(engine.view().status, Status::Pending);
+    assert!(engine
+        .view()
+        .coverage_gaps
+        .iter()
+        .any(|gap| gap.kind == loci_experiment::engine::CoverageGapKind::Cancelled));
+    engine.request_rebuild().unwrap();
+    while engine.view().status != Status::Validated {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert_eq!(paths(&engine.query()).len(), 52);
+}
+
+#[test]
+fn directory_move_with_deleted_long_child_can_save_and_reopen_its_live_paths() {
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = Fixture::new();
+    let mut leaf = fixture.root.join("a");
+    fs::create_dir(&leaf).unwrap();
+    for number in 0..15 {
+        leaf.push(format!("{number:02}{}", "d".repeat(238)));
+        fs::create_dir(&leaf).unwrap();
+    }
+    let deleted = leaf.join("f".repeat(230));
+    fs::write(&deleted, b"").unwrap();
+    let destination = fixture.root.join("p".repeat(245));
+    fs::create_dir(&destination).unwrap();
+    let mut options = EngineOptions::scale();
+    options.limits.depth = 32;
+    let database = fixture.base.join("state.loci");
+    let mut engine =
+        Engine::open_with_options(&fixture.root, Some(&database), options.clone()).unwrap();
+    fs::remove_file(deleted).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while paths(&engine.query()).len() != 17 || engine.view().status != Status::Validated {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    fs::rename(fixture.root.join("a"), destination.join("a")).unwrap();
+    while paths(&engine.query())
+        .iter()
+        .any(|path| path.starts_with(fixture.root.join("a")))
+        || engine.view().status != Status::Validated
+    {
+        engine.poll().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    let expected = paths(&engine.query());
+    assert!(expected
+        .iter()
+        .all(|path| path.as_os_str().as_bytes().len() <= 4096));
+    engine.save().unwrap();
+    engine.stop().unwrap();
+    let reopened = Engine::open_with_options(&fixture.root, Some(&database), options).unwrap();
+    let mut actual = paths(&reopened.query());
+    actual.sort();
+    let mut expected = expected;
+    expected.sort();
+    assert_eq!(actual, expected);
+}

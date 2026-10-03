@@ -362,10 +362,13 @@ pub(super) fn load(
         for member in chain.into_iter().rev() {
             depth += 1;
             path_length += 1 + inventory.data.name(member as u32).len();
-            if path_length > 4096 {
+            // Tombstones are graph-validated but no longer name searchable
+            // paths. A later ancestor move must not make the saved live cut
+            // unreadable because of a removed child's historical basename.
+            if alive[member] && path_length > 4096 {
                 return Err(invalid("checkpoint full path byte budget"));
             }
-            if depth > options.limits.depth + 1 {
+            if alive[member] && depth > options.limits.depth + 1 {
                 return Err(invalid("checkpoint depth budget"));
             }
             depths[member] = depth;

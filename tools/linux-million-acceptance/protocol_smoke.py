@@ -102,7 +102,15 @@ try:
  assert stopped['post_resources']['fd_count']==stopped['baseline_resources']['fd_count'],stopped
  assert len(list(pathlib.Path(f'/proc/{child.pid}/fd').iterdir()))==stopped['post_resources']['fd_count']
  req('QUIT');assert child.wait(timeout=10)==0
- result={'source_sha':args.sha,'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'development_protocol_check':True,'million_acceptance':False,'entries':len(expected),'run':str(run),'held_snapshot_byte_set_equal':True,'current_snapshot_byte_kind_set_equal':True,'sort_equal':True,'same_pid_fd_watch_baseline_restored':True}
+ # Malformed transport input must terminate the owned worker without a success
+ # response; use fresh real workers rather than calling framing internals.
+ for broken in [struct.pack('<I', 65537), struct.pack('<I', 4) + b'1', struct.pack('<I', 8) + b'0\tSTATUS']:
+  child=subprocess.Popen([str(binary),'--worker','--root',str(root),'--database',str(run/'db'),'--output',str(out),'--sha',args.sha,'--smoke'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=open(run/'invalid-frame.stderr.log','ab'),bufsize=0)
+  hello=reply();assert hello['op']=='HELLO'
+  child.stdin.write(broken);child.stdin.close()
+  assert child.wait(timeout=10)!=0, 'invalid frame accepted'
+  assert child.stdout.read()==b'', 'invalid frame returned a success response'
+ result={'source_sha':args.sha,'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'development_protocol_check':True,'million_acceptance':False,'entries':len(expected),'run':str(run),'held_snapshot_byte_set_equal':True,'current_snapshot_byte_kind_set_equal':True,'sort_equal':True,'same_pid_fd_watch_baseline_restored':True,'malformed_transport_rejected':True}
  (run/'result.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result))
 finally:
  if child.poll() is None:child.kill();child.wait()
