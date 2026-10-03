@@ -2,8 +2,8 @@ mod common;
 use common::Fixture;
 use loci_experiment::incremental::{Change, Portable};
 use loci_experiment::live::{QueryHandle, Status, Store};
-use loci_experiment::watch::{self, Inventory, Kind, Limits, RawEvent, Recovery, Signal};
-use std::collections::{BTreeMap, BTreeSet};
+use loci_experiment::watch::{self, Inventory, Kind, Limits, Recovery, Signal};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -309,81 +309,6 @@ fn partitioned_queries_preserve_first50_order_complete_counts_and_cancellation()
         assert!(out.cancelled && out.paths.is_empty());
     }
 }
-fn event(wd: i32, mask: u32, cookie: u32, name: &str) -> RawEvent {
-    RawEvent {
-        wd,
-        mask,
-        cookie,
-        name: name.as_bytes().to_vec(),
-    }
-}
-#[test]
-fn raw_directory_rename_remaps_later_child_events_and_handles_expected_retirement() {
-    use loci_experiment::incremental::events::*;
-    let f = Fixture::new();
-    let watched = BTreeMap::from([
-        (1, f.root.clone()),
-        (2, f.root.join("old")),
-        (3, f.root.join("old/nested")),
-    ]);
-    let raw = [
-        event(1, FROM | IS_DIR, 7, "old"),
-        event(1, TO | IS_DIR, 7, "new"),
-        event(2, MOVE_SELF, 0, ""),
-        event(3, CREATE, 0, "a.rs"),
-    ];
-    let out = translate(&f.root, &watched, &BTreeSet::new(), &raw).unwrap();
-    assert_eq!(
-        out.changes,
-        vec![
-            Change::Rename {
-                from: "old".into(),
-                to: "new".into()
-            },
-            Change::Refresh("new/nested/a.rs".into())
-        ]
-    );
-    let raw = [
-        event(1, DELETE | IS_DIR, 0, "old"),
-        event(2, DELETE_SELF, 0, ""),
-        event(2, watch::IN_IGNORED, 0, ""),
-    ];
-    let out = translate(&f.root, &watched, &BTreeSet::new(), &raw).unwrap();
-    assert_eq!(out.ignored, [2]);
-    assert_eq!(out.changes, [Change::Remove("old".into())]);
-}
-#[test]
-fn malformed_reordered_and_lost_raw_batches_request_correction() {
-    use loci_experiment::incremental::events::*;
-    let f = Fixture::new();
-    let watched = BTreeMap::from([(1, f.root.clone())]);
-    for (raw, expected) in [
-        (
-            vec![event(-1, watch::IN_Q_OVERFLOW, 0, "")],
-            Signal::KernelOverflow,
-        ),
-        (vec![event(99, CREATE, 0, "a")], Signal::UnknownWatch),
-        (
-            vec![event(1, TO, 7, "b"), event(1, FROM, 7, "a")],
-            Signal::GenerationRace,
-        ),
-        (vec![event(1, CREATE, 0, "../x")], Signal::GenerationRace),
-        (
-            vec![
-                event(1, FROM, 7, "a"),
-                event(1, FROM, 7, "a"),
-                event(1, TO, 7, "b"),
-            ],
-            Signal::GenerationRace,
-        ),
-    ] {
-        assert_eq!(
-            translate(&f.root, &watched, &BTreeSet::new(), &raw).err(),
-            Some(expected)
-        );
-    }
-}
-
 fn percentile(mut values: Vec<f64>, p: f64) -> f64 {
     values.sort_by(f64::total_cmp);
     values[((values.len() - 1) as f64 * p).ceil() as usize]
@@ -533,7 +458,6 @@ fn cancellation_during_partitioned_query_keeps_one_snapshot_and_bounded_results(
     );
 }
 
-#[cfg(windows)]
 #[test]
 fn windows_stream_paths_are_rejected_before_io_and_recovery_preserves_directory_entries() {
     let f = Fixture::new();
@@ -583,31 +507,6 @@ fn windows_stream_paths_are_rejected_before_io_and_recovery_preserves_directory_
     println!("PASS: actual NTFS ADS remains outside filename inventory; all Windows event variants reject before metadata I/O and recover");
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn linux_colon_filename_remains_a_valid_incremental_directory_entry() {
-    let f = Fixture::new();
-    let mut p = initialize(&f);
-    fs::write(f.root.join("a.rs:stream"), "ordinary Linux file").unwrap();
-    p.enqueue(Change::Refresh("a.rs:stream".into()));
-    assert!(p.tick(Duration::from_secs(1)).unwrap());
-    assert_eq!(paths(&p, "stream"), [PathBuf::from("a.rs:stream")]);
-    fs::rename(f.root.join("a.rs:stream"), f.root.join("b:stream.rs")).unwrap();
-    p.enqueue(Change::Rename {
-        from: "a.rs:stream".into(),
-        to: "b:stream.rs".into(),
-    });
-    assert!(p.tick(Duration::from_secs(2)).unwrap());
-    assert_eq!(paths(&p, "stream"), [PathBuf::from("b:stream.rs")]);
-    assert!(result(&p.store.handle(), "stream", false).validated_at_start_and_finish);
-    fs::remove_file(f.root.join("b:stream.rs")).unwrap();
-    p.enqueue(Change::Remove("b:stream.rs".into()));
-    assert!(p.tick(Duration::from_secs(3)).unwrap());
-    assert!(paths(&p, "").is_empty());
-    assert_eq!(p.metrics.full_scans, 1);
-}
-
-#[cfg(windows)]
 #[test]
 fn windows_ads_before_parent_rename_is_rejected_before_batch_precheck_io() {
     let f = Fixture::new();

@@ -87,75 +87,6 @@ fn portable_child_rename_before_parent_rename_requires_correction() {
     assert!(paths(&p.store.handle(), "seed.rs").is_empty());
     assert_eq!(p.metrics.full_scans, 2);
 }
-#[cfg(target_os = "linux")]
-fn native_settle(n: &mut loci_experiment::incremental::Native, wanted: &str) {
-    let started = std::time::Instant::now();
-    loop {
-        n.tick().unwrap();
-        if n.store.handle().view().status == Status::Validated
-            && paths(&n.store.handle(), wanted) == [PathBuf::from(wanted)]
-        {
-            return;
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(6),
-            "native correction did not converge"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-#[test]
-#[cfg(target_os = "linux")]
-fn native_child_create_and_subtree_before_parent_rename_are_not_omitted() {
-    let f = initial();
-    let mut n = loci_experiment::incremental::Native::new(&f.root, Limits::default()).unwrap();
-    assert!(n.tick().unwrap());
-    fs::write(f.root.join("old/new.rs"), "x").unwrap();
-    fs::create_dir(f.root.join("old/new-subtree")).unwrap();
-    fs::write(f.root.join("old/new-subtree/child.rs"), "x").unwrap();
-    fs::rename(f.root.join("old"), f.root.join("new")).unwrap();
-    std::thread::sleep(Duration::from_millis(270));
-    let published = n.tick().unwrap();
-    println!("native prior-child-create published={published},status={:?},new_file_query={:?},full_scans={}",n.store.handle().view().status,paths(&n.store.handle(),"new.rs"),n.metrics.full_scans);
-    assert!(
-        !published,
-        "real dependent batch must not validate missing child paths"
-    );
-    assert_eq!(n.store.handle().view().version, 1);
-    assert!(n.watch.state.reasons.contains(&Signal::GenerationRace));
-    native_settle(&mut n, "new/new.rs");
-    assert_eq!(
-        paths(&n.store.handle(), "child.rs"),
-        [PathBuf::from("new/new-subtree/child.rs")]
-    );
-    assert_eq!(n.metrics.full_scans, 2);
-    assert_eq!(n.watch.watches(), 4);
-    fs::write(f.root.join("new/new-subtree/later.rs"), "x").unwrap();
-    native_settle(&mut n, "new/new-subtree/later.rs");
-    assert_eq!(
-        n.metrics.full_scans, 2,
-        "post-recovery events should use the incremental path"
-    );
-}
-#[test]
-#[cfg(target_os = "linux")]
-fn native_child_rename_before_parent_rename_preserves_the_file() {
-    let f = initial();
-    let mut n = loci_experiment::incremental::Native::new(&f.root, Limits::default()).unwrap();
-    assert!(n.tick().unwrap());
-    fs::rename(
-        f.root.join("old/nested/seed.rs"),
-        f.root.join("old/nested/renamed.rs"),
-    )
-    .unwrap();
-    fs::rename(f.root.join("old"), f.root.join("new")).unwrap();
-    std::thread::sleep(Duration::from_millis(270));
-    assert!(!n.tick().unwrap());
-    native_settle(&mut n, "new/nested/renamed.rs");
-    assert!(paths(&n.store.handle(), "seed.rs").is_empty());
-    assert_eq!(n.metrics.full_scans, 2);
-    assert_eq!(n.watch.watches(), 3);
-}
 
 #[test]
 fn portable_reused_rename_source_does_not_substitute_replacement_contents() {
@@ -207,24 +138,4 @@ fn portable_refreshed_ancestor_cannot_supply_future_replacement_subtree() {
         [PathBuf::from("new/a.rs"), PathBuf::from("parent/old/b.rs")]
     );
     assert_eq!(p.metrics.full_scans, 2);
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn native_atomic_save_file_batch_keeps_incremental_fast_path() {
-    let f = Fixture::new();
-    let mut n = loci_experiment::incremental::Native::new(&f.root, Limits::default()).unwrap();
-    assert!(n.tick().unwrap());
-    fs::write(f.root.join("temporary"), "x").unwrap();
-    fs::rename(f.root.join("temporary"), f.root.join("saved.rs")).unwrap();
-    std::thread::sleep(Duration::from_millis(270));
-    assert!(n.tick().unwrap());
-    assert_eq!(
-        paths(&n.store.handle(), "saved.rs"),
-        [PathBuf::from("saved.rs")]
-    );
-    assert_eq!(
-        n.metrics.full_scans, 1,
-        "ordinary file publication must not trigger root correction"
-    );
 }

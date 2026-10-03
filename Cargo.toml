@@ -4,6 +4,19 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.99"
 publish = false
+default-run = "loci-experiment"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "loci-service"
+path = "src/bin/loci-service.rs"
+
+[[bin]]
+name = "loci"
+path = "src/bin/loci.rs"
 
 # Isolated from Kite; this experiment makes no standalone license decision.
 [workspace]
@@ -12,8 +25,3 @@ publish = false
 opt-level = 3
 codegen-units = 1
 lto = true
-
-
-[features]
-# Allows Windows cargo check to type-check FFI code; never claims Linux execution.
-linux-ffi-check = []

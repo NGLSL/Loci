@@ -32,19 +32,19 @@ Replace the placeholders. The output directory must not already exist. If needed
 
 ## Local bundle transfer
 
-When the exact commit is unavailable locally, transfer a full-history Git bundle through an approved local file transfer. The source checkout must already contain the frozen commit at `refs/heads/codex/linux-million-search`; creating this bundle requires no remote access or push:
+When the exact commit is unavailable locally, transfer a full-history Git bundle through an approved local file transfer. The source checkout must already contain the frozen commit at `refs/heads/main`; creating this bundle requires no remote access or push:
 
 ```text
-git bundle create loci-exact.bundle refs/heads/codex/linux-million-search
+git bundle create loci-exact.bundle refs/heads/main
 git bundle verify loci-exact.bundle
-git bundle list-heads loci-exact.bundle refs/heads/codex/linux-million-search
+git bundle list-heads loci-exact.bundle refs/heads/main
 ```
 
 Record the SHA-256 digest before transfer and compare it on Windows with `Get-FileHash -Algorithm SHA256`. Pass the local file with `-BundlePath 'D:\Project\Transfers\loci-exact.bundle'`. The runner verifies the bundle and requires that branch's advertised tip to equal the requested SHA, then imports it into `refs/codex-validation/windows/<SHA>`. It preserves the existing working branch and logs the local import. No remote fallback is attempted. The bundle must contain the required history, or already-present prerequisite objects must satisfy `git bundle verify`.
 
 ## Evidence and failure interpretation
 
-The five sequential steps are formatting, all-target Windows type checking, `linux-ffi-check` type checking, full debug tests, and full release tests. Both test commands are unfiltered and retain `--nocapture --test-threads=1`. The FFI feature checks types only; it does not execute Linux system calls on Windows. This gate covers the existing Windows event backend and shared core, not MFT/USN or GUI work. See [AGENTS.md](../../AGENTS.md) and the [validation guide](../../docs/VALIDATION.md) for repository scope.
+The four sequential steps are formatting, all-target Windows type checking, full debug tests, and full release tests. Both test commands are unfiltered and retain `--nocapture --test-threads=1`. This gate covers the existing Windows event backend and shared core, not MFT/USN or GUI work. See [AGENTS.md](../../AGENTS.md) and the [validation guide](../../docs/VALIDATION.md) for repository scope.
 
 Each step retains raw stdout/stderr, its command, duration, exit status, and process identity in `summary.json`. The summary records the exact checkout SHA, runner/bundle digests, Windows/NTFS/Rust metadata, and generated executable digests. The checkout, target directory and raw logs remain available after success or failure; cleanup is a separate local action after review.
 
@@ -52,4 +52,4 @@ A zero exit code alone does not pass either native test step. The runner require
 
 On timeout, termination targets only the held root `Process`, using its retained handle and creation-time check. It never reacquires a process by PID, invokes `taskkill`, or kills an unrelated process. **Descendants are not terminated or confirmed released.** They may continue running; the timeout sidecar explicitly records this uncertainty, and the gate fails. The runner uses a bounded five-second post-termination wait. After normal root exit, both raw byte-stream copies must reach EOF within five seconds; otherwise logs remain incomplete and the step is unverified. Descendants retaining pipe handles cannot force an unbounded output-drain wait. Review remaining descendants locally before cleanup or retry; no automatic PID-based cleanup is provided. A hung command, incomplete log or failed preflight is not native acceptance.
 
-A successful runner summary is evidence for these listed steps, not approval to resolve Task 18, publish or merge. Preserve raw results and the exact-SHA receipt for the final review together with the separate Linux native gates and [Linux acceptance runner](../linux-native-acceptance/README.md).
+A successful runner summary is evidence for these listed steps, not approval to resolve Task 18, publish or merge. Preserve raw results and the exact-SHA receipt for the final review.

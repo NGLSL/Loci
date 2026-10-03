@@ -1,6 +1,6 @@
 # 实现与参考资料
 
-当前 Cargo.lock 只有本项目，无第三方 Rust crate 依赖。源码没有纳入 Cardinal、plocate、FSearch 的实现，也没有 vendor 目录。查询结构、摘要、恢复流程、FFI适配与测试在本实验中编写；inotify 使用系统 libc，不包含 libc 源码。
+当前项目直接依赖 `serde`（含 derive）和 `serde_json`，用于本地服务协议及 CLI JSON。Cargo.lock 固定其精确版本与传递依赖；新服务不再是纯标准库项目。源码没有纳入 Cardinal、plocate、FSearch 的实现，也没有 vendor 目录。查询结构、摘要、恢复流程、FFI适配与测试在本实验中编写；Windows FFI 调用系统 API，不包含操作系统源码。
 
 设计研究参考以下官方项目；参考算法与架构没有引入其源代码或作出许可证兼容承诺：
 
@@ -11,6 +11,10 @@
 原型没有复制上述项目代码。任何将来实际复用组件都需要单独记录来源、版本和许可证。
 
 Loci的许可证选择尚未完成。本次没有添加LICENSE文件，也没有把其它项目的许可证套用到Loci。
+
+## 当前 Cargo 依赖
+
+直接依赖为 `serde` 1.0.229、`serde_json` 1.0.151；传递依赖包括 serde_core、serde_derive、itoa、memchr、proc-macro2、quote、syn、unicode-ident、zmij，具体版本以 Cargo.lock 为准。再分发时应保留所使用 crate 包中的许可文件与版权声明；以下算法参考记录不替代实际依赖的许可记录。
 
 ## 参考项目的已核实许可来源
 

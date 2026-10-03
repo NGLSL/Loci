@@ -299,7 +299,7 @@ try {
         $null = Get-TaskLocalDriveRoot $BundlePath
         & $git -C $RepoPath bundle verify $BundlePath *> (Join-Path $OutputDirectory 'bundle-verify.log')
         if ($LASTEXITCODE -ne 0) { throw 'Local bundle verification failed.' }
-        $advertised = @(& $git -C $RepoPath bundle list-heads $BundlePath 'refs/heads/codex/linux-million-search')
+        $advertised = @(& $git -C $RepoPath bundle list-heads $BundlePath 'refs/heads/main')
         $bundleListExit = $LASTEXITCODE
         $advertisedCommit = if ($advertised.Count -eq 1) { (($advertised[0] -split '\s+')[0]).ToLowerInvariant() } else { $null }
         if ($bundleListExit -ne 0 -or $advertisedCommit -ne $Commit.ToLowerInvariant()) {
@@ -307,7 +307,7 @@ try {
         }
         $TaskSummary.bundle_sha256 = (Get-FileHash -LiteralPath $BundlePath -Algorithm SHA256).Hash.ToLowerInvariant()
         $bundleRef = 'refs/codex-validation/windows/' + $Commit.ToLowerInvariant()
-        & $git -C $RepoPath fetch --no-tags --no-recurse-submodules $BundlePath ("refs/heads/codex/linux-million-search:" + $bundleRef) *> (Join-Path $OutputDirectory 'bundle-import.log')
+        & $git -C $RepoPath fetch --no-tags --no-recurse-submodules $BundlePath ("refs/heads/main:" + $bundleRef) *> (Join-Path $OutputDirectory 'bundle-import.log')
         if ($LASTEXITCODE -ne 0) { throw 'Local bundle import failed; no remote fetch is attempted.' }
     }
     $TaskPhase = 'checkout'
@@ -331,7 +331,6 @@ try {
     $TaskPhase = 'steps'
     Invoke-TaskStep 'format' $rustup @('run', $ResolvedToolchain, 'cargo', 'fmt', '--check') $TaskWorktree 'format-only'
     Invoke-TaskStep 'all-targets' $rustup @('run', $ResolvedToolchain, 'cargo', 'check', '--all-targets', '--offline', '--locked') $TaskWorktree 'windows-type-check'
-    Invoke-TaskStep 'linux-ffi-types' $rustup @('run', $ResolvedToolchain, 'cargo', 'check', '--all-targets', '--offline', '--locked', '--features', 'linux-ffi-check') $TaskWorktree 'linux-ffi-types-only'
     Invoke-TaskStep 'debug-native' $rustup @('run', $ResolvedToolchain, 'cargo', 'test', '--offline', '--locked', '--', '--nocapture', '--test-threads=1') $TaskWorktree 'native-windows-tests'
     Invoke-TaskStep 'release-native' $rustup @('run', $ResolvedToolchain, 'cargo', 'test', '--release', '--offline', '--locked', '--', '--nocapture', '--test-threads=1') $TaskWorktree 'native-windows-tests'
     $TaskPhase = 'verification'

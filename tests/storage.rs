@@ -78,7 +78,6 @@ fn failed_replacement_preserves_old_database_and_cleans_only_owned_temporary() {
     assert!(old.save(&directory_target).is_err());
     assert_eq!(fs::read_to_string(foreign).unwrap(), "keep");
     assert_eq!(fs::read_dir(&f.0).unwrap().count(), 3);
-    #[cfg(windows)]
     {
         use std::fs::OpenOptions;
         use std::os::windows::fs::OpenOptionsExt;
@@ -125,10 +124,8 @@ fn unsafe_and_inconsistent_inventory_cannot_overwrite_valid_database() {
             old.inventory.entries
         );
     }
-    #[cfg(windows)]
     assert!(Snapshot::new(&f.0, f.inventory("file:stream")).is_err());
-    #[cfg(unix)]
-    assert!(Snapshot::new(&f.0, f.inventory("file:stream")).is_ok());
+
     let mut conflicting = f.inventory("file");
     conflicting.entries.insert("file/child".into(), Kind::File);
     assert!(Snapshot::new(&f.0, conflicting).is_err());
@@ -150,7 +147,7 @@ fn envelope(root: &std::path::Path, entries: &[(u8, &str)], count: Option<u32>) 
     }
     let mut bytes = b"LOCISNP1".to_vec();
     bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.extend_from_slice(&(if cfg!(windows) { 1u32 } else { 2u32 }).to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     bytes.extend(payload);
     resign(&mut bytes);
@@ -224,18 +221,6 @@ fn hostile_database_child() {
     file.set_len(64 * 1024 * 1024).unwrap();
     drop(file);
     assert!(Snapshot::load(&db, &f.0).is_err());
-    #[cfg(target_os = "linux")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        unsafe extern "C" {
-            fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> i32;
-        }
-        let fifo = f.0.join("input.fifo");
-        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { mkfifo(name.as_ptr(), 0o600) }, 0);
-        assert!(Snapshot::load(&fifo, &f.0).is_err());
-    }
 }
 
 #[test]
@@ -303,7 +288,6 @@ fn hostile_destination_is_rejected_without_creating_temporary_files() {
     let f = Fixture::new();
     let snapshot = Snapshot::new(&f.0, f.inventory("safe")).unwrap();
     assert!(snapshot.save(&f.0.join("nul\0name")).is_err());
-    #[cfg(windows)]
     {
         let base = f.0.join("base.db");
         fs::write(&base, "keep").unwrap();
@@ -312,8 +296,7 @@ fn hostile_destination_is_rejected_without_creating_temporary_files() {
         assert_eq!(fs::read_to_string(base).unwrap(), "keep");
         assert_eq!(fs::read_dir(&f.0).unwrap().count(), 1);
     }
-    #[cfg(unix)]
-    assert_eq!(fs::read_dir(&f.0).unwrap().count(), 0);
+
     assert!(Snapshot::load(&f.0, &f.0).is_err());
 }
 

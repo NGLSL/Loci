@@ -124,7 +124,6 @@ pub(crate) fn skip(path: &Path) -> bool {
             "results",
             "results-v2",
             "results-v3",
-            "results-linux",
             "baseline-stage2",
         ]
         .contains(&n)
@@ -188,7 +187,6 @@ pub fn scan(
                     continue;
                 }
             };
-            #[cfg(windows)]
             {
                 use std::os::windows::fs::MetadataExt;
                 if meta.file_attributes() & 0x400 != 0 {
@@ -222,23 +220,13 @@ pub fn scan(
     }
     out
 }
-#[cfg(target_os = "linux")]
-fn path_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(path.as_os_str().as_bytes().to_vec())
-}
-#[cfg(not(target_os = "linux"))]
+
 fn path_bytes(path: &Path) -> io::Result<Vec<u8>> {
     path.to_str()
         .map(|s| s.as_bytes().to_vec())
         .ok_or_else(|| io::Error::other("non-UTF-8 checkpoint path on this platform"))
 }
-#[cfg(target_os = "linux")]
-fn decode_path(bytes: Vec<u8>) -> io::Result<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    Ok(std::ffi::OsString::from_vec(bytes).into())
-}
-#[cfg(not(target_os = "linux"))]
+
 fn decode_path(bytes: Vec<u8>) -> io::Result<PathBuf> {
     String::from_utf8(bytes)
         .map(PathBuf::from)
@@ -295,15 +283,12 @@ pub fn save_checkpoint(path: &Path, root: &Path, inventory: &Inventory) -> io::R
     file.write_all(&data)?;
     file.sync_all()?;
     drop(file);
-    // Unix rename atomically replaces. Windows may refuse replacement; preserve the old file.
+    // Windows may refuse replacement; preserve the old file.
     if let Err(e) = fs::rename(&temp, path) {
         let _ = fs::remove_file(temp);
         return Err(e);
     }
-    #[cfg(target_os = "linux")]
-    {
-        fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
-    }
+
     Ok(())
 }
 fn u32_at(data: &[u8], pos: &mut usize) -> io::Result<usize> {
@@ -371,94 +356,4 @@ pub fn load_checkpoint(path: &Path, root: &Path, limits: Limits) -> io::Result<I
         return Err(io::Error::other("checkpoint trailing bytes"));
     }
     Ok(out)
-}
-
-pub const IN_Q_OVERFLOW: u32 = 0x4000;
-pub const IN_IGNORED: u32 = 0x8000;
-pub const IN_UNMOUNT: u32 = 0x2000;
-#[derive(Debug, Clone)]
-pub struct RawEvent {
-    pub wd: i32,
-    pub mask: u32,
-    pub cookie: u32,
-    pub name: Vec<u8>,
-}
-pub struct Batch {
-    pub events: Vec<RawEvent>,
-    pub dropped: bool,
-    pub kernel_overflow: bool,
-    pub watch_lost: bool,
-}
-pub fn decode_events(data: &[u8], limit: usize) -> io::Result<Batch> {
-    let mut batch = Batch {
-        events: Vec::new(),
-        dropped: false,
-        kernel_overflow: false,
-        watch_lost: false,
-    };
-    let mut pos = 0;
-    while pos < data.len() {
-        let header = data
-            .get(pos..pos + 16)
-            .ok_or_else(|| io::Error::other("truncated event header"))?;
-        let wd = i32::from_ne_bytes(header[0..4].try_into().unwrap());
-        let mask = u32::from_ne_bytes(header[4..8].try_into().unwrap());
-        let cookie = u32::from_ne_bytes(header[8..12].try_into().unwrap());
-        let len = u32::from_ne_bytes(header[12..16].try_into().unwrap()) as usize;
-        if len > 4096 {
-            return Err(io::Error::other("event name budget"));
-        }
-        let end = (pos + 16)
-            .checked_add(len)
-            .ok_or_else(|| io::Error::other("event length overflow"))?;
-        let name = data
-            .get(pos + 16..end)
-            .ok_or_else(|| io::Error::other("truncated event name"))?;
-        let nul = name.iter().position(|b| *b == 0).unwrap_or(name.len());
-        if len > 0
-            && (nul == name.len()
-                || name[..nul].contains(&b'/')
-                || name[..nul] == *b"."
-                || name[..nul] == *b"..")
-        {
-            return Err(io::Error::other("invalid event name"));
-        }
-        batch.kernel_overflow |= mask & IN_Q_OVERFLOW != 0;
-        batch.watch_lost |= mask & (IN_IGNORED | IN_UNMOUNT) != 0;
-        if batch.events.len() < limit {
-            batch.events.push(RawEvent {
-                wd,
-                mask,
-                cookie,
-                name: name[..nul].to_vec(),
-            });
-        } else {
-            batch.dropped = true;
-        }
-        pos = end;
-    }
-    Ok(batch)
-}
-pub fn accept_batch(batch: Batch, known: &BTreeSet<i32>, state: &mut Recovery) {
-    if batch.kernel_overflow {
-        state.signal(Signal::KernelOverflow);
-    }
-    if batch.watch_lost {
-        state.signal(Signal::WatchLost);
-    }
-    if batch.dropped {
-        state.signal(Signal::UserOverflow);
-    }
-    for event in batch.events {
-        // Overflow has wd=-1, so it MUST precede watch-map lookup.
-        if event.mask & IN_Q_OVERFLOW != 0 {
-            state.signal(Signal::KernelOverflow);
-        } else if event.mask & (IN_IGNORED | IN_UNMOUNT) != 0 {
-            state.signal(Signal::WatchLost);
-        } else if !known.contains(&event.wd) {
-            state.signal(Signal::UnknownWatch);
-        } else {
-            state.signal(Signal::Change);
-        }
-    }
 }

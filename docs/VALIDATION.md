@@ -1,37 +1,27 @@
-> 本文记录基础提交7415280的历史验收。增量分支的新增范围、Windows联合51项结果及Linux待复验入口见[INCREMENTAL.md](INCREMENTAL.md)。本轮 Windows 原生引擎、持久化与停止生命周期见 [PERSISTENCE.md](PERSISTENCE.md)；历史结果不代表当前精确提交已经跨平台复验。
+# Windows 验证范围
 
-# 验证范围
+> 本文描述原有有界目录验证引擎及其历史证据。4096 条目预算不适用于当前 NTFS 全卷服务的产品上限；服务／普通权限 CLI 的当前入口见 [README](../README.md)。
+当前项目仅支持 Windows。历史通过数量属于各自提交，不代替本次 Windows-only 代码的精确提交验证。
 
-2026-10-02。完成Windows共享逻辑及x86_64 Linux原生基础验收；以下限制仍然适用。
+## 检查入口
 
-## 已完成的本地验证
-
-Windows debug与release各32项通过，fmt通过；Linux FFI代码在Windows cargo check中通过类型检查。Windows实际文件增删与rename使用工程内临时夹具，通知显式模拟。初始扫描/构建竞态、旧读者版本一致、预取消/执行中取消、重启、模拟漏事件、失败保留旧结果、事件风暴退避均有回归。
-
-基线CLI使用已有百万条合成记录索引核对12查询×complete/first50，共24组count/checksum与独立Python oracle一致；没有逐一比较完整ID集合，不是百万真实文件或百万条实时更新验证。
-
-## Linux原生验证
-
-上轮独立查询/监听恢复原型在x86_64 Linux、kernel 6.18.44、glibc2.41、**overlayfs** 上debug/release各32项普通测试通过；另行观察到真实IN_Q_OVERFLOW，并恢复清单。此时监听与查询尚未桥接。overlayfs结果不能推广到ext4、Btrfs或网络文件系统。
-
-上轮发现旧新Session短暂重叠，33 watches/1fd变成66/2。当前实现先关闭旧Session再重建，并加入Loci-managed的进程共享预算；最终源码在相同Linux overlayfs环境中debug/release各 **53项普通测试通过**，3项默认ignored；另行真实IN_Q_OVERFLOW到查询恢复与原生端到端测量通过。替换窗口 /proc 实测维持 **33 watches/1fd**，drop归0；跨Session的128-watch、8-fd边界与释放通过内核断言。没有以类型检查代替原生结果。
-
-最终修复了Native错误分支遗漏最新Recovery generation/reasons的问题，并明确无watcher期间的变动通过重扫恢复；新增失败元数据、跨线程旧读者和两代背压、无watcher缺口恢复三项原生回归。真实overflow执行8224轮create/delete后，使用实际观察到loss的同一Recovery驱动Native/Index/Query，准确查询到survivor。
-
-## 复现与资源边界
-
-已具备Rust1.99.0/rustfmt、Bash、timeout、Python3的x86_64 Linux执行：
-
-```sh
-bash scripts/validate-linux.sh --kernel-overflow --live-metrics
+```powershell
+cargo +1.99.0 fmt --check
+cargo +1.99.0 check --all-targets --offline --locked
+cargo +1.99.0 test --offline --locked
+cargo +1.99.0 test --release --offline --locked
 ```
 
-普通测试、真实overflow与原生计时分开记录。overflow只读sysctl，最多10000轮create/delete、10秒生成；没观察到真实事件时输出SKIP，脚本不将SKIP算通过。所有夹具只在工程work子目录，不扫描用户home或整台电脑，清理前校验resolved路径。
+`tests/windows_events.rs` 使用工程内真实文件及原生通知；共享 Engine 的可控 EventSource 明确属于模拟 loss／竞态测试。停止、句柄释放、持久化损坏／替换失败与跨进程恢复的历史结果见 [PERSISTENCE.md](PERSISTENCE.md)。CLI 应验证真实 root／database、帮助、错误、查询、分页和监控停止行为。
 
-原生计时采用1024文件和31次rename；子进程有512MiB地址空间、60CPU秒、120秒墙钟、16MiB输出和256fd预算。软件不安装依赖或修改sysctl。RSS/HWM不包含内核watch/slab对象字节成本。
+## 历史证据
 
-查询结果携带快照版本及开始/结束校正状态。Validated仅对应最后观察的截止点，文件系统可能随后变更；cancelled表示部分结果。预算、持续写入或读者保留旧代时，查询可返回旧快照并显示待校正；不能称为实时最新。
+基础提交 `7415280` 的 Windows debug／release 各 32 项通过；该轮使用真实文件增删与 rename，通知显式模拟。初始扫描／构建竞态、旧读者版本一致、预取消／执行中取消、重启、模拟漏事件、失败保留旧结果与风暴退避有回归。
 
-百万条在线重建、长期压力、其它Linux架构/文件系统、恶意TOCTOU和生产调用方集成尚未完成验证。
+基线 CLI 的百万合成记录检查为 12 查询 × complete／first50，共 24 组 count／checksum 与独立 Python oracle 一致；没有逐一比较完整 ID 集合。这不是百万真实文件或百万条实时更新验证。历史有界增量与 Windows 性能证据见 [INCREMENTAL.md](INCREMENTAL.md) 和 [BENCHMARKS.md](BENCHMARKS.md)。
 
-低层API约束：收到WatchLost的Session应丢弃并重建，直接复用可能保留过时登记。QueryHandle可以比发布者活得更久；当前 Store/Engine 停止或 drop 后，留下的 query handle 显示 Stopped。运行中的引擎仍需要调用方定期 poll，不能把未继续 poll 的快照称为持续校正。
+## 结果边界
+
+Validated 仅对应最后观察截止点，文件系统可随后变化。取消或 first50 的部分结果不能称 complete；预算、持续写入及读者保留旧代时可返回明确标记的旧快照。停止或 drop 后留下的 query handle 显示 Stopped。调用方仍须定期 poll，不能把未继续 poll 的快照称为持续校正。
+
+百万真实文件、长期压力、非 NTFS／网络文件系统、真实断电、对抗性 TOCTOU 和生产调用方集成尚未完成验证。Windows NTFS 独立原型的小型原生结果见其固定提交报告，不能等同公共 Engine 已装配。

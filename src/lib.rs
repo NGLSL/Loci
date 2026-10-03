@@ -1,6 +1,7 @@
-//! Independent bounded watcher/index snapshot experiment; no Kite integration.
-#[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
-pub mod linux_inotify;
+//! Windows file index, legacy directory engine, and local query service.
+#[cfg(not(windows))]
+compile_error!("Loci only supports Windows targets");
+
 pub mod watch;
 
 #[cfg(test)]
@@ -17,10 +18,14 @@ mod partitioned;
 pub mod events;
 
 pub mod engine;
-#[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
-mod linux_events;
+
 /// Versioned, bounded root inventories for the v0.1 engine.
 pub mod storage;
 
-#[cfg(windows)]
 pub mod windows_events;
+
+/// Full-volume NTFS inventory and persistent USN synchronization.
+pub mod ntfs;
+
+/// Local Windows service and its read-only query protocol.
+pub mod service;

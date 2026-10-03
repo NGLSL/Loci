@@ -1,4 +1,3 @@
-#![cfg(any(windows, target_os = "linux"))]
 mod common;
 use common::Fixture;
 use loci_experiment::engine::{Engine, QueryHandle, Status};
@@ -340,7 +339,6 @@ fn simulated_whole_batch_validation_precedes_inspection() {
         "",
         "/absolute",
     ];
-    #[cfg(windows)]
     let bad_paths = {
         let mut paths = bad_paths;
         paths.extend(["a\\.\\b", "a\\\\b", "a\\", "file:stream", "C:\\absolute"]);
@@ -449,7 +447,6 @@ fn queries_report_cancellation_first50_and_complete_counts() {
     assert!(all.validated_at_start_and_finish);
 }
 
-#[cfg(windows)]
 #[test]
 fn non_utf8_windows_name_rejects_candidate_and_preserves_old_query() {
     use std::ffi::OsString;
@@ -621,4 +618,41 @@ fn simulated_stop_error_still_marks_remaining_query_handles_stopped() {
     assert_eq!(paths(&handle, ""), [f.root.join("kept.txt")]);
     assert!(!engine.poll().unwrap());
     engine.stop().unwrap();
+}
+
+#[test]
+fn windows_owner_keeps_count_queries_rebuild_save_and_stop_available() {
+    let _native = NATIVE.lock().unwrap();
+    let f = Fixture::new();
+    fs::write(f.root.join("one.txt"), "one").unwrap();
+    fs::write(f.root.join("two.txt"), "two").unwrap();
+    let database = f.base.join("owner.bin");
+    let engine = Engine::open(&f.root, Some(&database)).unwrap();
+    let mut owner = engine.spawn().unwrap();
+    let job = owner.query().start_count("ext:txt").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while matches!(
+        job.state(),
+        loci_experiment::engine::QueryJobState::Pending
+            | loci_experiment::engine::QueryJobState::Running
+    ) {
+        assert!(Instant::now() < deadline, "count did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        job.state(),
+        loci_experiment::engine::QueryJobState::Complete
+    );
+    assert_eq!(job.count(), Some(2));
+    drop(job);
+    owner.save().unwrap().wait(Duration::from_secs(5)).unwrap();
+    assert!(database.is_file());
+    owner
+        .request_rebuild()
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+    owner.stop(Duration::from_secs(5)).unwrap();
+    assert!(owner.is_joined());
+    assert_eq!(owner.view().status, Status::Stopped);
 }

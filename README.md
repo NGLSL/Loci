@@ -1,40 +1,60 @@
 # Loci
 
-Loci 是独立的 Rust 文件名/路径搜索实验，包含紧凑路径记录、块级 trigram 候选过滤、短词摘要及最终精确匹配。实时原型将 Linux inotify 接到不可变查询快照，支持有界增量更新、失效校正、取消和并发读者；保留全量重扫作为对照。
+Loci 是 Windows 文件名／路径搜索项目，提供独立 **LociIndex** 后台服务、普通权限查询 CLI，以及保留的有界目录验证引擎。当前构建目标仅为 Windows，Rust **1.99.0**；服务 JSON 协议使用 `serde` 和 `serde_json`，依赖说明见 [THIRD_PARTY.md](THIRD_PARTY.md)。许可证尚未决定。
 
-项目使用 Rust **1.99.0** 和标准库，无第三方 Cargo 依赖，无 GUI。v0.1 嵌入式引擎在 Windows 使用原生递归通知，在 x86_64 Linux 使用 inotify，统一提供版本化持久库存和停止生命周期。用户 CLI 尚未完成。许可证尚未决定，没有添加 LICENSE 文件。
+## 后台服务与普通权限查询
 
-嵌入式 `engine::Engine::open/poll/query/save/stop` 和 `storage::Snapshot::new/save/load` 用法、数据库位置、格式、预算及验证范围见 [docs/PERSISTENCE.md](docs/PERSISTENCE.md)。完整 v0.1 仍须完成用户 CLI、生产规模和产品交付验收。
+`loci-service.exe` 通过 Windows SCM 运行，服务名为 `LociIndex`，账户为 LocalSystem，负责本机固定 NTFS 卷的索引、USN 增量和持久恢复。安装／启用服务需要管理员授权；日常 `loci.exe`、Kite 及官方插件以普通权限通过本机 `\\.\pipe\Loci.Search.v1` 只读查询／状态协议访问同一索引。客户端不能指定目录、保存或重建索引。
 
-新引擎代码提交 `657412e` 已在同一次 [Rust 1.99 跨平台 CI](https://github.com/NGLSL/Loci/actions/runs/37045846370) 验证：Linux/ext4 debug、release 各119 passed，Windows/NTFS 各96 passed，均0 failed。Linux 覆盖实际新 Engine 的跨进程保存与离线变化恢复、递归监听、真实内核溢出校正和 watch/fd 释放；此记录与旧原型验收分开。
-
-Linux scale 开发提交 `57cca5b` 在真实百万非根条目上通过完整字节路径 oracle：生产 20 ms owner 的实际进程静默 600.09 秒，CPU 为单逻辑核的 0.282%，RSS 168.39 MiB，HWM 183.83 MiB，20,001 个实际 watches；停止后 watches 为零。另在真实 100k 条目上各测量 200 次新增、删除、重命名，p95 均不超过 22.6 ms，压缩前后全路径一致且没有额外整根扫描。测量 SHA、进程、容量预算与 RSS 的区别及原始记录见 [压缩与静默验证](docs/LINUX-SCALE-COMPACTION-VALIDATION.md)。此处使用原生 inotify/overlayfs；最终 SSD/ext4/Btrfs、百万变更与长跑验收仍待完成。
-
-查询为大小写不敏感的 AND 子串，可使用 `ext:rs` 精确扩展名条件。first50 返回记录顺序前50项，complete 计算完整匹配数并保留前50项；没有相关性排序、全文、拼音或 mmap。
-
-实时原型最多4096项、总UTF-8输入1 MiB；单条路径4096 bytes、查询512 bytes。非UTF-8候选明确失败，旧结果保留并标待校正。最多8查询租约、两代索引；Loci 管理的会话共享128 watches /8 sessions预算。成功尝试冷却250ms，失败退避至多2秒。独立CLI的100k/1M合成记录基准不受实时4096项限制。
-
-```sh
-cargo +1.99.0 fmt --check
-cargo +1.99.0 test --offline
-cargo +1.99.0 test --release --offline
-```
-
-已有 Rust 1.99.0、rustfmt、Bash、timeout、Python3 的 x86_64 Linux：
-
-```sh
-bash scripts/validate-linux.sh --kernel-overflow --live-metrics
-```
-
-Windows可运行共享查询、恢复、持久化与引擎夹具测试；原型通知显式模拟，新引擎及 `windows_events` 使用原生通知：
+构建服务与客户端：
 
 ```powershell
-cargo +1.99.0 test --release --offline --target-dir target/stage3
-python scripts/measure-live-windows.py
+cargo +1.99.0 build --release --locked --bin loci-service --bin loci
 ```
 
-Windows的 linux-ffi-check 只能用于 cargo check；不要在Windows用该feature运行测试或构建来冒充Linux执行。
+在管理员 PowerShell 安装／启用服务：
 
-基础提交7415280验收：Windows debug/release各32项；x86_64 Linux overlayfs各53项及另行真实overflow/原生测量通过。联合P1/P2修复Windows各51项通过；云端P1单独补丁Linux各79项通过，精确联合提交仍待复验。成对测量、复验入口与实现边界见 [docs/INCREMENTAL.md](docs/INCREMENTAL.md)。生产规模、其它文件系统和架构尚未验证。
+```powershell
+.\scripts\install-service.ps1 -ExecutablePath D:\Project\Loci\target\release\loci-service.exe
+```
 
-验证方法与当前通过范围见 [docs/VALIDATION.md](docs/VALIDATION.md)；合成数据、硬件与性能局限见 [docs/BENCHMARKS.md](docs/BENCHMARKS.md)；实现归属见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+正常查询无需管理员权限，结果为 JSON：
+
+```powershell
+.\target\release\loci.exe status
+.\target\release\loci.exe query --type documents --limit 50 report
+cargo +1.99.0 run --locked --bin loci -- query --type images --limit 20 holiday
+```
+
+`--type` 支持 all、images、documents、videos、audio、archives、folders；`--limit` 为 1..100。独立 CLI 整个请求期限为 6 秒；Kite 插件使用 500 ms 请求期限，两者分别约束。
+
+## NTFS 索引范围和验证边界
+
+后端先通过 MFT 全卷枚举取得对象，再以 `FILE_ID_BOTH_DIR_INFO` 目录批次补齐名称和硬链接关系，USN 变化更新库存，checkpoint 同时保存来源身份、库存与游标。NTFS 内部元数据和精确 `%ProgramData%\Loci` 存储子树排除，防止保存自身触发变化循环；不会排除整个 ProgramData。文件系统或读取错误、持续校正和预算失败显式报告，旧结果不能称为新的完整库存。
+
+未配对 UTF-16 名称在索引中保留原始身份；当前 JSON 输出跳过无法安全表示的名称并报告数量，避免有损转换后打开错误路径。百万合成库已有实跑证据，但真实服务安装、真实全卷／百万文件、普通权限端到端查询、升级和长期运行仍待验收；不能宣称已达到 Everything 性能。
+
+Kite 构建将服务、CLI 与安装脚本打包到 `resources/loci/`，官方插件作为服务的只读客户端。Kite 通过固定 Loci 提交构建服务和插件；更新依赖时应先提交 Loci 实现，再更新 Kite 的固定 revision。远端构建还需要该提交已推送，并验证对应 CI。
+
+## 原有目录验证引擎
+
+`engine::Engine::open/poll/query/save/stop` 和 `storage::Snapshot` 保留用于有界目录验证，文档见 [PERSISTENCE.md](docs/PERSISTENCE.md)。`cargo run` 默认仍运行 `loci-experiment`，原 `engine` CLI 可显式选 root／database、查询、分页和监控：
+
+```powershell
+cargo +1.99.0 run --locked -- engine help
+```
+
+该旧验证引擎最多 4096 条目、128 目录、16 深度及 1 MiB UTF-8 相对路径输入，最多 8 查询租约和两代索引；这些是验证模块预算，**不是全盘服务的产品上限**。旧目录 CLI 的 root／save／rebuild 不能用于配置当前服务或 Kite 插件。
+
+## 检查与历史证据
+
+```powershell
+cargo +1.99.0 fmt --check
+cargo +1.99.0 check --all-targets --locked
+cargo +1.99.0 test --locked
+cargo +1.99.0 test --release --locked
+```
+
+[Windows NTFS 原型交接](docs/WINDOWS-SHARED-HANDOFF.md)与[身份／游标 ADR](docs/adr/0001-source-object-entry-cursor.md)保留固定历史实现和 proposed 契约，不因当前服务实现而自动 accepted。历史提交 `657412e` 的 [Rust 1.99 CI](https://github.com/NGLSL/Loci/actions/runs/37045846370) 中 Windows debug／release 各 96 passed；这不能代表当前服务实现已经 CI 或原生安装验收。
+
+旧有界验证边界见 [VALIDATION.md](docs/VALIDATION.md)、历史增量测量见 [INCREMENTAL.md](docs/INCREMENTAL.md)、基准方法见 [BENCHMARKS.md](docs/BENCHMARKS.md)。旧测量不能代替全卷服务性能验证。

@@ -45,15 +45,7 @@ impl Drop for Fixture {
         fs::remove_dir_all(base).unwrap();
     }
 }
-fn raw(wd: i32, mask: u32, cookie: u32, name: &[u8]) -> Vec<u8> {
-    let mut b = vec![];
-    b.extend(wd.to_ne_bytes());
-    b.extend(mask.to_ne_bytes());
-    b.extend(cookie.to_ne_bytes());
-    b.extend((name.len() as u32).to_ne_bytes());
-    b.extend(name);
-    b
-}
+
 #[test]
 fn real_add_delete_file_and_directory_rename_reconcile() {
     let f = Fixture::new();
@@ -195,49 +187,4 @@ fn watcher_callback_precedes_each_directory_enumeration() {
     assert!(out
         .entries
         .contains_key(&PathBuf::from("child/after-watch")));
-}
-#[test]
-fn overflow_wd_minus_one_is_detected_before_unknown_watch() {
-    let batch = decode_events(&raw(-1, IN_Q_OVERFLOW, 0, &[]), 4).unwrap();
-    let mut state = Recovery::new(4);
-    accept_batch(batch, &BTreeSet::new(), &mut state);
-    assert!(state.reasons.contains(&Signal::KernelOverflow));
-    assert!(!state.reasons.contains(&Signal::UnknownWatch));
-}
-#[test]
-fn raw_rename_pair_watch_loss_and_decode_capacity_are_bounded() {
-    let mut bytes = raw(1, 0x40, 99, b"old\0");
-    bytes.extend(raw(2, 0x80, 99, b"new\0"));
-    let batch = decode_events(&bytes, 4).unwrap();
-    assert_eq!(batch.events[0].cookie, batch.events[1].cookie);
-    assert_eq!(batch.events[1].name, b"new");
-    assert!(decode_events(&bytes, 1).unwrap().dropped);
-    assert!(decode_events(&bytes[..10], 4).is_err());
-    assert!(decode_events(&raw(1, 1, 0, b"../escape\0"), 4).is_err());
-    let mut state = Recovery::new(4);
-    accept_batch(
-        decode_events(&raw(7, IN_IGNORED, 0, &[]), 4).unwrap(),
-        &BTreeSet::new(),
-        &mut state,
-    );
-    assert!(state.reasons.contains(&Signal::WatchLost));
-}
-#[test]
-fn non_utf8_linux_event_names_are_preserved_as_bytes() {
-    let batch = decode_events(&raw(1, 0x100, 0, &[0xff, 0xfe, 0]), 4).unwrap();
-    assert_eq!(batch.events[0].name, [0xff, 0xfe]);
-}
-
-#[test]
-fn special_loss_flags_survive_user_batch_truncation() {
-    let mut bytes = raw(1, 0x100, 0, b"a\0");
-    bytes.extend(raw(-1, IN_Q_OVERFLOW, 0, &[]));
-    bytes.extend(raw(2, IN_IGNORED, 0, &[]));
-    let batch = decode_events(&bytes, 1).unwrap();
-    assert!(batch.dropped && batch.kernel_overflow && batch.watch_lost);
-    let mut state = Recovery::new(1);
-    accept_batch(batch, &BTreeSet::from([1]), &mut state);
-    assert!(state.reasons.contains(&Signal::KernelOverflow));
-    assert!(state.reasons.contains(&Signal::WatchLost));
-    assert!(state.reasons.contains(&Signal::UserOverflow));
 }

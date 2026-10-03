@@ -36,7 +36,6 @@ impl Drop for OwnerCredit {
 enum CommandKind {
     Save,
     Rebuild,
-    Compact,
 }
 struct Command {
     kind: CommandKind,
@@ -74,7 +73,6 @@ impl MonitorRequest {
 /// a timed-out explicit stop retains ownership until a later join or Drop.
 pub struct MonitorOwner {
     query: QueryHandle,
-    supports_cancel: bool,
     sender: mpsc::SyncSender<Command>,
     stop: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -84,10 +82,7 @@ pub struct MonitorOwner {
 impl Engine {
     pub fn spawn(self) -> io::Result<MonitorOwner> {
         let credit = OwnerCredit::acquire()?;
-        #[cfg(target_os = "linux")]
-        let supports_cancel = self.scale.is_some();
-        #[cfg(not(target_os = "linux"))]
-        let supports_cancel = false;
+
         let query = self.query();
         let metrics = Arc::new(Mutex::new(self.metrics().clone()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -104,10 +99,6 @@ impl Engine {
                     Ok(command) => {
                         if worker_stop.load(Ordering::Acquire) { break; }
                         let result = match command.kind {
-                            CommandKind::Compact => {
-                                worker_cancel.store(false, Ordering::Release);
-                                engine.request_compaction()
-                            },
                             CommandKind::Save if engine.view().status != Status::Validated => Err(io::Error::new(io::ErrorKind::WouldBlock, "unsaved: monitor observation is not validated; prior checkpoint preserved")),
                             CommandKind::Save => engine.save(),
                             CommandKind::Rebuild => {
@@ -130,7 +121,6 @@ impl Engine {
         })?;
         Ok(MonitorOwner {
             query,
-            supports_cancel,
             sender,
             stop,
             cancel,
@@ -175,22 +165,7 @@ impl MonitorOwner {
     pub fn request_rebuild(&self) -> io::Result<MonitorRequest> {
         self.request(CommandKind::Rebuild)
     }
-    pub fn request_compaction(&self) -> io::Result<MonitorRequest> {
-        self.request(CommandKind::Compact)
-    }
-    /// Interrupt scale correction without ending monitoring. Rebuild resumes it.
-    /// Acceptance is immediate; Pending with a Cancelled gap confirms completion.
-    /// The bounded compatibility backend returns Unsupported and keeps monitoring.
-    pub fn cancel(&self) -> io::Result<()> {
-        if !self.supports_cancel {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "scan cancellation requires scale mode",
-            ));
-        }
-        self.cancel.store(true, Ordering::Release);
-        Ok(())
-    }
+
     /// Requests stop independently of queued work. Success means the worker joined.
     /// Timeout leaves the worker owned here; resources may still be held by OS I/O.
     pub fn stop(&mut self, timeout: Duration) -> io::Result<()> {

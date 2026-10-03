@@ -1,5 +1,4 @@
-//! Bounded incremental filename/path inventory transactions; no Windows event backend.
-pub mod events;
+//! Bounded incremental filename/path inventory transactions.
 use crate::live::{Gate, Store};
 use crate::watch::{self, Inventory, Kind, Limits, Recovery, Signal};
 use std::fs;
@@ -62,20 +61,6 @@ pub struct Metrics {
     pub metadata_calls: usize,
     pub transactions: usize,
     pub changed_paths: usize,
-    pub audited_directories: usize,
-    pub correction_attempts: usize,
-    pub compaction_attempts: usize,
-    pub compactions: usize,
-    pub compaction_restarts: usize,
-    pub compacted_entries: usize,
-    pub reclaimed_slots: usize,
-    pub reclaimed_name_bytes: usize,
-    pub scope_checks: usize,
-    /// Scale inventory work in the last local transaction, excluding derived
-    /// path/query cache and native watch topology work.
-    pub last_touched_entries: usize,
-    pub last_copied_entries: usize,
-    pub last_copied_segments: usize,
 }
 pub(crate) fn validate_limits(limits: Limits) -> io::Result<()> {
     if limits.entries == 0
@@ -99,14 +84,12 @@ pub(crate) fn valid(path: &Path) -> io::Result<()> {
     if bytes.is_empty()
         || !path.components().all(|c| matches!(c, Component::Normal(_)))
         || bytes
-            .split(|c| *c == b'/' || (cfg!(windows) && *c == b'\\'))
+            .split(|c| *c == b'/' || *c == b'\\')
             .any(|part| part.is_empty() || part == b"." || part == b"..")
     {
         return Err(io::Error::other("unsafe relative event path"));
     }
     // NTFS stream paths are not directory entries. Reject before filesystem I/O.
-    // Unix colons are ordinary filename bytes and must remain accepted.
-    #[cfg(windows)]
     if path.as_os_str().as_encoded_bytes().contains(&b':') {
         return Err(io::Error::other(
             "Windows stream paths are not filename entries",
@@ -136,7 +119,6 @@ fn inspect(root: &Path, path: &Path, metrics: &mut Metrics) -> io::Result<Option
         if meta.file_type().is_symlink() {
             return Ok(None);
         }
-        #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
             if meta.file_attributes() & 0x400 != 0 {
@@ -503,7 +485,3 @@ impl Portable {
         }
     }
 }
-#[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
-mod native;
-#[cfg(any(target_os = "linux", feature = "linux-ffi-check"))]
-pub use native::Native;

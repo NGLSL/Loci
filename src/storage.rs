@@ -12,13 +12,7 @@ const INPUT_LIMIT: usize = 1024 * 1024;
 const ENTRY_LIMIT: usize = 4096;
 const HEADER: usize = 20;
 const MAX_BYTES: usize = HEADER + 4 + PATH_LIMIT + 4 + INPUT_LIMIT + ENTRY_LIMIT * 5 + 8;
-const PLATFORM: u32 = if cfg!(windows) {
-    1
-} else if cfg!(unix) {
-    2
-} else {
-    3
-};
+const PLATFORM: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -65,9 +59,9 @@ fn validate(inventory: &Inventory) -> io::Result<()> {
         }
         if !path.components().all(|c| matches!(c, Component::Normal(_)))
             || text
-                .split(|c| c == '/' || (cfg!(windows) && c == '\\'))
+                .split(|c| c == '/' || c == '\\')
                 .any(|s| s.is_empty() || s == "." || s == "..")
-            || (cfg!(windows) && text.contains(':'))
+            || text.contains(':')
         {
             return Err(invalid("unsafe snapshot relative path"));
         }
@@ -118,14 +112,7 @@ impl Snapshot {
     pub fn save(&self, path: &Path) -> io::Result<()> {
         atomic_save(path, &self.encode()?)
     }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn save_in_directory(
-        &self,
-        parent: &fs::File,
-        name: &std::ffi::OsStr,
-    ) -> io::Result<()> {
-        linux_atomic_save(parent, name, &self.encode()?)
-    }
+
     fn encode(&self) -> io::Result<Vec<u8>> {
         validate(&self.inventory)?;
         if root_path(&self.root)? != self.root {
@@ -155,22 +142,7 @@ impl Snapshot {
         }
         let mut options = OpenOptions::new();
         options.read(true);
-        #[cfg(all(
-            target_os = "linux",
-            any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "arm",
-                target_arch = "riscv64"
-            )
-        ))]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Linux O_NONBLOCK on the supported asm-generic/x86 profiles. A
-            // concurrently substituted FIFO must not block before metadata.
-            options.custom_flags(0x800);
-        }
+
         let file = options.open(path)?;
         if !file.metadata()?.is_file() {
             return Err(invalid("snapshot input must be a regular file"));
@@ -278,9 +250,7 @@ fn get_path(bytes: &[u8], pos: &mut usize) -> io::Result<PathBuf> {
     Ok(PathBuf::from(text))
 }
 
-#[cfg(not(target_os = "linux"))]
 struct Temporary(Option<PathBuf>);
-#[cfg(not(target_os = "linux"))]
 impl Drop for Temporary {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
@@ -292,7 +262,6 @@ fn validate_destination(path: &Path) -> io::Result<()> {
     if path.file_name().is_none() {
         return Err(invalid("snapshot destination requires filename"));
     }
-    #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
         use std::path::Prefix;
@@ -311,16 +280,9 @@ fn validate_destination(path: &Path) -> io::Result<()> {
             }
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        if path.as_os_str().as_bytes().contains(&0) {
-            return Err(invalid("NUL in snapshot destination"));
-        }
-    }
+
     Ok(())
 }
-#[cfg(not(target_os = "linux"))]
 fn atomic_save(path: &Path, bytes: &[u8]) -> io::Result<()> {
     validate_destination(path)?;
     let parent = path
@@ -368,140 +330,10 @@ fn atomic_save(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // The name no longer belongs to us after replacement. Never remove another
     // writer's file if that temporary name is reused before this guard drops.
     temp.0 = None;
-    #[cfg(unix)]
-    fs::File::open(parent)?.sync_all()?;
+
     Ok(())
 }
-#[cfg(all(not(windows), not(target_os = "linux")))]
-fn replace(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
-}
 
-#[cfg(target_os = "linux")]
-fn atomic_save(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    validate_destination(path)?;
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .ok_or_else(|| invalid("snapshot destination requires filename"))?;
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(0x10000 | 0x20000) // O_DIRECTORY | O_NOFOLLOW
-        .open(parent)?;
-    linux_atomic_save(&directory, name, bytes)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn linux_atomic_save(
-    parent: &fs::File,
-    name: &std::ffi::OsStr,
-    bytes: &[u8],
-) -> io::Result<()> {
-    use std::ffi::{c_char, c_int, c_uint, CString};
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    #[link(name = "c")]
-    unsafe extern "C" {
-        fn openat(directory: c_int, name: *const c_char, flags: c_int, ...) -> c_int;
-        fn renameat(
-            from_directory: c_int,
-            from: *const c_char,
-            to_directory: c_int,
-            to: *const c_char,
-        ) -> c_int;
-        fn unlinkat(directory: c_int, name: *const c_char, flags: c_int) -> c_int;
-    }
-    struct TemporaryAt<'a> {
-        parent: &'a fs::File,
-        name: Option<CString>,
-    }
-    impl Drop for TemporaryAt<'_> {
-        fn drop(&mut self) {
-            if let Some(name) = &self.name {
-                // Same held directory as creation; never follow a replaced path.
-                unsafe { unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
-            }
-        }
-    }
-    let path = Path::new(name);
-    if path.components().count() != 1
-        || !matches!(path.components().next(), Some(Component::Normal(_)))
-    {
-        return Err(invalid("snapshot destination requires a single filename"));
-    }
-    let destination = CString::new(name.as_bytes()).map_err(|_| invalid("NUL in filename"))?;
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let mut created = None;
-    for _ in 0..16 {
-        let mut temporary = name.to_os_string();
-        temporary.push(format!(
-            ".{}.{}.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let temporary =
-            CString::new(temporary.as_bytes()).map_err(|_| invalid("NUL in temporary filename"))?;
-        // x86_64 Linux O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC. create_new
-        // semantics ensure a foreign temporary is never followed or removed.
-        let fd = unsafe {
-            openat(
-                parent.as_raw_fd(),
-                temporary.as_ptr(),
-                0x1 | 0x40 | 0x80 | 0x80000,
-                0o600 as c_uint,
-            )
-        };
-        if fd >= 0 {
-            // We own the new descriptor; File closes it on every error path.
-            let file = unsafe { fs::File::from_raw_fd(fd) };
-            created = Some((
-                TemporaryAt {
-                    parent,
-                    name: Some(temporary),
-                },
-                file,
-            ));
-            break;
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(error);
-        }
-    }
-    let (mut temporary, mut file) = created.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "snapshot temporary filename collision budget",
-        )
-    })?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-    let from = temporary
-        .name
-        .as_ref()
-        .ok_or_else(|| invalid("missing snapshot temporary"))?;
-    if unsafe {
-        renameat(
-            parent.as_raw_fd(),
-            from.as_ptr(),
-            parent.as_raw_fd(),
-            destination.as_ptr(),
-        )
-    } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    temporary.name = None;
-    parent.sync_all()
-}
-#[cfg(windows)]
 fn replace(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]

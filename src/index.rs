@@ -31,14 +31,7 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     needle.is_empty()
         || (hay.len() >= needle.len() && hay.windows(needle.len()).any(|x| x == needle))
 }
-/// Raw-query extension semantics for paths containing invalid UTF-8: the
-/// basename suffix is independently lowercased, rather than inheriting the
-/// context of preceding filename characters (for example Greek final sigma).
-#[cfg(target_os = "linux")]
-pub(crate) fn normalized_raw_extension(name: &[u8]) -> Option<String> {
-    let dot = name.iter().rposition(|byte| *byte == b'.')?;
-    std::str::from_utf8(&name[dot + 1..]).ok().map(normalize)
-}
+
 impl Index {
     pub fn from_paths(paths: impl Iterator<Item = String>) -> Self {
         let mut index = Self {
@@ -334,45 +327,6 @@ pub struct Query {
     ext: Option<String>,
 }
 impl Query {
-    #[cfg(target_os = "linux")]
-    pub(crate) fn unfiltered(&self) -> bool {
-        self.tokens.is_empty() && self.ext.is_none()
-    }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn filter(&self) -> (u128, ShortSignature, crate::signatures::PairSignature) {
-        let mut short = ShortSignature::default();
-        let mut pairs = crate::signatures::PairSignature::default();
-        let mut grams = 0;
-        for token in &self.tokens {
-            short.insert(token.as_bytes());
-            pairs.insert(token.as_bytes());
-            grams |= trigram_signature(token.as_bytes());
-        }
-        if let Some(extension) = &self.ext {
-            short.insert(extension.as_bytes());
-            pairs.insert(extension.as_bytes());
-            grams |= trigram_signature(extension.as_bytes());
-        }
-        (grams, short, pairs)
-    }
-    /// Already-lowercased UTF-8 runs separated by byte FF; valid queries cannot
-    /// contain that separator, so terms cannot bridge invalid filesystem bytes.
-    /// Invalid paths use the independent raw basename suffix for extensions.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn matches_normalized(&self, path: &[u8], raw_name: &[u8]) -> bool {
-        self.tokens
-            .iter()
-            .all(|token| contains(path, token.as_bytes()))
-            && self.ext.as_ref().is_none_or(|ext| {
-                if path.contains(&255) {
-                    return normalized_raw_extension(raw_name).is_some_and(|suffix| suffix == *ext);
-                }
-                let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
-                name.iter()
-                    .rposition(|byte| *byte == b'.')
-                    .is_some_and(|dot| &name[dot + 1..] == ext.as_bytes())
-            })
-    }
     pub fn parse(raw: &str) -> Self {
         let mut q = Self {
             tokens: vec![],

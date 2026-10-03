@@ -5,7 +5,7 @@ Blocked by: None
 
 ## Goal
 
-在阶段 A 独立原型证据基础上，交付可评审的 Windows 私有后端：建立库存、查询名称／路径、处理在线变化、停止释放、持久化、跨进程重开并处理离线变化。阶段 B 不修改根 Cargo.toml 或现有共享引擎接口；共享装配等待 proposed ADR 的双方确认。
+在阶段 A 独立原型证据基础上，交付可评审的 Windows 私有后端：建立库存、查询名称／路径、处理在线变化、停止释放、持久化、跨进程重开并处理离线变化。阶段 B 不修改根 Cargo.toml 或现有共享引擎接口；共享装配等待 proposed ADR 的核心契约确认。
 
 ## Scope and decisions
 
@@ -29,7 +29,7 @@ Blocked by: None
 
 ## Out of scope
 
-GUI、共享引擎装配、Linux 实现、全机默认扫描、自动 100k／1M 创建、合 main、PR、release、系统设置修改。管理员 UAC 每次须有覆盖本次执行的明确授权；先完成可检查的代码与有界 runner，再请求需要的授权。
+GUI、共享引擎装配、全机默认扫描、自动 100k／1M 创建、合 main、PR、release、系统设置修改。管理员 UAC 每次须有覆盖本次执行的明确授权；先完成可检查的代码与有界 runner，再请求需要的授权。
 
 ## Comments
 

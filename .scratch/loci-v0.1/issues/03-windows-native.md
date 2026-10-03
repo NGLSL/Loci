@@ -22,7 +22,7 @@ Owner: 独立Windows实现
 Windows 原生来源来自精确提交 13b1f940b8f1d099ff6b06af02981d95796ab21d；整合后修复 old-only 空批次观察窗口。
 
 环境：Rust 1.99.0 / x86_64-pc-windows-msvc / D: NTFS。
-命令：cargo +1.99.0 fmt --check；cargo +1.99.0 check --all-targets --offline --locked；cargo +1.99.0 check --offline --locked --features linux-ffi-check；cargo +1.99.0 test --offline --locked；cargo +1.99.0 test --release --offline --locked。
+命令：cargo +1.99.0 fmt --check；cargo +1.99.0 check --all-targets --offline --locked；cargo +1.99.0 test --offline --locked；cargo +1.99.0 test --release --offline --locked。
 结果：静态检查通过，debug/release 各89 passed、0 failed、2性能测量ignored；storage9、engine16、windows_events13。
 规范与规格两轴审计完成；Stopped + WatchLost 状态问题实际 red/green 修复，无剩余可行动发现。
 
@@ -35,3 +35,5 @@ Windows 原生来源来自精确提交 13b1f940b8f1d099ff6b06af02981d95796ab21d�
 补充来源：245b0dfae49a907f599c69101de800d91857c5cc；整合代码：e3d86e28a80581701557ce5b3397df4eefb88f59；最终文档提交：de8f897eda0ba856b1f59e9497f2bd079d287686。
 新增7项completion/时钟注入边界测试（非真实跨内核completion证明），Windows原生测试共20项=13真实平台夹具+7注入状态测试。独立两轴增量审计无新可行动发现；debug/release全量96 passed、0 failed、2性能测量ignored；fmt/all-targets/linux-ffi-check通过。两个测试注入入口在lib test harness中有dead_code warning，生产构建不包含此入口。
 最后只含Git已提交文件的干净源码目录release构建及engine16/storage9/windows20共45项回归通过。用户ignore配置继续留在本地；本轮未补Linux/CLI/CI门槛。
+
+2026-10-03 范围更新：当前仅支持 Windows；Linux／Unix 实现与验收门槛已取消。以上历史评论属于对应旧提交，不能替代 Windows-only 代码的当前验证。
