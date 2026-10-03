@@ -341,11 +341,22 @@ fn journal_provenance_and_checkpoint_failure_preserve_complete_inventory() {
 fn current_token_native_volume_permission_is_observed_without_elevation() {
     match Volume::open("D:") {
         Ok(volume) => {
-            let journal = volume.query().unwrap();
-            println!(
-                "native_D_readable,journal_id={},cursor={}",
-                journal.id, journal.next
-            );
+            match volume.query() {
+                Ok(journal) => println!(
+                    "native_D_readable,journal_id={},cursor={}",
+                    journal.id, journal.next
+                ),
+                Err(error) => {
+                    // A readable NTFS volume need not have an active journal
+                    // (for example, the GitHub runner's temporary D: drive).
+                    println!(
+                        "native_D_journal,error_kind={:?},os_code={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    );
+                    assert!(error.raw_os_error().is_some());
+                }
+            }
         }
         Err(error) => {
             println!(
