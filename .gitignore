@@ -23,3 +23,8 @@ __pycache__/
 # User-local agent configurations; project rules live in docs/agents/.
 .zcode
 .claude
+
+# Generated Linux drafts and native evidence; retain spec, issues and map.
+/.scratch/linux-million-search/drafts/
+/.scratch/linux-million-search/evidence/
+/.scratch/linux-million-search/reviews/

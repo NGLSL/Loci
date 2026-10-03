@@ -110,3 +110,65 @@ Windows 状态为“有实现／证据支持该提议”时，也不等于双方
 6. Ready／Pending／Stopped、查询是否遍历完整、观察 cursor 与持久 cursor 分别可见；停止／Drop 安全释放；内存／I/O／句柄预算按真实工作量验证。
 
 这些是建议共享验收条件。阶段 B 已通过其中的小型 Windows 场景，不代表 Linux 或共享装配全部通过；100k／1M、长期压力和真实内核失效的后续预算见阶段 B 报告。
+
+## Linux 当前实现回复（2026-10-03）
+
+以上 Windows 基线和“待确认”栏保留为提出交接时的记录；以下逐项回应 A1–A6，描述已实现的 Linux 行为及仍需双方决定的部分。`origin/main` 的 Windows 原型和交接材料已在集成提交 `5639efea5592c4e001b7244628b1e597261f6be9` 合入 Linux 分支；该次合并没有改变根项目的 `src/`、`tests/` 或 Cargo 输入。合入原型不等于完成公共 Engine 的 NTFS 产品装配。
+
+Linux 的依据是 [已接受的目录项库存 ADR 及其后续扩展](adr/0001-linux-scale-entry-inventory.md)、[规格](../.scratch/linux-million-search/spec.md)、[实施地图](../.scratch/linux-million-search/map.md)和下列源码／公开行为回归。Linux scale 生产基线为 `0c2df04b6f2a810b9c3f16ec7611d1552e83ef07`；`52446d5922b08bf68bcee799a553dd33965798e6` 仅调整 opt-in 100k 原生功能回归的共享等待期限，未改生产实现或正式性能门槛。以下回复没有接受或冻结 [来源／对象／游标 ADR](adr/0001-source-object-entry-cursor.md)，其状态仍为 proposed。
+
+### A1：来源与搜索范围
+
+当前 Linux scale 是单根 Engine，固定 root 描述符、原始根路径和观察到的设备／inode 身份，并绑定根的 mount ID 与显式相对子树排除配置。checkpoint 校验来源和范围；根替换、根重新挂载或不兼容范围不能沿用旧库并发布 Validated。根节点参与内部关系图，但不是普通搜索结果。
+
+嵌套的不同 mount ID 只保留挂载边界目录项，不遍历内容；相同 mount ID 的 Btrfs 子卷可继续遍历，不因设备号不同就误判为另一挂载。局部目录扫描也通过新打开的描述符核对 mount ID。依据：[范围实现](../src/engine/scale/scope.rs)、[checkpoint](../src/engine/scale/checkpoint.rs)、[真实范围回归](../tests/linux_scale_scope.rs)。
+
+目前没有把 SourceId／ScopeId 抽成跨平台公共类型，也没有跨 root 合成查询或重叠范围去重。物理对象来源身份与搜索范围在概念上需要区分；其共享编码和跨 root 归并规则仍待决定，不能将单根设备／inode 绑定直接当成全卷永久 SourceId。
+
+### A2：目录项身份与名称关系
+
+Linux writer 分配 epoch 内单调增长的私有 `u32 EntryId`；概念上的 `EntryKey` 是父目录项 ID 与原始 basename 字节。实际 lookup 保存父 ID 和完整名称 hash，碰撞再比较原始字节，不能只以 hash 判断同一名称。观察到的设备／inode 是物理身份线索，不能证明离线变化后还是同一对象。
+
+已知、可靠的范围内 rename 保持原目录项 ID，目录 rename 更新父／名称关系，后代路径从关系派生。硬链接分别拥有目录项和搜索路径；删除一个名称不删除另一个。删除的 ID 不在同一 epoch 内复用；全量校正或压缩可重分配 ID，旧租约仍使用自己的不可变关系图。因此这些私有 ID 不作为跨 epoch／跨平台持久对象键。
+
+依据：[库存](../src/engine/scale/inventory.rs)、[公共 Engine 硬链接／rename／旧租约回归](../tests/linux_scale_engine.rs)，初始实现 `60d9db0`。Windows tuple 身份随 rename 改变与 Linux epoch 内 ID 稳定是各自实现事实；共享 ID 的所有权、编码和生命周期尚未统一。
+
+### A3：原始名称、元数据与链接
+
+Linux basename、关系查找和持久库保留原始 bytes，结果路径保留 OS 字符串，CLI 可用 NUL 分隔导出原始字节。不同的非 UTF-8 名称不会因显示替换字符而合并。Linux 冒号是普通名称字节，不套用 Windows ADS 规则；当前没有可直接承载 Windows 未配对 UTF-16 的公共 tagged RawName 实现。
+
+库存记录目录项 kind 和观察到的设备／inode；symlink（包括悬空链接）是可搜索目录项，扫描不跟随其目标。公共 scale 快照可返回 `EntryKind`，查询该历史元数据不重新读取当前文件系统。挂载边界采用 A1 的单根规则，不把 Windows attributes 位当成相同元数据。
+
+依据：[原始名称／链接／范围回归](../tests/linux_scale_scope.rs)、[公共租约接口](../src/engine.rs)及 `f90febc`。跨平台 RawName 标签、可选物理身份、最低元数据及 inode 复用的强身份方案仍需单独决定，现有 Linux 观察值不宣称具有 NTFS reference 的离线语义。
+
+### A4：事件来源与恢复游标
+
+现有 Linux 来源是 inotify，没有持久 cursor，也没有跨停机事件重放。重开有效 checkpoint 时先给出明确 Pending 的历史可查询视图，再安装监听并校正；每个目录先 watch 后 enumeration，批次间及最终发布前排空来源并核对观察 generation。不能将数据库加载成功等同于当前目录已完整验证。
+
+可靠的普通文件变化及已知父目录下的新建目录可有界局部更新；新目录同样先 watch 后枚举，不无条件增加 full-root scan。未配对 moved-in 目录、未知目录身份、loss／实际 `IN_Q_OVERFLOW`、覆盖或挂载变化走保守校正／失败路径。持续变化、取消或预算失败保留旧查询，不能发布部分 Validated。
+
+依据：[inotify 来源](../src/linux_events.rs)、[scale 调度](../src/engine/scale.rs)、[stale 启动回归](../tests/linux_stale_startup.rs)、[真实溢出与恢复回归](../tests/linux_scale_recovery.rs)及 `ee2e9f3`／`f3097a4`。共享游标必须允许缺失；Linux 当前只能声明监听、丢失检测和重启校正，不能声明 USN 式 offline replay。
+
+### A5：验证、发布、租约与保存
+
+当前公共 seam 仍是 `Engine` 与 `EventSource::poll/stop`；Linux 的 inventory、扫描和 snapshot store 是私有实现，没有已冻结的共享候选 trait。完整候选必须通过范围、覆盖与 generation 校验才能发布新不可变 cut。目录移动后的整子树深度／路径预算在 writer 修改前校验；失败保留旧查询并报告受影响范围。
+
+查询租约固定 snapshot，分页 cursor 同时绑定该 snapshot 与完整查询文本；cursor 本身不持有租约。最多八个租约、一个退休 cut，读者仍占用退休 cut 时暂停新发布。旧租约保留先前路径，但不被标成已针对新的观察版本验证。查询遍历是否完整、历史观察状态、监控状态和保存结果分别表达。
+
+scale checkpoint 保存同一已发布 cut 的关系图、原始名称、版本／epoch、来源和范围；Linux 没有另行保存的来源恢复 cursor。公共 `save` 要求当前观察 Validated 且没有覆盖缺口，固定数据库 parent 描述符后原子保存。保存失败保留旧数据库并返回错误，不回滚已经成功发布的内存观察。来源、预算和覆盖错误按产生边界的类别处理，错误字符串只供显示。
+
+依据：[snapshot／租约](../src/engine/scale/query.rs)、[公共保存入口](../src/engine.rs)、[checkpoint](../src/engine/scale/checkpoint.rs)、[真实 parent 替换／保存失败回归](../tests/linux_scale_checkpoint.rs)、[monitor 释放回归](../tests/linux_monitor_owner.rs)。候选批次、平台事务与共享核心的责任分界仍需设计；不能把现有路径事件或 Windows 全量容器直接冻结为共享 ABI。
+
+### A6：查询与降级
+
+公共查询文本是 UTF-8：空白分隔普通项作 AND，`ext:` 作扩展名过滤，匹配采用 Unicode 小写归一化。Linux 非 UTF-8 路径按有效 UTF-8 片段匹配，单个词不能跨无效字节，不同 AND 词可命中不同片段；原始路径身份始终保留。当前没有任意原始 bytes 查询或 Windows UTF-16 查询装配。
+
+分页、完整导出、精确 count 和可选排序针对固定 snapshot，不用“输出前 N 条”代替完整性判定。依据：[共享 matcher](../src/index.rs)、[scale 查询](../src/engine/scale/query.rs)、[原始名称回归](../tests/linux_scale_scope.rs)、[公共查询任务回归](../tests/linux_query_jobs.rs)及 `f3986dd`。Windows 当前大小写敏感的字面 UTF-16 查询不能直接替代这个公共 matcher。
+
+Linux scale 是显式 opt-in；Windows 公共 Engine 当前拒绝该模式为 Unsupported，保留已有 bounded 行为。独立 NTFS probes 尚未接入公共 Engine，也没有实现自动切换到 ReadDirectoryChangesW 的产品降级。共同匹配编码、原始精确查询和降级策略仍待决定。
+
+### 本次回复的验收边界
+
+`0c2df04b` 的真实 ext4 证明包含 76 个 native jobs（无环境 skip）及百万测量全部 12 项数值检查通过，原始工件保留在 `/workspace/loci-native-final-ext4-0c2df04b/`。四次维护后 RSS 为 177.059／177.641／177.605／177.609 MiB，HWM 为 367.461 MiB；这属于该源码与该环境的真实证明，不能重贴为本次合并提交的最终 gate，也不能替代 SSD/NVMe 参考硬件或真实 24 小时验收。
+
+旧 `52446d59` 的实际 ext4 76 jobs 已通过，Btrfs debug／release 76 jobs 与 driver correctness 已 exit 0；后续百万阶段仍在运行，属于旧 compiled-source 的开发证明。原始目录为 `/workspace/loci-native-final-ext4-52446d59-focused/` 与 `/workspace/loci-btrfs-final-run-52446d59/`，不据此宣告合并后源码完成最终验收。Linux issues 14–18 保留未完成状态；Windows 证据沿用本文上方的独立原型报告，共享产品装配、最终统一 review 与未验证环境门槛继续保留。
