@@ -1,6 +1,6 @@
 # Issue tracker: Local Markdown
 
-本项目的规格和实施任务保存在仓库内 `.scratch/`，架构决策保存在 `docs/adr/`。这些核心 Markdown 记录随 Git 版本管理；技能中的“发布到任务跟踪系统”指写入对应仓库文件。
+本项目的规格、任务和决策记录保存在本地 `.scratch/`。技能中的“发布到任务跟踪系统”指写入本地 Markdown 文件。
 
 ## 规格与实施任务
 
